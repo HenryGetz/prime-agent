@@ -825,6 +825,8 @@ async fn late_receipts_recorded_before_the_row_lands_apply_on_landing() {
     };
     let engine = create_session(SessionEngineConfig {
         on_late_sent_agent_message: None,
+        auto_background_notice: None,
+        auto_background_registry: None,
         semantic_edges: None,
         cron_store: None,
         queued_steering_probe: None,
