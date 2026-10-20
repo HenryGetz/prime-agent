@@ -532,12 +532,27 @@ pub async fn execute_bash(
                 });
             } else if let Some(notice) = notice {
                 // The caller claimed the promotion edge first: the
-                // completion rides the notice lane.
+                // completion rides the notice lane. A terminal exec
+                // failure keeps the partial output and appends the same
+                // status line the inline catch path renders (aborted /
+                // timeout:N), so the diagnostic survives the promotion;
+                // the row itself stays kernel-parity (no exit code).
+                let mut output = snapshot.content.clone();
+                let failure = exec_result.as_ref().err().map(ToString::to_string);
+                if failure.as_deref() == Some("aborted") {
+                    output = append_status(&output, "Command aborted");
+                } else if let Some(secs) = failure
+                    .as_deref()
+                    .and_then(|failure| failure.strip_prefix("timeout:"))
+                {
+                    output =
+                        append_status(&output, &format!("Command timed out after {secs} seconds"));
+                }
                 notice(pa_agent::auto_background::AutoBackgroundCompletion {
                     pid,
                     exit_code: exec_result.as_ref().ok().copied().flatten(),
                     command: notice_command,
-                    output: snapshot.content.clone(),
+                    output,
                     full_output_path: snapshot.full_output_path,
                 });
             }
@@ -1201,5 +1216,92 @@ mod auto_background_tests {
                 );
             }
         }
+    }
+
+    #[tokio::test]
+    async fn a_promoted_command_that_fails_keeps_the_diagnostic() {
+        // A promoted job's terminal exec failure (aborted / timeout:N)
+        // must not lose its diagnostic: the inline catch path renders the
+        // same status line, and the completion carries it (the row stays
+        // parity — no exit code reports as -1).
+        struct FailingOps;
+        impl BashOperations for FailingOps {
+            fn exec<'a>(
+                &'a self,
+                _command: &'a str,
+                _cwd: &'a str,
+                options: ExecOptions<'a>,
+            ) -> ExecFuture<'a> {
+                Box::pin(async move {
+                    if let Some(on_spawn) = options.on_spawn {
+                        on_spawn(4321);
+                    }
+                    (options.on_data)(b"partial-lander\n");
+                    tokio::time::sleep(Duration::from_millis(400)).await;
+                    Err(anyhow::anyhow!("timeout:1"))
+                })
+            }
+        }
+        let registry = pa_agent::auto_background::AutoBackgroundRegistry::new();
+        let (tx, mut rx) = tokio::sync::mpsc::unbounded_channel::<AutoBackgroundCompletion>();
+        let notice: pa_agent::auto_background::AutoBackgroundNoticeFn =
+            Arc::new(move |completion| {
+                tx.send(completion).ok();
+            });
+        registry.arm(
+            "call-4",
+            pa_agent::auto_background::AutoBackgroundArm {
+                window: Duration::from_millis(100),
+                notice: Some(Arc::clone(&notice)),
+            },
+        );
+        let options = BashToolOptions {
+            operations: Some(Arc::new(FailingOps)),
+            auto_background_after: Some(Duration::from_millis(100)),
+            on_background_completion: Some(notice),
+            auto_background_registry: Some(Arc::new(registry)),
+            ..BashToolOptions::default()
+        };
+        let result = execute_bash(
+            "call-4",
+            ".",
+            &options,
+            "slow failure",
+            None,
+            None,
+            None,
+            None,
+        )
+        .await
+        .expect("promotion returns Ok");
+        assert!(
+            result.content[0]
+                .as_text()
+                .expect("text block")
+                .starts_with("Command exceeded"),
+            "the call must promote"
+        );
+        let completion = tokio::time::timeout(Duration::from_secs(5), rx.recv())
+            .await
+            .expect("the failed job's completion arrives")
+            .expect("notice lane open");
+        // No exit code: the row renders -1, kernel-parity for a job that
+        // died without reporting one.
+        assert_eq!(completion.exit_code, None);
+        // The diagnostic survives: partial output plus the same status
+        // line the inline catch path renders.
+        assert_eq!(completion.pid, Some(4321));
+        assert!(
+            completion.output.contains("partial-lander"),
+            "byte-cursor read: {}",
+            completion.output
+        );
+        assert!(
+            completion
+                .output
+                .ends_with("Command timed out after 1 seconds"),
+            "the completion must carry the failure diagnostic: {}",
+            completion.output
+        );
     }
 }
