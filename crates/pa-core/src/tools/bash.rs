@@ -577,9 +577,17 @@ pub async fn execute_bash(
             {
                 ExecEvent::Promoted
             }
+            // The exec task claimed DONE a moment before its channel send:
+            // the send is guaranteed once DONE is claimed (only a task panic
+            // can drop it), so wait for it instead of failing the call.
             ExecEvent::Promoted => match done_rx.try_recv() {
                 Ok(done) => ExecEvent::Done(done),
-                Err(_) => anyhow::bail!("bash completion raced the promotion edge and was lost"),
+                Err(_) => match tokio::time::timeout(PROMOTION_EDGE_RECV, &mut done_rx).await {
+                    Ok(Ok(done)) => ExecEvent::Done(done),
+                    Ok(Err(_)) | Err(_) => {
+                        anyhow::bail!("bash completion raced the promotion edge and was lost")
+                    }
+                },
             },
             event @ ExecEvent::Done(_) => event,
         }
@@ -681,6 +689,10 @@ struct ExecDone {
 const HANDOFF_RUNNING: u8 = 0;
 const HANDOFF_PROMOTED: u8 = 1;
 const HANDOFF_DONE: u8 = 2;
+
+/// Grace for the promotion-edge recv: a DONE-claimed task's channel send is
+/// microseconds away; the bound only guards a panicked task.
+const PROMOTION_EDGE_RECV: Duration = Duration::from_millis(500);
 
 /// Job-number fallback for promotion when the operations backend reports no
 /// pid.
