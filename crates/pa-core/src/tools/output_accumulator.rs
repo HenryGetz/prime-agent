@@ -348,6 +348,19 @@ impl OutputAccumulator {
         }
     }
 
+    /// Force the disk spill open, replaying the buffered chunks: the
+    /// promotion hand-off needs `snapshot().full_output_path` to exist
+    /// even for low-output commands (the synthetic result promises the
+    /// output streams to disk, and nothing re-reads it in memory later).
+    /// After this, appends write through the spill.
+    pub fn force_spill(&mut self) {
+        if self.spill.is_open() {
+            return;
+        }
+        let replay = std::mem::take(&mut self.raw_chunks);
+        self.spill.open(&replay);
+    }
+
     /// Settle the spill; afterwards `snapshot().full_output_path` is terminal.
     #[allow(dead_code)]
     pub async fn close_temp_file(&mut self) {

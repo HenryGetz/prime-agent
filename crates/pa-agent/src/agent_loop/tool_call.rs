@@ -179,17 +179,21 @@ fn spawn_update_emitter(
 struct AutoBackgroundArmGuard {
     armed: bool,
     tool_call_id: String,
+    registry: std::sync::Arc<crate::auto_background::AutoBackgroundRegistry>,
 }
 
 impl AutoBackgroundArmGuard {
+    /// Arm the per-call watchdog for `bash` tool calls. A ZERO window is
+    /// armed too (as a zero arm): the dispatch must learn the loop's
+    /// disable, not fall back to the tool options' default window.
     fn arm_for(
         directive: &crate::auto_background::AutoBackgroundDirective,
         tool_call_id: &str,
         tool_name: &str,
     ) -> Self {
-        let armed = directive.armed() && tool_name == "bash";
+        let armed = tool_name == "bash";
         if armed {
-            crate::auto_background::arm(
+            directive.registry.arm(
                 tool_call_id,
                 crate::auto_background::AutoBackgroundArm {
                     window: directive.window,
@@ -200,6 +204,7 @@ impl AutoBackgroundArmGuard {
         Self {
             armed,
             tool_call_id: tool_call_id.to_string(),
+            registry: std::sync::Arc::clone(&directive.registry),
         }
     }
 }
@@ -207,7 +212,7 @@ impl AutoBackgroundArmGuard {
 impl Drop for AutoBackgroundArmGuard {
     fn drop(&mut self) {
         if self.armed {
-            crate::auto_background::disarm(&self.tool_call_id);
+            self.registry.disarm(&self.tool_call_id);
         }
     }
 }

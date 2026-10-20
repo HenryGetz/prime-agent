@@ -5,7 +5,7 @@ use std::collections::{HashMap, HashSet};
 use std::fmt::Write as _;
 use std::future::Future;
 use std::pin::Pin;
-use std::sync::atomic::{AtomicBool, Ordering};
+use std::sync::atomic::{AtomicBool, AtomicU8, Ordering};
 use std::sync::{Arc, Mutex};
 use std::time::Duration;
 
@@ -111,6 +111,11 @@ pub struct BashToolOptions {
     /// The completion notice for promoted jobs (direct calls; the agent
     /// loop's arm carries the loop's notice lane instead).
     pub on_background_completion: Option<pa_agent::auto_background::AutoBackgroundNoticeFn>,
+    /// The agent loop's arm registry: when the embedding puts the agent's
+    /// registry here, the loop's per-call arm (window and notice lane)
+    /// reaches the dispatch (see [`pa_agent::auto_background`]).
+    pub auto_background_registry:
+        Option<std::sync::Arc<pa_agent::auto_background::AutoBackgroundRegistry>>,
 }
 
 /// Probe for at-risk files via `git status --porcelain`. Returns `Ok(None)`
@@ -361,7 +366,11 @@ pub async fn execute_bash(
     // The promotion window: the agent loop's per-call arm (AgentOptions
     // derived) wins; a direct call falls back to the tool options. A zero
     // window disables promotion.
-    let (window, notice) = match pa_agent::auto_background::take(tool_call_id) {
+    let (mut window, notice) = match options
+        .auto_background_registry
+        .as_ref()
+        .and_then(|registry| registry.take(tool_call_id))
+    {
         Some(arm) => (arm.window, arm.notice),
         None => (
             options
@@ -372,6 +381,12 @@ pub async fn execute_bash(
             options.on_background_completion.clone(),
         ),
     };
+    // A promotion without a notice lane strands the command: the synthetic
+    // result promises a completion notification that can never arrive, and
+    // nothing re-reads the job afterwards. Promotion requires the lane.
+    if notice.is_none() {
+        window = Duration::ZERO;
+    }
 
     // The command runs in its own task so a promotion can hand it off: on
     // promotion this call returns while the task keeps driving the process,
@@ -389,8 +404,16 @@ pub async fn execute_bash(
         }) as Arc<dyn Fn(&[u8]) + Send + Sync>
     };
     let pid_slot = Arc::new(Mutex::new(None::<u32>));
-    let promoted = Arc::new(AtomicBool::new(false));
+    // The promotion/completion handoff: RUNNING -> PROMOTED (the caller's
+    // window edge) or RUNNING -> DONE (the exec task's completion). The
+    // compare-exchange decides exactly one winner when both race the same
+    // edge, so neither the completion notice nor the ExecDone handoff is
+    // lost.
+    let handoff = Arc::new(AtomicU8::new(HANDOFF_RUNNING));
     let (done_tx, mut done_rx) = tokio::sync::oneshot::channel::<ExecDone>();
+    // The caller's wake channel for the promotion (the task watches the
+    // same `Notify` the output stream uses).
+    let notify_caller = Arc::clone(&notify);
 
     {
         let ops = Arc::clone(&ops);
@@ -404,7 +427,7 @@ pub async fn execute_bash(
         let task_on_update = on_update.clone();
         let on_data = Arc::clone(&on_data);
         let pid_slot = Arc::clone(&pid_slot);
-        let promoted = Arc::clone(&promoted);
+        let handoff = Arc::clone(&handoff);
         let acc = Arc::clone(&acc);
         tokio::spawn(async move {
             let on_spawn = {
@@ -426,6 +449,8 @@ pub async fn execute_bash(
             );
             tokio::pin!(exec_fut);
 
+            let mut task_on_update = task_on_update;
+            let mut update_lane_settled = false;
             let mut last_update_at: Option<std::time::Instant> = None;
             let exec_result: anyhow::Result<Option<i32>> = loop {
                 let deadline = if dirty.load(Ordering::SeqCst) {
@@ -451,6 +476,15 @@ pub async fn execute_bash(
                     result = &mut exec_fut => {
                         break result;
                     }
+                }
+                // The caller promoted: release the streamed-update lane
+                // NOW, not at process exit — the agent loop's update
+                // emitter drains only once every callback sender drops,
+                // so holding the callback here would wedge the tool call
+                // (and the turn) until the process finished.
+                if !update_lane_settled && handoff.load(Ordering::SeqCst) == HANDOFF_PROMOTED {
+                    update_lane_settled = true;
+                    task_on_update = None;
                 }
                 if dirty.swap(false, Ordering::SeqCst) {
                     last_update_at = Some(std::time::Instant::now());
@@ -482,21 +516,29 @@ pub async fn execute_bash(
                 (snapshot, acc.get_last_line_bytes())
             };
             let pid = *pid_slot.lock().unwrap();
-            if promoted.load(Ordering::SeqCst) {
-                if let Some(notice) = notice {
-                    notice(pa_agent::auto_background::AutoBackgroundCompletion {
-                        pid,
-                        exit_code: exec_result.as_ref().ok().copied().flatten(),
-                        command: notice_command,
-                        output: snapshot.content.clone(),
-                        full_output_path: snapshot.full_output_path,
-                    });
-                }
-            } else {
+            if handoff
+                .compare_exchange(
+                    HANDOFF_RUNNING,
+                    HANDOFF_DONE,
+                    Ordering::SeqCst,
+                    Ordering::SeqCst,
+                )
+                .is_ok()
+            {
                 let _ = done_tx.send(ExecDone {
                     result: exec_result,
                     snapshot,
                     last_line_bytes,
+                });
+            } else if let Some(notice) = notice {
+                // The caller claimed the promotion edge first: the
+                // completion rides the notice lane.
+                notice(pa_agent::auto_background::AutoBackgroundCompletion {
+                    pid,
+                    exit_code: exec_result.as_ref().ok().copied().flatten(),
+                    command: notice_command,
+                    output: snapshot.content.clone(),
+                    full_output_path: snapshot.full_output_path,
                 });
             }
         });
@@ -512,21 +554,49 @@ pub async fn execute_bash(
             Err(_) => anyhow::bail!("bash execution task failed"),
         }
     } else {
-        tokio::select! {
+        let raced = tokio::select! {
             done = &mut done_rx => match done {
                 Ok(done) => ExecEvent::Done(done),
                 Err(_) => anyhow::bail!("bash execution task failed"),
             },
             () = tokio::time::sleep(window) => ExecEvent::Promoted,
+        };
+        match raced {
+            // The window edge claims the promotion only from RUNNING: the
+            // exec task may have completed at the same instant and claimed
+            // DONE first — its ExecDone is already queued.
+            ExecEvent::Promoted
+                if handoff
+                    .compare_exchange(
+                        HANDOFF_RUNNING,
+                        HANDOFF_PROMOTED,
+                        Ordering::SeqCst,
+                        Ordering::SeqCst,
+                    )
+                    .is_ok() =>
+            {
+                ExecEvent::Promoted
+            }
+            ExecEvent::Promoted => match done_rx.try_recv() {
+                Ok(done) => ExecEvent::Done(done),
+                Err(_) => anyhow::bail!("bash completion raced the promotion edge and was lost"),
+            },
+            event @ ExecEvent::Done(_) => event,
         }
     };
 
     match exec_event {
         ExecEvent::Promoted => {
-            promoted.store(true, Ordering::SeqCst);
+            // Wake the exec task so it observes the promotion and releases
+            // the streamed-update lane (see the task body).
+            notify_caller.notify_one();
             let pid = *pid_slot.lock().unwrap();
             let snapshot = {
-                let acc = acc.lock().unwrap();
+                let mut acc = acc.lock().unwrap();
+                // The synthetic result promises the output streams to disk:
+                // force the spill open so `fullOutputPath` exists even for
+                // a low-output command (the only later re-read path).
+                acc.force_spill();
                 acc.snapshot()
             };
             let job = match pid {
@@ -542,6 +612,7 @@ pub async fn execute_bash(
                 "autoBackgrounded": true,
                 "pid": pid,
                 "command": command,
+                "output": snapshot.content,
             });
             if let Some(path) = &snapshot.full_output_path {
                 details["fullOutputPath"] = json!(path);
@@ -604,6 +675,13 @@ struct ExecDone {
     last_line_bytes: usize,
 }
 
+/// The promotion/completion handoff states (see [`execute_bash`]): RUNNING
+/// moves to PROMOTED (the caller's window edge) or DONE (the exec task's
+/// completion) exactly once, whichever wins the edge race.
+const HANDOFF_RUNNING: u8 = 0;
+const HANDOFF_PROMOTED: u8 = 1;
+const HANDOFF_DONE: u8 = 2;
+
 /// Job-number fallback for promotion when the operations backend reports no
 /// pid.
 static JOB_SEQUENCE: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(1);
@@ -654,6 +732,7 @@ pub fn create_bash_tool_definition_with_options(
     let spawn_hook = options.spawn_hook.clone();
     let auto_background_after = options.auto_background_after;
     let on_background_completion = options.on_background_completion.clone();
+    let auto_background_registry = options.auto_background_registry.clone();
     let execute: crate::tools::tool_definition::ExecuteFn = {
         Arc::new(move |tool_call_id, params, signal, on_update| {
             let cwd = cwd.clone();
@@ -665,6 +744,7 @@ pub fn create_bash_tool_definition_with_options(
                 spawn_hook: spawn_hook.clone(),
                 auto_background_after,
                 on_background_completion: on_background_completion.clone(),
+                auto_background_registry: auto_background_registry.clone(),
             };
             Box::pin(async move {
                 let command = params
@@ -717,7 +797,7 @@ mod auto_background_tests {
     use std::sync::Arc;
     use std::time::{Duration, Instant};
 
-    use super::{execute_bash, BashToolOptions};
+    use super::{execute_bash, BashOperations, BashToolOptions, ExecFuture, ExecOptions};
     use pa_agent::auto_background::AutoBackgroundCompletion;
 
     #[tokio::test]
@@ -845,5 +925,255 @@ Continue other work or end the turn."
             "slow-lander\n"
         );
         assert!(rx.try_recv().is_err(), "no notice when promotion is off");
+    }
+
+    /// A `BashOperations` whose exec resolves only when the test releases it
+    /// (edge-race control: the release fires at the promotion window).
+    struct HeldOps {
+        release: Arc<tokio::sync::Notify>,
+    }
+
+    impl BashOperations for HeldOps {
+        fn exec<'a>(
+            &'a self,
+            _command: &'a str,
+            _cwd: &'a str,
+            options: ExecOptions<'a>,
+        ) -> ExecFuture<'a> {
+            let release = Arc::clone(&self.release);
+            Box::pin(async move {
+                if let Some(on_spawn) = options.on_spawn {
+                    on_spawn(4321);
+                }
+                release.notified().await;
+                (options.on_data)(b"edge-lander\n");
+                Ok(Some(0))
+            })
+        }
+    }
+
+    #[tokio::test]
+    async fn a_zero_window_arm_disables_even_with_tool_options_windows() {
+        // The loop's zero arm must win over a live tool-options window: a
+        // missing arm falls back to the options (which would promote).
+        let registry = pa_agent::auto_background::AutoBackgroundRegistry::new();
+        let (tx, mut rx) = tokio::sync::mpsc::unbounded_channel::<AutoBackgroundCompletion>();
+        let notice: pa_agent::auto_background::AutoBackgroundNoticeFn =
+            Arc::new(move |completion| {
+                tx.send(completion).ok();
+            });
+        registry.arm(
+            "call-0",
+            pa_agent::auto_background::AutoBackgroundArm {
+                window: Duration::ZERO,
+                notice: Some(Arc::clone(&notice)),
+            },
+        );
+        let ops = Arc::new(HeldOps {
+            release: Arc::new(tokio::sync::Notify::new()),
+        });
+        let release = Arc::clone(&ops.release);
+        tokio::spawn(async move {
+            tokio::time::sleep(Duration::from_secs(1)).await;
+            release.notify_one();
+        });
+        let options = BashToolOptions {
+            operations: Some(ops),
+            auto_background_after: Some(Duration::from_millis(200)),
+            on_background_completion: Some(notice),
+            auto_background_registry: Some(Arc::new(registry)),
+            ..BashToolOptions::default()
+        };
+        let result = execute_bash("call-0", ".", &options, "sleep 1", None, None, None, None)
+            .await
+            .expect("zero arm runs inline");
+        let text = result.content[0].as_text().expect("text block");
+        assert!(
+            !text.starts_with("Command exceeded"),
+            "the zero arm must disable promotion, got: {text}"
+        );
+        assert!(result.details.is_none(), "no promotion details");
+        assert!(rx.try_recv().is_err(), "no notice for a disabled call");
+    }
+
+    #[tokio::test]
+    async fn promotion_requires_a_notice_lane() {
+        // Without a completion lane the synthetic result would promise a
+        // wake that can never arrive: promotion must not fire.
+        let registry = pa_agent::auto_background::AutoBackgroundRegistry::new();
+        registry.arm(
+            "call-1",
+            pa_agent::auto_background::AutoBackgroundArm {
+                window: Duration::from_millis(200),
+                notice: None,
+            },
+        );
+        let ops = Arc::new(HeldOps {
+            release: Arc::new(tokio::sync::Notify::new()),
+        });
+        let release = Arc::clone(&ops.release);
+        tokio::spawn(async move {
+            tokio::time::sleep(Duration::from_secs(1)).await;
+            release.notify_one();
+        });
+        let options = BashToolOptions {
+            operations: Some(ops),
+            auto_background_after: Some(Duration::from_millis(200)),
+            auto_background_registry: Some(Arc::new(registry)),
+            ..BashToolOptions::default()
+        };
+        let result = execute_bash("call-1", ".", &options, "sleep 1", None, None, None, None)
+            .await
+            .expect("laneless call runs inline");
+        let text = result.content[0].as_text().expect("text block");
+        assert!(
+            !text.starts_with("Command exceeded"),
+            "promotion without a notice lane strands the command: {text}"
+        );
+        assert!(result.details.is_none(), "no promotion details");
+    }
+
+    #[tokio::test]
+    async fn promotion_releases_the_streamed_update_lane() {
+        // The agent loop's update emitter drains only once every callback
+        // sender drops: the exec task must release the on_update callback
+        // at promotion, not at process exit (or the tool call wedges).
+        let registry = pa_agent::auto_background::AutoBackgroundRegistry::new();
+        let (tx, mut rx) = tokio::sync::mpsc::unbounded_channel::<AutoBackgroundCompletion>();
+        let notice: pa_agent::auto_background::AutoBackgroundNoticeFn =
+            Arc::new(move |completion| {
+                tx.send(completion).ok();
+            });
+        registry.arm(
+            "call-2",
+            pa_agent::auto_background::AutoBackgroundArm {
+                window: Duration::from_millis(200),
+                notice: Some(Arc::clone(&notice)),
+            },
+        );
+        let callback: super::OnUpdate = Arc::new(|_| {});
+        let ops = Arc::new(HeldOps {
+            release: Arc::new(tokio::sync::Notify::new()),
+        });
+        let release = Arc::clone(&ops.release);
+        tokio::spawn(async move {
+            tokio::time::sleep(Duration::from_secs(2)).await;
+            release.notify_one();
+        });
+        let options = BashToolOptions {
+            operations: Some(ops),
+            auto_background_after: Some(Duration::from_millis(200)),
+            on_background_completion: Some(notice),
+            auto_background_registry: Some(Arc::new(registry)),
+            ..BashToolOptions::default()
+        };
+        let result = execute_bash(
+            "call-2",
+            ".",
+            &options,
+            "sleep 8",
+            None,
+            None,
+            None,
+            Some(Arc::clone(&callback)),
+        )
+        .await
+        .expect("promotion returns Ok");
+        assert!(
+            result.content[0]
+                .as_text()
+                .expect("text block")
+                .starts_with("Command exceeded"),
+            "the call must promote"
+        );
+        // The exec task's callback clone must drop once the task observes
+        // the promotion — long before the held command's release at 2s
+        // (a teardown deferred to process exit fails this deadline).
+        let deadline = Instant::now() + Duration::from_secs(1);
+        while Arc::strong_count(&callback) > 1 {
+            assert!(
+                Instant::now() < deadline,
+                "the promoted exec task never released the update lane"
+            );
+            tokio::time::sleep(Duration::from_millis(20)).await;
+        }
+        let completion = tokio::time::timeout(Duration::from_secs(5), rx.recv())
+            .await
+            .expect("the held command completes after teardown")
+            .expect("notice lane open");
+        assert_eq!(completion.pid, Some(4321));
+    }
+
+    #[tokio::test]
+    async fn the_promotion_edge_never_strands_a_completion() {
+        // The window edge and the completion can race: exactly one of
+        // {synthetic result, then notice} or {normal result, no notice}
+        // must hold — never a synthetic result with no completion and
+        // never a lost ExecDone.
+        let window = Duration::from_millis(300);
+        // The release alternates: just before the window (the Done path
+        // must win) and just after it (the promotion must win and the
+        // notice must land) — plus the true edge in between.
+        for rep in 0..10 {
+            let registry = pa_agent::auto_background::AutoBackgroundRegistry::new();
+            let (tx, mut rx) = tokio::sync::mpsc::unbounded_channel::<AutoBackgroundCompletion>();
+            let notice: pa_agent::auto_background::AutoBackgroundNoticeFn =
+                Arc::new(move |completion| {
+                    tx.send(completion).ok();
+                });
+            registry.arm(
+                "call-3",
+                pa_agent::auto_background::AutoBackgroundArm {
+                    window,
+                    notice: Some(Arc::clone(&notice)),
+                },
+            );
+            let ops = Arc::new(HeldOps {
+                release: Arc::new(tokio::sync::Notify::new()),
+            });
+            let release = Arc::clone(&ops.release);
+            // Fire the release around the window edge itself.
+            let release_delay = Duration::from_millis(match rep % 2 {
+                0 => 295,
+                _ => 305,
+            });
+            tokio::spawn(async move {
+                tokio::time::sleep(release_delay).await;
+                release.notify_one();
+            });
+            let options = BashToolOptions {
+                operations: Some(ops),
+                auto_background_after: Some(window),
+                on_background_completion: Some(notice),
+                auto_background_registry: Some(Arc::new(registry)),
+                ..BashToolOptions::default()
+            };
+            let result = execute_bash(
+                "call-3",
+                ".",
+                &options,
+                "held command",
+                None,
+                None,
+                None,
+                None,
+            )
+            .await
+            .expect("edge call resolves");
+            let text = result.content[0].as_text().expect("text block");
+            if text.starts_with("Command exceeded") {
+                let completion = tokio::time::timeout(Duration::from_secs(2), rx.recv())
+                    .await
+                    .expect("a promoted call's completion must arrive")
+                    .expect("notice lane open");
+                assert_eq!(completion.exit_code, Some(0));
+            } else {
+                assert_eq!(text, "edge-lander\n", "normal result carries the output");
+                assert!(
+                    rx.try_recv().is_err(),
+                    "an inline completion fires no notice"
+                );
+            }
+        }
     }
 }

@@ -6,7 +6,7 @@
 //! and the tool (which owns the running process).
 
 use std::collections::HashMap;
-use std::sync::{Arc, Mutex, OnceLock};
+use std::sync::{Arc, Mutex};
 use std::time::Duration;
 
 /// The default auto-background window: an inline bash call is promoted to
@@ -45,53 +45,76 @@ pub struct AutoBackgroundArm {
 }
 
 /// The loop-level directive derived from [`crate::agent::AgentOptions`]:
-/// the resolved window plus the embedding's notice hook.
-#[derive(Clone, Default)]
+/// the resolved window plus the embedding's notice hook, and this agent's
+/// arm registry.
+#[derive(Clone)]
 pub struct AutoBackgroundDirective {
-    /// Zero disables promotion for every tool call.
+    /// The promotion window; a zero duration disables promotion (the arm
+    /// still reaches the bash dispatch so the disable is the loop's, not
+    /// the tool options' fallback).
     pub window: Duration,
     pub notice: Option<AutoBackgroundNoticeFn>,
+    /// This agent's arm registry: the loop arms here, the bash dispatch
+    /// takes from here. One instance per agent, never process-global:
+    /// provider tool-call ids (e.g. `call_0`) repeat across concurrent
+    /// agents, and a global map would cross-wire their windows and notice
+    /// lanes.
+    pub registry: Arc<AutoBackgroundRegistry>,
 }
 
-impl AutoBackgroundDirective {
-    /// Whether the directive arms a watchdog for this window.
-    #[must_use]
-    pub fn armed(&self) -> bool {
-        !self.window.is_zero()
+impl Default for AutoBackgroundDirective {
+    fn default() -> Self {
+        Self {
+            window: Duration::ZERO,
+            notice: None,
+            registry: Arc::new(AutoBackgroundRegistry::new()),
+        }
     }
 }
 
-fn arms() -> &'static Mutex<HashMap<String, AutoBackgroundArm>> {
-    static ARMS: OnceLock<Mutex<HashMap<String, AutoBackgroundArm>>> = OnceLock::new();
-    ARMS.get_or_init(|| Mutex::new(HashMap::new()))
+/// One agent's per-call arm registry: the hand-off channel between the
+/// agent loop (which knows the configured window and notice lane) and the
+/// bash dispatch running its tool calls.
+#[derive(Default)]
+pub struct AutoBackgroundRegistry {
+    arms: Mutex<HashMap<String, AutoBackgroundArm>>,
 }
 
-/// Arm the watchdog for one tool call. The bash dispatch consumes the arm
-/// (see [`take`]); the loop also disarms after the call settles, so an
-/// arm for a call that never reached the bash dispatch cannot leak.
-pub fn arm(tool_call_id: &str, value: AutoBackgroundArm) {
-    arms()
-        .lock()
-        .unwrap_or_else(std::sync::PoisonError::into_inner)
-        .insert(tool_call_id.to_string(), value);
-}
+impl AutoBackgroundRegistry {
+    /// An empty registry.
+    #[must_use]
+    pub fn new() -> Self {
+        Self::default()
+    }
 
-/// Consume the arm for one tool call (the bash dispatch's promotion
-/// window and notice lane for this call).
-#[must_use]
-pub fn take(tool_call_id: &str) -> Option<AutoBackgroundArm> {
-    arms()
-        .lock()
-        .unwrap_or_else(std::sync::PoisonError::into_inner)
-        .remove(tool_call_id)
-}
+    /// Arm the watchdog for one tool call. The bash dispatch consumes the
+    /// arm (see [`Self::take`]); the loop also disarms after the call
+    /// settles, so an arm for a call that never reached the bash dispatch
+    /// cannot leak.
+    pub fn arm(&self, tool_call_id: &str, value: AutoBackgroundArm) {
+        self.arms
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
+            .insert(tool_call_id.to_string(), value);
+    }
 
-/// Remove an unconsumed arm (the loop's post-call cleanup).
-pub fn disarm(tool_call_id: &str) {
-    arms()
-        .lock()
-        .unwrap_or_else(std::sync::PoisonError::into_inner)
-        .remove(tool_call_id);
+    /// Consume the arm for one tool call (the bash dispatch's promotion
+    /// window and notice lane for this call).
+    #[must_use]
+    pub fn take(&self, tool_call_id: &str) -> Option<AutoBackgroundArm> {
+        self.arms
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
+            .remove(tool_call_id)
+    }
+
+    /// Remove an unconsumed arm (the loop's post-call cleanup).
+    pub fn disarm(&self, tool_call_id: &str) {
+        self.arms
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
+            .remove(tool_call_id);
+    }
 }
 
 #[cfg(test)]
@@ -100,25 +123,62 @@ mod tests {
 
     #[test]
     fn arm_take_and_disarm_round_trip() {
-        arm(
+        let registry = AutoBackgroundRegistry::new();
+        registry.arm(
             "t1",
             AutoBackgroundArm {
                 window: Duration::from_secs(2),
                 notice: None,
             },
         );
-        let taken = take("t1");
+        let taken = registry.take("t1");
         assert_eq!(taken.expect("arm consumed").window, Duration::from_secs(2));
-        assert!(take("t1").is_none(), "arm consumed once");
+        assert!(registry.take("t1").is_none(), "arm consumed once");
 
-        arm(
+        registry.arm(
             "t2",
             AutoBackgroundArm {
                 window: Duration::from_secs(1),
                 notice: None,
             },
         );
-        disarm("t2");
-        assert!(take("t2").is_none(), "disarmed arm is gone");
+        registry.disarm("t2");
+        assert!(registry.take("t2").is_none(), "disarmed arm is gone");
+    }
+
+    #[test]
+    fn registries_do_not_cross_wire() {
+        // The same provider id across two agents (a `call_0` repeat) must
+        // not reach into the other agent's window or notice lane.
+        let a = AutoBackgroundRegistry::new();
+        let b = AutoBackgroundRegistry::new();
+        a.arm(
+            "call_0",
+            AutoBackgroundArm {
+                window: Duration::from_millis(100),
+                notice: None,
+            },
+        );
+        b.arm(
+            "call_0",
+            AutoBackgroundArm {
+                window: Duration::from_millis(900),
+                notice: None,
+            },
+        );
+        assert_eq!(
+            a.take("call_0").expect("a's arm").window,
+            Duration::from_millis(100)
+        );
+        assert_eq!(
+            b.take("call_0").expect("b's arm").window,
+            Duration::from_millis(900)
+        );
+        assert!(a.take("call_0").is_none(), "each arm consumed once");
+        let fresh = AutoBackgroundRegistry::new();
+        assert!(
+            fresh.take("call_0").is_none(),
+            "a fresh registry has no arms"
+        );
     }
 }
