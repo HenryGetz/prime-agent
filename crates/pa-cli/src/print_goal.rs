@@ -831,6 +831,7 @@ mod tests {
         let engine = Arc::new(
             pa_core::session_engine::engine::create_session(
                 pa_core::session_engine::engine::SessionEngineConfig {
+                    auto_background_notice: None,
                     on_late_sent_agent_message: None,
                     semantic_edges: None,
                     cron_store: None,
@@ -1449,6 +1450,7 @@ mod tests {
         let engine = Arc::new(
             pa_core::session_engine::engine::create_session(
                 pa_core::session_engine::engine::SessionEngineConfig {
+                    auto_background_notice: None,
                     on_late_sent_agent_message: None,
                     semantic_edges: None,
                     cron_store: None,

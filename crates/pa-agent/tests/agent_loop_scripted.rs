@@ -713,3 +713,112 @@ fn scripted_event_shapes_round_trip_through_the_event_enum() {
             if matches!(**event, AssistantMessageEvent::Error { .. })
     )));
 }
+
+#[tokio::test]
+async fn inline_bash_calls_get_the_auto_background_arm() {
+    use pa_agent::auto_background::{take, AutoBackgroundArm};
+
+    /// A bash-named tool that consumes the loop's watchdog arm and reports
+    /// it, mirroring the pa-core bash dispatch's arm consumption.
+    struct ArmProbeTool {
+        armed: std::sync::atomic::AtomicBool,
+        window_ms: std::sync::atomic::AtomicU64,
+    }
+
+    impl AgentTool for ArmProbeTool {
+        fn name(&self) -> &'static str {
+            "bash"
+        }
+
+        fn description(&self) -> &'static str {
+            "Arm probe."
+        }
+
+        fn parameters(&self) -> &'static serde_json::Value {
+            static SCHEMA: OnceLock<serde_json::Value> = OnceLock::new();
+            SCHEMA.get_or_init(|| {
+                serde_json::json!({ "type": "object", "properties": { "command": { "type": "string" } } })
+            })
+        }
+
+        fn execute(
+            self: Arc<Self>,
+            tool_call_id: String,
+            _params: serde_json::Value,
+            _signal: AbortSignal,
+            _on_update: AgentToolUpdateCallback,
+        ) -> pa_agent::BoxFut<'static, anyhow::Result<AgentToolResult>> {
+            Box::pin(async move {
+                match take(&tool_call_id) {
+                    Some(AutoBackgroundArm { window, notice }) => {
+                        assert!(notice.is_none(), "test wires no notice lane");
+                        self.armed.store(true, Ordering::SeqCst);
+                        self.window_ms.store(
+                            u64::try_from(window.as_millis()).expect("window ms fit"),
+                            Ordering::SeqCst,
+                        );
+                    }
+                    None => self.armed.store(false, Ordering::SeqCst),
+                }
+                Ok(AgentToolResult::text("probe done"))
+            })
+        }
+    }
+
+    let probe = Arc::new(ArmProbeTool {
+        armed: std::sync::atomic::AtomicBool::new(false),
+        window_ms: std::sync::atomic::AtomicU64::new(0),
+    });
+    let provider = Arc::new(ScriptedProvider::new(test_model()));
+    let agent = Agent::new(AgentOptions {
+        initial_state: pa_agent::agent::AgentInitialState {
+            tools: Some(vec![probe.clone() as Arc<dyn AgentTool>]),
+            ..Default::default()
+        },
+        stream_fn: Some(provider.stream_fn()),
+        auto_background_after: Some(2_500),
+        ..Default::default()
+    });
+    agent.set_model(test_model()).await;
+    provider.push_tool_call_turn(
+        None,
+        vec![("call-1", "bash", serde_json::json!({ "command": "true" }))],
+    );
+    provider.push_text_turn("done");
+    agent.prompt("run it").await.unwrap();
+    agent.wait_for_idle().await;
+
+    assert!(
+        probe.armed.load(Ordering::SeqCst),
+        "bash call must be armed"
+    );
+    assert_eq!(probe.window_ms.load(Ordering::SeqCst), 2_500);
+
+    // A zero window never arms, and other tools never see the arm.
+    let probe = Arc::new(ArmProbeTool {
+        armed: std::sync::atomic::AtomicBool::new(false),
+        window_ms: std::sync::atomic::AtomicU64::new(0),
+    });
+    let provider = Arc::new(ScriptedProvider::new(test_model()));
+    let agent = Agent::new(AgentOptions {
+        initial_state: pa_agent::agent::AgentInitialState {
+            tools: Some(vec![probe.clone() as Arc<dyn AgentTool>]),
+            ..Default::default()
+        },
+        stream_fn: Some(provider.stream_fn()),
+        auto_background_after: Some(0),
+        ..Default::default()
+    });
+    agent.set_model(test_model()).await;
+    provider.push_tool_call_turn(
+        None,
+        vec![("call-2", "bash", serde_json::json!({ "command": "true" }))],
+    );
+    provider.push_text_turn("done");
+    agent.prompt("run it").await.unwrap();
+    agent.wait_for_idle().await;
+    assert!(
+        !probe.armed.load(Ordering::SeqCst),
+        "a zero window disables the watchdog"
+    );
+}

@@ -106,6 +106,10 @@ pub struct SessionEngineConfig {
     /// request ids on the wire).
     pub semantic_edges: Option<super::semantic_edges::SemanticEdgeIdentity>,
     pub on_late_sent_agent_message: Option<crate::tools::ipython::LateSentAgentMessageHandler>,
+    /// The completion notice for promoted inline bash jobs: the embedding's
+    /// lane for the `[bash-done]` wake (the daemon wires its bash-completion
+    /// sink); `None` keeps promotions silent.
+    pub auto_background_notice: Option<pa_agent::auto_background::AutoBackgroundNoticeFn>,
 }
 
 pub struct SessionEngine {
@@ -263,6 +267,9 @@ pub async fn create_session(mut config: SessionEngineConfig) -> anyhow::Result<S
     let compaction_threshold_percent = settings.get_compaction_threshold_percent();
     let auto_refine_gates =
         super::refine::AutoRefineGates::from_settings(settings.settings().auto_refine.as_ref());
+    // Inline-bash promotion window: read once here so every rebuilt loop
+    // config carries the same setting.
+    let auto_background_after_ms = settings.get_auto_background_after_ms();
     // Request timing: the settings half of the flag is read once here
     // (`settings` moves into the loader); the `PI_REQUEST_TIMING` half stays live.
     let request_timing_settings = settings.get_request_timing();
@@ -742,6 +749,8 @@ pub async fn create_session(mut config: SessionEngineConfig) -> anyhow::Result<S
         should_stop_before_turn: config.queued_steering_probe.clone(),
         steering_mode: config.steering_mode,
         follow_up_mode: config.follow_up_mode,
+        auto_background_after: Some(auto_background_after_ms),
+        auto_background_notice: config.auto_background_notice.clone(),
         ..Default::default()
     });
 

@@ -12,6 +12,7 @@ use super::{
     ProviderTarget, QuotaParkState, SessionCommandExecution, SessionCommandParams,
     SessionEngineConfig, SupervisorChildSessions, Value,
 };
+use crate::bash_notices::auto_background_to_bash_completion;
 
 /// The instruction the floor appends to a bare skill invocation: ask what
 /// the user wants first, never an imperative to execute.
@@ -961,6 +962,26 @@ impl AgentSessionEngine {
         self.config.cron_store.clone()
     }
 
+    /// The promoted inline bash job notice lane: the same bash-completion
+    /// sink the kernel's backgrounded `bash()` jobs feed (see
+    /// [`super::bash_notices`]). `None` outside a worker with the lane.
+    pub(super) fn auto_background_notice(
+        &self,
+    ) -> Option<pa_agent::auto_background::AutoBackgroundNoticeFn> {
+        let sink = self
+            .bash_completion_sink
+            .lock()
+            .expect("bash completion sink lock")
+            .clone()?;
+        Some(std::sync::Arc::new(
+            move |completion: pa_agent::auto_background::AutoBackgroundCompletion| {
+                if let Some(notice) = auto_background_to_bash_completion(&completion) {
+                    sink(notice);
+                }
+            },
+        ))
+    }
+
     /// The kernel cron binding: the live active session id plus the
     /// durable id + file from the header. `None` outside a daemon worker.
     pub(super) fn kernel_cron_binding(
@@ -1261,6 +1282,10 @@ impl AgentSessionEngine {
                 wiring.binding = self.kernel_cron_binding().or(wiring.binding);
                 wiring
             }),
+            // Promoted inline bash jobs complete through the same
+            // bash-completion lane as backgrounded `bash()` jobs (the
+            // `[bash-done pid:N exit:M]` row + wake).
+            auto_background_notice: self.auto_background_notice(),
         })
         .await
         .inspect(|engine| {

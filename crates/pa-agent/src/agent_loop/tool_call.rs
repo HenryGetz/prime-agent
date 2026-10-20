@@ -110,15 +110,20 @@ pub(crate) struct ExecutedToolCallOutcome {
     is_error: bool,
 }
 
-/// Race the tool against abort, stream `tool_execution_update` events
-/// through a background emitter task, and return an error tool result when
-/// the tool fails (or aborts, with the TS message "Tool execution aborted").
-pub(crate) async fn execute_prepared_tool_call(
+/// The streamed-update lane for one tool execution: the `on_update`
+/// callback the tool calls with partial results, the emitter task that
+/// forwards them as `ToolExecutionUpdate` events, and the accepting flag.
+fn spawn_update_emitter(
     prepared: &PreparedToolCall,
     progress: ToolProgressCadence,
     signal: Option<&AbortSignal>,
     emit: &AgentEventSink,
-) -> ExecutedToolCallOutcome {
+) -> (
+    Arc<std::sync::atomic::AtomicBool>,
+    AgentToolUpdateCallback,
+    tokio::sync::mpsc::UnboundedSender<AgentToolResult>,
+    tokio::task::JoinHandle<anyhow::Result<()>>,
+) {
     let accepting_updates = Arc::new(std::sync::atomic::AtomicBool::new(true));
     let (update_tx, mut update_rx) = tokio::sync::mpsc::unbounded_channel::<AgentToolResult>();
     let update_tx_for_callback = update_tx.clone();
@@ -166,6 +171,68 @@ pub(crate) async fn execute_prepared_tool_call(
         })
     };
 
+    (accepting_updates, on_update, update_tx, emit_updates)
+}
+
+/// One inline bash call's watchdog registration: the arm is consumed by
+/// the bash dispatch; the drop removes an unconsumed arm.
+struct AutoBackgroundArmGuard {
+    armed: bool,
+    tool_call_id: String,
+}
+
+impl AutoBackgroundArmGuard {
+    fn arm_for(
+        directive: &crate::auto_background::AutoBackgroundDirective,
+        tool_call_id: &str,
+        tool_name: &str,
+    ) -> Self {
+        let armed = directive.armed() && tool_name == "bash";
+        if armed {
+            crate::auto_background::arm(
+                tool_call_id,
+                crate::auto_background::AutoBackgroundArm {
+                    window: directive.window,
+                    notice: directive.notice.clone(),
+                },
+            );
+        }
+        Self {
+            armed,
+            tool_call_id: tool_call_id.to_string(),
+        }
+    }
+}
+
+impl Drop for AutoBackgroundArmGuard {
+    fn drop(&mut self) {
+        if self.armed {
+            crate::auto_background::disarm(&self.tool_call_id);
+        }
+    }
+}
+
+/// Race the tool against abort, stream `tool_execution_update` events
+/// through a background emitter task, and return an error tool result when
+/// the tool fails (or aborts, with the TS message "Tool execution aborted").
+pub(crate) async fn execute_prepared_tool_call(
+    prepared: &PreparedToolCall,
+    signal: Option<&AbortSignal>,
+    emit: &AgentEventSink,
+    auto_background: &crate::auto_background::AutoBackgroundDirective,
+) -> ExecutedToolCallOutcome {
+    let (accepting_updates, on_update, update_tx, emit_updates) =
+        spawn_update_emitter(prepared, signal, emit);
+    // The inline-bash watchdog: arm the promotion window for this call so
+    // the bash dispatch (pa-core) can promote a command that outlives it.
+    // The arm is consumed by the dispatch; the guard removes anything left
+    // over after the call settles.
+    let auto_background_guard = AutoBackgroundArmGuard::arm_for(
+        auto_background,
+        &prepared.tool_call.id,
+        prepared.tool.name(),
+    );
+
     let execute_result = race_with_abort(
         (Arc::clone(&prepared.tool)).execute(
             prepared.tool_call.id.clone(),
@@ -178,6 +245,8 @@ pub(crate) async fn execute_prepared_tool_call(
     .await;
     heartbeat.stop();
     let elapsed_ms = elapsed_ms_since(started_at);
+
+    drop(auto_background_guard);
 
     accepting_updates.store(false, std::sync::atomic::Ordering::SeqCst);
     drop(update_tx);
