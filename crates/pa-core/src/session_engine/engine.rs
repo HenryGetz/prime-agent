@@ -110,6 +110,13 @@ pub struct SessionEngineConfig {
     /// lane for the `[bash-done]` wake (the daemon wires its bash-completion
     /// sink); `None` keeps promotions silent.
     pub auto_background_notice: Option<pa_agent::auto_background::AutoBackgroundNoticeFn>,
+    /// The agent's inline-bash arm registry. An embedding that registers a
+    /// native bash tool must pass the SAME registry here and to that tool's
+    /// [`crate::tools::BashToolOptions::auto_background_registry`] - the
+    /// loop arms here and the bash dispatch takes from there. `None` builds
+    /// a private registry (promotions only apply to tools sharing it).
+    pub auto_background_registry:
+        Option<std::sync::Arc<pa_agent::auto_background::AutoBackgroundRegistry>>,
 }
 
 pub struct SessionEngine {
@@ -751,6 +758,7 @@ pub async fn create_session(mut config: SessionEngineConfig) -> anyhow::Result<S
         follow_up_mode: config.follow_up_mode,
         auto_background_after: Some(auto_background_after_ms),
         auto_background_notice: config.auto_background_notice.clone(),
+        auto_background_registry: config.auto_background_registry.clone(),
         ..Default::default()
     });
 

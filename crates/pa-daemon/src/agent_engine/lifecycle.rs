@@ -1286,6 +1286,12 @@ impl AgentSessionEngine {
             // bash-completion lane as backgrounded `bash()` jobs (the
             // `[bash-done pid:N exit:M]` row + wake).
             auto_background_notice: self.auto_background_notice(),
+            // The shared arm registry for the same lane: a session that
+            // ever registers a native bash tool shares this registry with
+            // it, so the loop's arms reach the bash dispatch.
+            auto_background_registry: Some(std::sync::Arc::new(
+                pa_agent::auto_background::AutoBackgroundRegistry::new(),
+            )),
         })
         .await
         .inspect(|engine| {

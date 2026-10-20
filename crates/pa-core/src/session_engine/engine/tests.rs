@@ -64,6 +64,7 @@ async fn engine_runs_tool_loop_and_persists() {
         inner_stream(model, context, options)
     });
     let engine = create_session(SessionEngineConfig {
+        auto_background_registry: None,
         auto_background_notice: None,
         on_late_sent_agent_message: None,
         semantic_edges: None,
@@ -174,6 +175,7 @@ async fn spawned_child_prompt_stamps_its_depth() {
     let cwd = tmp.path().join("project");
     std::fs::create_dir_all(&cwd).unwrap();
     let engine = create_session(SessionEngineConfig {
+        auto_background_registry: None,
         auto_background_notice: None,
         on_late_sent_agent_message: None,
         semantic_edges: None,
@@ -247,6 +249,7 @@ async fn oauth_creds_unlock_generic_mcp_gating_in_new_sessions() {
         stream_fn: pa_agent::stream::StreamFn,
     ) -> SessionEngineConfig {
         SessionEngineConfig {
+            auto_background_registry: None,
             auto_background_notice: None,
             on_late_sent_agent_message: None,
             semantic_edges: None,
@@ -437,6 +440,7 @@ async fn create_session_appends_missing_resume_settings_rows() {
         ))
         .unwrap();
     let engine = create_session(SessionEngineConfig {
+        auto_background_registry: None,
         auto_background_notice: None,
         on_late_sent_agent_message: None,
         semantic_edges: None,
