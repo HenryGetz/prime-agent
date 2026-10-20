@@ -625,10 +625,18 @@ pub async fn execute_bash(
             if let Some(path) = &snapshot.full_output_path {
                 details["fullOutputPath"] = json!(path);
             }
+            // The spill path goes in the TEXT, not just `details` (details
+            // are for logs and UI rendering; they never reach the model):
+            // without it the model cannot find the streamed output after
+            // the wake.
+            let spill_note = match &snapshot.full_output_path {
+                Some(path) => format!("Output streams to disk: {path}."),
+                None => "Output streams to disk.".to_string(),
+            };
             Ok(ToolExecutionResult {
                 content: vec![ToolContentBlock::text(format!(
-                    "Command exceeded {window_text}. Auto-backgrounded as job {job}. Output \
-streams to disk. The completion notification wakes the turn. Continue other work or end the turn."
+                    "Command exceeded {window_text}. Auto-backgrounded as job {job}. \
+{spill_note} The completion notification wakes the turn. Continue other work or end the turn."
                 ))],
                 details: Some(details),
                 is_error: false,
@@ -847,12 +855,18 @@ mod auto_background_tests {
             text.starts_with("Command exceeded 2s. Auto-backgrounded as job "),
             "unexpected synthetic text: {text}"
         );
+        // The spill path must be IN the text: details never reach the model.
+        let details = result.details.clone().expect("promotion details");
+        let spill_path = details["fullOutputPath"].as_str().expect("spill path");
+        assert!(
+            text.contains(&format!("Output streams to disk: {spill_path}.")),
+            "the synthetic text must carry the spill path: {text}"
+        );
         assert!(text.contains(
-            "Output streams to disk. The completion notification wakes the turn. \
-Continue other work or end the turn."
+            "The completion notification wakes the turn. Continue other work or end the turn."
         ));
         assert!(!result.is_error);
-        let details = result.details.expect("promotion details");
+        let details = result.details.clone().expect("promotion details");
         assert_eq!(details["autoBackgrounded"], serde_json::json!(true));
         let pid = details["pid"].as_u64().expect("pid reported");
 
