@@ -440,12 +440,38 @@ pub async fn execute_bash(
             let gate_run_signal = signal.clone();
             let gate_handoff = Arc::clone(&handoff);
             let gate_job_signal = task_signal.clone();
+            // The gate claims the handoff ONLY from RUNNING, exactly like
+            // the promotion and the completion edges: an abort at the
+            // promotion boundary cannot both kill the job and leave the
+            // synthetic "keeps running" result. Once the handoff settles
+            // (promotion, completion, or abort) the gate exits, so it
+            // never outlives the call it guarded.
             tokio::spawn(async move {
                 let Some(run_signal) = gate_run_signal else {
                     return;
                 };
-                run_signal.cancelled_owned().await;
-                if gate_handoff.load(Ordering::SeqCst) == HANDOFF_RUNNING {
+                while !run_signal.is_cancelled() {
+                    if gate_handoff.load(Ordering::SeqCst) != HANDOFF_RUNNING {
+                        // The handoff settled (promotion, completion, or a
+                        // competing abort): the gate is closed — exit now,
+                        // so it never outlives the call it guarded.
+                        return;
+                    }
+                    tokio::time::sleep(Duration::from_millis(50)).await;
+                }
+                // Claim the abort edge ONLY from RUNNING, exactly like the
+                // promotion and the completion edges: an abort at the
+                // promotion boundary cannot both kill the job and leave the
+                // synthetic "keeps running" result standing.
+                if gate_handoff
+                    .compare_exchange(
+                        HANDOFF_RUNNING,
+                        HANDOFF_ABORTED,
+                        Ordering::SeqCst,
+                        Ordering::SeqCst,
+                    )
+                    .is_ok()
+                {
                     gate_job_signal.cancel();
                 }
             });
@@ -508,7 +534,9 @@ pub async fn execute_bash(
                 // emitter drains only once every callback sender drops,
                 // so holding the callback here would wedge the tool call
                 // (and the turn) until the process finished.
-                if !update_lane_settled && handoff.load(Ordering::SeqCst) == HANDOFF_PROMOTED {
+                if !update_lane_settled && handoff.load(Ordering::SeqCst) != HANDOFF_RUNNING {
+                    // Promoted or abort-gated: no caller is streaming, so
+                    // release the update lane NOW.
                     update_lane_settled = true;
                     task_on_update = None;
                 }
@@ -542,21 +570,19 @@ pub async fn execute_bash(
                 (snapshot, acc.get_last_line_bytes())
             };
             let pid = *pid_slot.lock().unwrap();
-            if handoff
+            let claimed_done = handoff
                 .compare_exchange(
                     HANDOFF_RUNNING,
                     HANDOFF_DONE,
                     Ordering::SeqCst,
                     Ordering::SeqCst,
                 )
-                .is_ok()
+                .is_ok();
+            if let Some(notice) = (!claimed_done
+                && handoff.load(Ordering::SeqCst) == HANDOFF_PROMOTED)
+                .then(|| notice.clone())
+                .flatten()
             {
-                let _ = done_tx.send(ExecDone {
-                    result: exec_result,
-                    snapshot,
-                    last_line_bytes,
-                });
-            } else if let Some(notice) = notice {
                 // The caller claimed the promotion edge first: the
                 // completion rides the notice lane. A terminal exec
                 // failure keeps the partial output and appends the same
@@ -588,8 +614,26 @@ pub async fn execute_bash(
                     exit_code: exec_result.as_ref().ok().copied().flatten(),
                     command: notice_command,
                     output,
-                    full_output_path: snapshot.full_output_path,
+                    full_output_path: snapshot.full_output_path.clone(),
                     status,
+                });
+                // The caller may still be inside its promotion-edge grace
+                // wait (the claim raced its window): deliver the ExecDone
+                // too — a caller that already returned drops it silently.
+                let _ = done_tx.send(ExecDone {
+                    result: exec_result,
+                    snapshot,
+                    last_line_bytes,
+                });
+            } else {
+                // DONE claimed inline, or the abort gate claimed ABORTED:
+                // the caller is still inline (an aborted run drops its
+                // frame in practice); hand it the real result. No notice —
+                // the inline caller reports the outcome itself.
+                let _ = done_tx.send(ExecDone {
+                    result: exec_result,
+                    snapshot,
+                    last_line_bytes,
                 });
             }
         });
@@ -623,9 +667,17 @@ pub async fn execute_bash(
                 Err(_) => anyhow::bail!("bash execution task failed"),
             },
             // The window edge claims the promotion only from RUNNING: the
-            // exec task may have completed at the same instant and claimed
-            // DONE first — its ExecDone is already queued.
-            ExecEvent::Promoted
+            // exec task may have completed at the same instant (claimed
+            // DONE), or the abort gate may have claimed ABORTED. The
+            // orphan record is written BEFORE the claim and released when
+            // the claim loses, so the record's active/inactive pair is
+            // always write-ordered (the completion's inactive write can
+            // only follow a won claim, which follows the active write).
+            ExecEvent::Promoted => {
+                let pid = *pid_slot.lock().unwrap();
+                if let Some(pid) = pid {
+                    crate::kernel::orphan_journal::record_orphan_process_state(pid as i32, true);
+                }
                 if handoff
                     .compare_exchange(
                         HANDOFF_RUNNING,
@@ -633,22 +685,41 @@ pub async fn execute_bash(
                         Ordering::SeqCst,
                         Ordering::SeqCst,
                     )
-                    .is_ok() =>
-            {
-                ExecEvent::Promoted
-            }
-            // The exec task claimed DONE a moment before its channel send:
-            // the send is guaranteed once DONE is claimed (only a task panic
-            // can drop it), so wait for it instead of failing the call.
-            ExecEvent::Promoted => match done_rx.try_recv() {
-                Ok(done) => ExecEvent::Done(done),
-                Err(_) => match tokio::time::timeout(PROMOTION_EDGE_RECV, &mut done_rx).await {
-                    Ok(Ok(done)) => ExecEvent::Done(done),
-                    Ok(Err(_)) | Err(_) => {
-                        anyhow::bail!("bash completion raced the promotion edge and was lost")
+                    .is_ok()
+                {
+                    ExecEvent::Promoted
+                } else {
+                    // The claim lost the edge (completion or abort gate):
+                    // the job never detached, so the orphan record is
+                    // spent immediately.
+                    if let Some(pid) = pid {
+                        crate::kernel::orphan_journal::record_orphan_process_state(
+                            pid as i32, false,
+                        );
                     }
-                },
-            },
+                    // A DONE-claimed task's channel send is microseconds
+                    // away (only a task panic can drop it); an ABORTED
+                    // task delivers its result at the killed process's
+                    // exit. Wait instead of failing the call.
+                    match done_rx.try_recv() {
+                        Ok(done) => ExecEvent::Done(done),
+                        Err(_) => {
+                            if let Ok(Ok(done)) =
+                                tokio::time::timeout(PROMOTION_EDGE_RECV, &mut done_rx).await
+                            {
+                                ExecEvent::Done(done)
+                            } else {
+                                if handoff.load(Ordering::SeqCst) == HANDOFF_ABORTED {
+                                    anyhow::bail!("aborted");
+                                }
+                                anyhow::bail!(
+                                    "bash completion raced the promotion edge and was lost"
+                                )
+                            }
+                        }
+                    }
+                }
+            }
             event @ ExecEvent::Done(_) => event,
         }
     };
@@ -667,14 +738,10 @@ pub async fn execute_bash(
                 acc.force_spill();
                 acc.snapshot()
             };
-            // The detached job outlives this call: journal it in the same
-            // orphan-process journal the kernel `bash()` lane uses, so a
-            // worker crash or restart reaps its process group instead of
-            // leaking it behind a wake that can never arrive (best-effort,
-            // kernel-lane parity).
-            if let Some(pid) = pid {
-                crate::kernel::orphan_journal::record_orphan_process_state(pid as i32, true);
-            }
+            // The orphan record for this pid was written BEFORE the
+            // promotion claim (see the edge race above), so a worker
+            // crash or restart reaps its process group instead of leaking
+            // it behind a wake that can never arrive.
             let job = match pid {
                 Some(pid) => pid.to_string(),
                 None => format!("bash-{}", JOB_SEQUENCE.fetch_add(1, Ordering::SeqCst)),
@@ -769,11 +836,14 @@ struct ExecDone {
 }
 
 /// The promotion/completion handoff states (see [`execute_bash`]): RUNNING
-/// moves to PROMOTED (the caller's window edge) or DONE (the exec task's
-/// completion) exactly once, whichever wins the edge race.
+/// moves to exactly one of PROMOTED (the caller's window edge), DONE (the
+/// exec task's completion), or ABORTED (the abort gate forwarding a run
+/// abort while the call is still inline) — the compare-exchanges decide
+/// the edge races atomically.
 const HANDOFF_RUNNING: u8 = 0;
 const HANDOFF_PROMOTED: u8 = 1;
 const HANDOFF_DONE: u8 = 2;
+const HANDOFF_ABORTED: u8 = 3;
 
 /// Grace for the promotion-edge recv: a DONE-claimed task's channel send is
 /// microseconds away; the bound only guards a panicked task.
@@ -1599,6 +1669,61 @@ mod auto_background_tests {
         assert!(result.details.is_none());
     }
 
+    #[tokio::test]
+    async fn an_inline_abort_kills_the_command_and_returns_the_status() {
+        // An abort while the call is still inline claims the edge atomically
+        // (RUNNING -> ABORTED) and kills the command: the caller gets the
+        // inline aborted result and NO notice fires — the abort-gated
+        // completion never rides the notice lane.
+        let registry = pa_agent::auto_background::AutoBackgroundRegistry::new();
+        let (tx, mut rx) = tokio::sync::mpsc::unbounded_channel::<AutoBackgroundCompletion>();
+        registry.arm(
+            "call-inline-abort",
+            pa_agent::auto_background::AutoBackgroundArm {
+                window: Duration::from_secs(10),
+                notice: Some(Arc::new(move |completion| {
+                    tx.send(completion).ok();
+                })),
+            },
+        );
+        let run_signal = super::AbortSignal::new();
+        let cancel_signal = run_signal.clone();
+        tokio::spawn(async move {
+            tokio::time::sleep(Duration::from_millis(300)).await;
+            cancel_signal.cancel();
+        });
+        let options = BashToolOptions {
+            auto_background_registry: Some(Arc::new(registry)),
+            ..BashToolOptions::default()
+        };
+        let result = execute_bash(
+            "call-inline-abort",
+            ".",
+            &options,
+            "sleep 3; echo never-lander",
+            None,
+            None,
+            Some(run_signal),
+            None,
+        )
+        .await;
+        let text = match result {
+            Err(error) => error.to_string(),
+            Ok(result) => result.content[0].as_text().expect("text block").to_string(),
+        };
+        assert!(
+            !text.starts_with("Command exceeded"),
+            "an inline abort must not promote: {text}"
+        );
+        assert!(
+            text.contains("Command aborted"),
+            "the inline catch path reports the abort: {text}"
+        );
+        assert!(
+            rx.try_recv().is_err(),
+            "an abort-gated inline completion fires no notice"
+        );
+    }
     #[test]
     fn output_tail_note_caps_and_trims() {
         assert_eq!(output_tail_note("", 8), "");
