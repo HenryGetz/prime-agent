@@ -102,18 +102,11 @@ pub struct BashToolOptions {
     pub shell_path: Option<String>,
     /// Hook to adjust command, cwd, or env before execution.
     pub spawn_hook: Option<BashSpawnHook>,
-    /// The inline promotion window: a call still running this long is
-    /// promoted to a background job. `None` uses the default
-    /// ([`pa_agent::auto_background::DEFAULT_AUTO_BACKGROUND_AFTER_MS`]);
-    /// `Some` of a zero duration disables promotion. The agent loop's
-    /// per-call arm overrides this.
-    pub auto_background_after: Option<Duration>,
-    /// The completion notice for promoted jobs (direct calls; the agent
-    /// loop's arm carries the loop's notice lane instead).
-    pub on_background_completion: Option<pa_agent::auto_background::AutoBackgroundNoticeFn>,
-    /// The agent loop's arm registry: when the embedding puts the agent's
-    /// registry here, the loop's per-call arm (window and notice lane)
-    /// reaches the dispatch (see [`pa_agent::auto_background`]).
+    /// The agent loop's arm registry: the ONE config source for promotion.
+    /// The loop arms every bash call (window and notice lane; a zero arm
+    /// is the disable), and the dispatch takes its window from the arm.
+    /// A call with no arm — a direct dispatch outside the loop — never
+    /// promotes (see [`pa_agent::auto_background`]).
     pub auto_background_registry:
         Option<std::sync::Arc<pa_agent::auto_background::AutoBackgroundRegistry>>,
 }
@@ -252,8 +245,27 @@ fn append_status(text: &str, status: &str) -> String {
     }
 }
 
+/// The promoted text's partial-output tail: the last [`OUTPUT_TAIL_CHARS`]
+/// characters of the streamed output, so a command that printed an error and
+/// then hung stays visible without reading the spill file.
+const OUTPUT_TAIL_CHARS: usize = 512;
+
+/// The text-embedded tail of the partial output (`""` when there is none).
+fn output_tail_note(content: &str, cap: usize) -> String {
+    if content.trim().is_empty() {
+        return String::new();
+    }
+    let tail = content.char_indices().rev().nth(cap.saturating_sub(1));
+    let start = match tail {
+        Some((index, _)) => index,
+        None => 0,
+    };
+    format!("\n\nOutput so far:\n{}", &content[start..])
+}
+
 /// Execute one bash tool call. Errors carry the model-facing text.
-// The TS-parity parameter list is the tool's contract.
+// The TS-era parameter list is the tool's contract; `tool_call_id` is a
+// Rust-native addition (the promotion arm is keyed per call).
 #[allow(clippy::too_many_arguments)]
 #[tracing::instrument(
     level = "debug",
@@ -363,23 +375,17 @@ pub async fn execute_bash(
         });
     }
 
-    // The promotion window: the agent loop's per-call arm (AgentOptions
-    // derived) wins; a direct call falls back to the tool options. A zero
-    // window disables promotion.
+    // The promotion window has ONE source: the agent loop's per-call arm
+    // in the shared registry (the loop arms every bash call, zero
+    // included, so its disable reaches the dispatch as a zero arm). A call
+    // with no arm — a direct dispatch outside the loop — never promotes.
     let (mut window, notice) = match options
         .auto_background_registry
         .as_ref()
         .and_then(|registry| registry.take(tool_call_id))
     {
         Some(arm) => (arm.window, arm.notice),
-        None => (
-            options
-                .auto_background_after
-                .unwrap_or(Duration::from_millis(
-                    pa_agent::auto_background::DEFAULT_AUTO_BACKGROUND_AFTER_MS,
-                )),
-            options.on_background_completion.clone(),
-        ),
+        None => (Duration::ZERO, None),
     };
     // A promotion without a notice lane strands the command: the synthetic
     // result promises a completion notification that can never arrive, and
@@ -423,7 +429,27 @@ pub async fn execute_bash(
         let notice_command = command.to_string();
         let task_cwd = spawn_context.cwd.clone();
         let task_env = spawn_context.env.clone();
-        let task_signal = signal.clone();
+        // The promoted job outlives the run: a user abort later in the
+        // same run must not kill a job the model was told keeps running
+        // (kernel parity — backgrounded `bash()` handles survive run
+        // aborts). The gate forwards the run's abort to the job's signal
+        // only while the call is still inline (RUNNING); once the
+        // promotion edge claims the job, the run's signal is decoupled.
+        let task_signal = AbortSignal::new();
+        {
+            let gate_run_signal = signal.clone();
+            let gate_handoff = Arc::clone(&handoff);
+            let gate_job_signal = task_signal.clone();
+            tokio::spawn(async move {
+                let Some(run_signal) = gate_run_signal else {
+                    return;
+                };
+                run_signal.cancelled_owned().await;
+                if gate_handoff.load(Ordering::SeqCst) == HANDOFF_RUNNING {
+                    gate_job_signal.cancel();
+                }
+            });
+        }
         let task_on_update = on_update.clone();
         let on_data = Arc::clone(&on_data);
         let pid_slot = Arc::clone(&pid_slot);
@@ -442,7 +468,7 @@ pub async fn execute_bash(
                 ExecOptions {
                     on_data: on_data.as_ref(),
                     on_spawn: Some(&on_spawn),
-                    signal: task_signal,
+                    signal: Some(task_signal),
                     timeout,
                     env: Some(task_env),
                 },
@@ -548,6 +574,12 @@ pub async fn execute_bash(
                     output =
                         append_status(&output, &format!("Command timed out after {secs} seconds"));
                 }
+                // The promoted job was journaled active at the
+                // promotion edge: the exited process releases its record
+                // (best-effort, kernel-lane parity).
+                if let Some(pid) = pid {
+                    crate::kernel::orphan_journal::record_orphan_process_state(pid as i32, false);
+                }
                 notice(pa_agent::auto_background::AutoBackgroundCompletion {
                     pid,
                     exit_code: exec_result.as_ref().ok().copied().flatten(),
@@ -577,6 +609,15 @@ pub async fn execute_bash(
             () = tokio::time::sleep(window) => ExecEvent::Promoted,
         };
         match raced {
+            // A job without a pid has no wake lane: the daemon's mapper
+            // cannot name it in a `[bash-done]` row, so the synthetic text
+            // would promise a completion notification that can never
+            // arrive. It must not detach — it runs inline to completion
+            // (the same contract as a promotion without a notice lane).
+            ExecEvent::Promoted if pid_slot.lock().unwrap().is_none() => match done_rx.await {
+                Ok(done) => ExecEvent::Done(done),
+                Err(_) => anyhow::bail!("bash execution task failed"),
+            },
             // The window edge claims the promotion only from RUNNING: the
             // exec task may have completed at the same instant and claimed
             // DONE first — its ExecDone is already queued.
@@ -622,6 +663,14 @@ pub async fn execute_bash(
                 acc.force_spill();
                 acc.snapshot()
             };
+            // The detached job outlives this call: journal it in the same
+            // orphan-process journal the kernel `bash()` lane uses, so a
+            // worker crash or restart reaps its process group instead of
+            // leaking it behind a wake that can never arrive (best-effort,
+            // kernel-lane parity).
+            if let Some(pid) = pid {
+                crate::kernel::orphan_journal::record_orphan_process_state(pid as i32, true);
+            }
             let job = match pid {
                 Some(pid) => pid.to_string(),
                 None => format!("bash-{}", JOB_SEQUENCE.fetch_add(1, Ordering::SeqCst)),
@@ -633,6 +682,10 @@ pub async fn execute_bash(
             };
             let mut details = json!({
                 "autoBackgrounded": true,
+                // The running marker: the promoted result renders as a
+                // live job, not a finished successful command (#3523's
+                // `BashSnapshot.running` parity for the TUI/ACP surfaces).
+                "running": true,
                 "pid": pid,
                 "command": command,
                 "output": snapshot.content,
@@ -648,10 +701,15 @@ pub async fn execute_bash(
                 Some(path) => format!("Output streams to disk: {path}."),
                 None => "Output streams to disk.".to_string(),
             };
+            // The last stretch of the partial output also goes in the text:
+            // a command that printed an error and then hung stays visible
+            // without the model going to read the spill.
+            let output_note = output_tail_note(&snapshot.content, OUTPUT_TAIL_CHARS);
             Ok(ToolExecutionResult {
                 content: vec![ToolContentBlock::text(format!(
                     "Command exceeded {window_text}. Auto-backgrounded as job {job}. \
-{spill_note} The completion notification wakes the turn. Continue other work or end the turn."
+{spill_note} The completion notification wakes the turn. Continue other work or end the turn.\
+{output_note}"
                 ))],
                 details: Some(details),
                 is_error: false,
@@ -765,8 +823,6 @@ pub fn create_bash_tool_definition_with_options(
     let command_prefix = options.command_prefix.clone();
     let shell_path = options.shell_path.clone();
     let spawn_hook = options.spawn_hook.clone();
-    let auto_background_after = options.auto_background_after;
-    let on_background_completion = options.on_background_completion.clone();
     let auto_background_registry = options.auto_background_registry.clone();
     let execute: crate::tools::tool_definition::ExecuteFn = {
         Arc::new(move |tool_call_id, params, signal, on_update| {
@@ -777,8 +833,6 @@ pub fn create_bash_tool_definition_with_options(
                 command_prefix: command_prefix.clone(),
                 shell_path: shell_path.clone(),
                 spawn_hook: spawn_hook.clone(),
-                auto_background_after,
-                on_background_completion: on_background_completion.clone(),
                 auto_background_registry: auto_background_registry.clone(),
             };
             Box::pin(async move {
@@ -832,17 +886,27 @@ mod auto_background_tests {
     use std::sync::Arc;
     use std::time::{Duration, Instant};
 
-    use super::{execute_bash, BashOperations, BashToolOptions, ExecFuture, ExecOptions};
+    use super::{
+        execute_bash, output_tail_note, BashOperations, BashToolOptions, ExecFuture, ExecOptions,
+        OUTPUT_TAIL_CHARS,
+    };
     use pa_agent::auto_background::AutoBackgroundCompletion;
 
     #[tokio::test]
     async fn a_call_past_the_window_promotes_and_notifies() {
         let (tx, mut rx) = tokio::sync::mpsc::unbounded_channel::<AutoBackgroundCompletion>();
+        let registry = pa_agent::auto_background::AutoBackgroundRegistry::new();
+        registry.arm(
+            "test-promote",
+            pa_agent::auto_background::AutoBackgroundArm {
+                window: Duration::from_secs(2),
+                notice: Some(Arc::new(move |completion| {
+                    tx.send(completion).ok();
+                })),
+            },
+        );
         let options = BashToolOptions {
-            on_background_completion: Some(Arc::new(move |completion| {
-                tx.send(completion).ok();
-            })),
-            auto_background_after: Some(Duration::from_secs(2)),
+            auto_background_registry: Some(Arc::new(registry)),
             ..BashToolOptions::default()
         };
 
@@ -883,6 +947,9 @@ mod auto_background_tests {
         assert!(!result.is_error);
         let details = result.details.clone().expect("promotion details");
         assert_eq!(details["autoBackgrounded"], serde_json::json!(true));
+        // The running marker: the promoted result renders as a live job,
+        // not a finished successful command (#3523's BashSnapshot parity).
+        assert_eq!(details["running"], serde_json::json!(true));
         let pid = details["pid"].as_u64().expect("pid reported");
 
         // (a) The process outlives the call; its output lands via the
@@ -904,11 +971,18 @@ mod auto_background_tests {
     #[tokio::test]
     async fn a_call_under_the_window_runs_inline() {
         let (tx, mut rx) = tokio::sync::mpsc::unbounded_channel::<AutoBackgroundCompletion>();
+        let registry = pa_agent::auto_background::AutoBackgroundRegistry::new();
+        registry.arm(
+            "test-inline",
+            pa_agent::auto_background::AutoBackgroundArm {
+                window: Duration::from_secs(10),
+                notice: Some(Arc::new(move |completion| {
+                    tx.send(completion).ok();
+                })),
+            },
+        );
         let options = BashToolOptions {
-            on_background_completion: Some(Arc::new(move |completion| {
-                tx.send(completion).ok();
-            })),
-            auto_background_after: Some(Duration::from_secs(10)),
+            auto_background_registry: Some(Arc::new(registry)),
             ..BashToolOptions::default()
         };
 
@@ -934,11 +1008,18 @@ mod auto_background_tests {
     #[tokio::test]
     async fn a_zero_window_disables_promotion() {
         let (tx, mut rx) = tokio::sync::mpsc::unbounded_channel::<AutoBackgroundCompletion>();
+        let registry = pa_agent::auto_background::AutoBackgroundRegistry::new();
+        registry.arm(
+            "test-disabled",
+            pa_agent::auto_background::AutoBackgroundArm {
+                window: Duration::ZERO,
+                notice: Some(Arc::new(move |completion| {
+                    tx.send(completion).ok();
+                })),
+            },
+        );
         let options = BashToolOptions {
-            on_background_completion: Some(Arc::new(move |completion| {
-                tx.send(completion).ok();
-            })),
-            auto_background_after: Some(Duration::ZERO),
+            auto_background_registry: Some(Arc::new(registry)),
             ..BashToolOptions::default()
         };
 
@@ -994,9 +1075,10 @@ mod auto_background_tests {
     }
 
     #[tokio::test]
-    async fn a_zero_window_arm_disables_even_with_tool_options_windows() {
-        // The loop's zero arm must win over a live tool-options window: a
-        // missing arm falls back to the options (which would promote).
+    async fn a_zero_window_arm_disables_promotion() {
+        // The loop's zero arm is the disable: the dispatch must honor it
+        // even though the notice lane is wired (a live lane alone must not
+        // resurrect a window the loop resolved to zero).
         let registry = pa_agent::auto_background::AutoBackgroundRegistry::new();
         let (tx, mut rx) = tokio::sync::mpsc::unbounded_channel::<AutoBackgroundCompletion>();
         let notice: pa_agent::auto_background::AutoBackgroundNoticeFn =
@@ -1020,8 +1102,6 @@ mod auto_background_tests {
         });
         let options = BashToolOptions {
             operations: Some(ops),
-            auto_background_after: Some(Duration::from_millis(200)),
-            on_background_completion: Some(notice),
             auto_background_registry: Some(Arc::new(registry)),
             ..BashToolOptions::default()
         };
@@ -1059,7 +1139,6 @@ mod auto_background_tests {
         });
         let options = BashToolOptions {
             operations: Some(ops),
-            auto_background_after: Some(Duration::from_millis(200)),
             auto_background_registry: Some(Arc::new(registry)),
             ..BashToolOptions::default()
         };
@@ -1103,8 +1182,6 @@ mod auto_background_tests {
         });
         let options = BashToolOptions {
             operations: Some(ops),
-            auto_background_after: Some(Duration::from_millis(200)),
-            on_background_completion: Some(notice),
             auto_background_registry: Some(Arc::new(registry)),
             ..BashToolOptions::default()
         };
@@ -1184,8 +1261,6 @@ mod auto_background_tests {
             });
             let options = BashToolOptions {
                 operations: Some(ops),
-                auto_background_after: Some(window),
-                on_background_completion: Some(notice),
                 auto_background_registry: Some(Arc::new(registry)),
                 ..BashToolOptions::default()
             };
@@ -1257,8 +1332,6 @@ mod auto_background_tests {
         );
         let options = BashToolOptions {
             operations: Some(Arc::new(FailingOps)),
-            auto_background_after: Some(Duration::from_millis(100)),
-            on_background_completion: Some(notice),
             auto_background_registry: Some(Arc::new(registry)),
             ..BashToolOptions::default()
         };
@@ -1302,6 +1375,321 @@ mod auto_background_tests {
                 .ends_with("Command timed out after 1 seconds"),
             "the completion must carry the failure diagnostic: {}",
             completion.output
+        );
+    }
+
+    /// A backend that never reports a pid: `on_spawn` is never called, so
+    /// the promotion edge sees `pid: None` — exactly the case where the
+    /// daemon mapper would drop the completion (no `[bash-done]` row).
+    struct PidlessOps {
+        release: Arc<tokio::sync::Notify>,
+    }
+
+    impl BashOperations for PidlessOps {
+        fn exec<'a>(
+            &'a self,
+            _command: &'a str,
+            _cwd: &'a str,
+            options: ExecOptions<'a>,
+        ) -> ExecFuture<'a> {
+            let release = Arc::clone(&self.release);
+            Box::pin(async move {
+                // Deliberately NO on_spawn call: the pid is never reported.
+                release.notified().await;
+                (options.on_data)(b"pidless-lander\n");
+                Ok(Some(0))
+            })
+        }
+    }
+
+    #[tokio::test]
+    async fn a_pidless_job_never_detaches() {
+        // A job without a pid has no wake lane (the mapper returns None),
+        // so the synthetic text would promise a completion notification
+        // that can never arrive. It must run inline to completion instead.
+        let registry = pa_agent::auto_background::AutoBackgroundRegistry::new();
+        let (tx, mut rx) = tokio::sync::mpsc::unbounded_channel::<AutoBackgroundCompletion>();
+        registry.arm(
+            "call-pidless",
+            pa_agent::auto_background::AutoBackgroundArm {
+                window: Duration::from_millis(200),
+                notice: Some(Arc::new(move |completion| {
+                    tx.send(completion).ok();
+                })),
+            },
+        );
+        let ops = Arc::new(PidlessOps {
+            release: Arc::new(tokio::sync::Notify::new()),
+        });
+        let release = Arc::clone(&ops.release);
+        tokio::spawn(async move {
+            tokio::time::sleep(Duration::from_secs(1)).await;
+            release.notify_one();
+        });
+        let options = BashToolOptions {
+            operations: Some(ops),
+            auto_background_registry: Some(Arc::new(registry)),
+            ..BashToolOptions::default()
+        };
+        let result = execute_bash(
+            "call-pidless",
+            ".",
+            &options,
+            "held",
+            None,
+            None,
+            None,
+            None,
+        )
+        .await
+        .expect("pidless call resolves");
+        // Inline completion: the real output, no synthetic text, no notice.
+        assert_eq!(
+            result.content[0].as_text().expect("text block"),
+            "pidless-lander\n"
+        );
+        assert!(result.details.is_none(), "no promotion details");
+        assert!(rx.try_recv().is_err(), "no notice for an inline call");
+    }
+
+    #[tokio::test]
+    async fn a_promoted_text_carries_the_partial_output_tail() {
+        // A command that printed an error and then hung stays visible: the
+        // synthetic text embeds the tail of the streamed output (details
+        // never reach the model).
+        let registry = pa_agent::auto_background::AutoBackgroundRegistry::new();
+        let (tx, mut rx) = tokio::sync::mpsc::unbounded_channel::<AutoBackgroundCompletion>();
+        registry.arm(
+            "call-tail",
+            pa_agent::auto_background::AutoBackgroundArm {
+                window: Duration::from_secs(2),
+                notice: Some(Arc::new(move |completion| {
+                    tx.send(completion).ok();
+                })),
+            },
+        );
+        let options = BashToolOptions {
+            auto_background_registry: Some(Arc::new(registry)),
+            ..BashToolOptions::default()
+        };
+        let result = execute_bash(
+            "call-tail",
+            ".",
+            &options,
+            "echo tail-lander; sleep 5",
+            None,
+            None,
+            None,
+            None,
+        )
+        .await
+        .expect("promotion returns Ok");
+        let text = result.content[0].as_text().expect("text block");
+        assert!(
+            text.contains("Output so far:") && text.contains("tail-lander"),
+            "the synthetic text must carry the partial output tail: {text}"
+        );
+        // The kernel-lane parity: the notice still holds the full output.
+        let completion = tokio::time::timeout(Duration::from_secs(10), rx.recv())
+            .await
+            .expect("completion lands")
+            .expect("notice lane open");
+        assert_eq!(completion.exit_code, Some(0));
+    }
+
+    #[tokio::test]
+    async fn a_promoted_job_survives_a_later_run_abort() {
+        // The promoted job is decoupled from the run's abort signal: a
+        // user abort after the promotion must not kill the background job
+        // the model was told keeps running (the notice would say "Command
+        // aborted" and the work would be lost).
+        let registry = pa_agent::auto_background::AutoBackgroundRegistry::new();
+        let (tx, mut rx) = tokio::sync::mpsc::unbounded_channel::<AutoBackgroundCompletion>();
+        registry.arm(
+            "call-abort-gate",
+            pa_agent::auto_background::AutoBackgroundArm {
+                window: Duration::from_millis(200),
+                notice: Some(Arc::new(move |completion| {
+                    tx.send(completion).ok();
+                })),
+            },
+        );
+        let run_signal = super::AbortSignal::new();
+        let options = BashToolOptions {
+            auto_background_registry: Some(Arc::new(registry)),
+            ..BashToolOptions::default()
+        };
+        let result = execute_bash(
+            "call-abort-gate",
+            ".",
+            &options,
+            "sleep 3; echo gate-lander",
+            None,
+            None,
+            Some(run_signal.clone()),
+            None,
+        )
+        .await
+        .expect("promotion returns Ok");
+        assert!(
+            result.content[0]
+                .as_text()
+                .expect("text block")
+                .starts_with("Command exceeded"),
+            "the call must promote"
+        );
+        // The run aborts AFTER the promotion: the job must survive it (the
+        // local backend honors the signal; the gate must have decoupled it).
+        run_signal.cancel();
+        let completion = tokio::time::timeout(Duration::from_secs(10), rx.recv())
+            .await
+            .expect("the promoted job completes")
+            .expect("notice lane open");
+        assert_eq!(
+            completion.exit_code,
+            Some(0),
+            "the promoted job was killed by the run abort: {completion:?}"
+        );
+        assert!(
+            !completion.output.contains("Command aborted"),
+            "the completion must not report an abort: {}",
+            completion.output
+        );
+        assert!(completion.output.contains("gate-lander"));
+    }
+
+    #[tokio::test]
+    async fn a_call_without_an_arm_never_promotes() {
+        // The arm registry is the ONE config source: a direct dispatch
+        // with no arm (outside the agent loop) never promotes, no matter
+        // how long the command runs.
+        let ops = Arc::new(HeldOps {
+            release: Arc::new(tokio::sync::Notify::new()),
+        });
+        let release = Arc::clone(&ops.release);
+        tokio::spawn(async move {
+            tokio::time::sleep(Duration::from_secs(1)).await;
+            release.notify_one();
+        });
+        let options = BashToolOptions {
+            operations: Some(ops),
+            ..BashToolOptions::default()
+        };
+        let result = execute_bash(
+            "call-armless",
+            ".",
+            &options,
+            "held",
+            None,
+            None,
+            None,
+            None,
+        )
+        .await
+        .expect("armless call resolves");
+        assert_eq!(
+            result.content[0].as_text().expect("text block"),
+            "edge-lander\n",
+            "no arm means no promotion, ever"
+        );
+        assert!(result.details.is_none());
+    }
+
+    #[test]
+    fn output_tail_note_caps_and_trims() {
+        assert_eq!(output_tail_note("", 8), "");
+        assert_eq!(output_tail_note("  \n ", 8), "");
+        assert_eq!(output_tail_note("abc", 8), "\n\nOutput so far:\nabc");
+        let long = "x".repeat(1_024);
+        let note = output_tail_note(&long, OUTPUT_TAIL_CHARS);
+        assert!(note.ends_with(&"x".repeat(OUTPUT_TAIL_CHARS)));
+        assert!(!note.starts_with('x'), "the note is labeled, not raw tail");
+        // The cap keeps multi-byte characters whole.
+        let unicode = "é".repeat(600);
+        let note = output_tail_note(&unicode, 512);
+        assert!(note.chars().rev().take(512).all(|c| c == 'é'));
+    }
+
+    #[tokio::test]
+    async fn a_promoted_job_journals_orphan_state() {
+        // The promoted job is journaled in the same orphan-process journal
+        // the kernel `bash()` lane uses, so a worker crash or restart
+        // reaps its process group instead of leaking it.
+        let dir = tempfile::TempDir::new().expect("temp dir");
+        let journal = dir.path().join("t.orphans.jsonl");
+        std::env::set_var(
+            "PRIME_AGENT_INTERNAL_ORPHAN_PROCESS_JOURNAL",
+            journal.display().to_string(),
+        );
+        let registry = pa_agent::auto_background::AutoBackgroundRegistry::new();
+        let (tx, mut rx) = tokio::sync::mpsc::unbounded_channel::<AutoBackgroundCompletion>();
+        registry.arm(
+            "call-journal",
+            pa_agent::auto_background::AutoBackgroundArm {
+                window: Duration::from_millis(200),
+                notice: Some(Arc::new(move |completion| {
+                    tx.send(completion).ok();
+                })),
+            },
+        );
+        let options = BashToolOptions {
+            auto_background_registry: Some(Arc::new(registry)),
+            ..BashToolOptions::default()
+        };
+        let result = execute_bash(
+            "call-journal",
+            ".",
+            &options,
+            "sleep 2; echo journaled-lander",
+            None,
+            None,
+            None,
+            None,
+        )
+        .await
+        .expect("promotion returns Ok");
+        let details = result.details.clone().expect("promotion details");
+        let pid = details["pid"].as_u64().expect("pid reported") as usize;
+        let journal_rows = || std::fs::read_to_string(&journal).unwrap_or_default();
+        // The active row is written at the promotion edge, before the call
+        // returns; poll briefly so a contended host cannot flake.
+        let mut active_seen = false;
+        for _ in 0..10 {
+            if journal_rows().contains(&format!("\"pid\":{pid},\"ownerPid\":")) {
+                active_seen = true;
+                break;
+            }
+            tokio::time::sleep(Duration::from_millis(100)).await;
+        }
+        assert!(
+            active_seen,
+            "the promoted job must be journaled active at promotion"
+        );
+        // Completion releases the record.
+        let completion = tokio::time::timeout(Duration::from_secs(10), rx.recv())
+            .await
+            .expect("completion lands")
+            .expect("notice lane open");
+        assert_eq!(completion.exit_code, Some(0));
+        // The journal is append-only: the LAST row for this pid must be
+        // the inactive release.
+        let mut released = false;
+        for _ in 0..20 {
+            let rows = journal_rows();
+            let last_row = rows
+                .lines()
+                .rev()
+                .find(|line| line.contains(&format!("\"pid\":{pid},")));
+            if last_row.is_some_and(|line| line.contains("\"active\":false")) {
+                released = true;
+                break;
+            }
+            tokio::time::sleep(Duration::from_millis(100)).await;
+        }
+        std::env::remove_var("PRIME_AGENT_INTERNAL_ORPHAN_PROCESS_JOURNAL");
+        assert!(
+            released,
+            "the completed job must release its journal record"
         );
     }
 }

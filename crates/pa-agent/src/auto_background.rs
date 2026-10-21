@@ -62,16 +62,6 @@ pub struct AutoBackgroundDirective {
     pub registry: Arc<AutoBackgroundRegistry>,
 }
 
-impl Default for AutoBackgroundDirective {
-    fn default() -> Self {
-        Self {
-            window: Duration::ZERO,
-            notice: None,
-            registry: Arc::new(AutoBackgroundRegistry::new()),
-        }
-    }
-}
-
 /// One agent's per-call arm registry: the hand-off channel between the
 /// agent loop (which knows the configured window and notice lane) and the
 /// bash dispatch running its tool calls.

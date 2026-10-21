@@ -110,7 +110,6 @@ pub(crate) struct ExecutedToolCallOutcome {
     is_error: bool,
 }
 
-
 /// One inline bash call's watchdog registration: the arm is consumed by
 /// the bash dispatch; the drop removes an unconsumed arm.
 struct AutoBackgroundArmGuard {

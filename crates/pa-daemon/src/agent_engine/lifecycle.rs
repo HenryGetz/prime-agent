@@ -962,16 +962,16 @@ impl AgentSessionEngine {
         self.config.cron_store.clone()
     }
 
-    /// The promoted inline bash job notice lane: the same bash-completion
+    /// The promoted inline bash job notice lane: the same kernel-notice
     /// sink the kernel's backgrounded `bash()` jobs feed (see
     /// [`super::bash_notices`]). `None` outside a worker with the lane.
     pub(super) fn auto_background_notice(
         &self,
     ) -> Option<pa_agent::auto_background::AutoBackgroundNoticeFn> {
         let sink = self
-            .bash_completion_sink
+            .kernel_notice_sink
             .lock()
-            .expect("bash completion sink lock")
+            .expect("kernel notice sink lock")
             .clone()?;
         Some(std::sync::Arc::new(
             move |completion: pa_agent::auto_background::AutoBackgroundCompletion| {

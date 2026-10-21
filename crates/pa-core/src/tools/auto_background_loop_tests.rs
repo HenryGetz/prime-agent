@@ -1,12 +1,7 @@
 //! The live loop + live bash dispatch promotion contract (integration,
 //! in-lib because the tools module is `pub(crate)`): an inline bash tool
 //! call past the window settles the TURN — the streamed-update emitter
-//! included, so the loop is not wedged until the process exits — and the
-//! completion notice carries the command's output.
-
-//! The live loop + live bash dispatch promotion contract: an inline bash
-//! tool call past the window settles the TURN (the streamed-update emitter
-//! included, so the loop is not wedged until the process exits), returns
+//! included, so the loop is not wedged until the process exits — returns
 //! the synthetic auto-backgrounded result, and the completion notice
 //! carries the command's output.
 

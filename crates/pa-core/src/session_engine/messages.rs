@@ -218,20 +218,31 @@ pub fn create_async_bash_completion_message(
     pid: u32,
     command: &str,
     exit_code: i64,
+    full_output_path: Option<&str>,
     timestamp: u64,
 ) -> pa_types::session::CustomMessage {
     // TS `JSON.stringify(details.command)`: the quoted, escaped command.
     let encoded_command = serde_json::to_string(command).unwrap_or_default();
-    let content = format!("[bash-done pid:{pid} exit:{exit_code}]\n\nCommand: {encoded_command}");
+    // Kernel completions carry no spill path (the model re-reads a live
+    // handle); a promoted native-bash job's only durable output is the
+    // spill file, so its row points the model there.
+    let mut content =
+        format!("[bash-done pid:{pid} exit:{exit_code}]\n\nCommand: {encoded_command}");
+    let mut details = serde_json::json!({
+        "pid": pid,
+        "command": command,
+        "exitCode": exit_code,
+    });
+    if let Some(path) = full_output_path {
+        use std::fmt::Write as _;
+        let _ = write!(content, "\n\nOutput: {path}");
+        details["fullOutputPath"] = serde_json::json!(path);
+    }
     pa_types::session::CustomMessage {
         custom_type: ASYNC_BASH_COMPLETION_CUSTOM_TYPE.to_string(),
         content: UserContent::Text(content),
         display: true,
-        details: Some(serde_json::json!({
-            "pid": pid,
-            "command": command,
-            "exitCode": exit_code,
-        })),
+        details: Some(details),
         timestamp,
         rest: serde_json::Map::default(),
     }
@@ -743,9 +754,40 @@ state
     }
 
     #[test]
+    fn promoted_completion_row_carries_the_spill_path() {
+        // A promoted native-bash job's only durable output is the spill
+        // file: the wake row must point the model at it (kernel
+        // completions keep the TS shape — see the test above).
+        let message = create_async_bash_completion_message(
+            7100,
+            "sleep 61; echo done",
+            0,
+            Some("/tmp/spill/bash-7100.out"),
+            3_000,
+        );
+        let UserContent::Text(content) = &message.content else {
+            panic!("text row");
+        };
+        assert_eq!(
+            content,
+            "[bash-done pid:7100 exit:0]\n\nCommand: \"sleep 61; echo done\"\n\nOutput: /tmp/spill/bash-7100.out"
+        );
+        let details = message.details.unwrap();
+        assert_eq!(
+            details["fullOutputPath"],
+            serde_json::json!("/tmp/spill/bash-7100.out")
+        );
+    }
+
+    #[test]
     fn async_bash_completion_message_matches_the_ts_shape() {
-        let message =
-            create_async_bash_completion_message(4321, "sleep 12; echo RW_WAKE_DONE", 0, 1_000);
+        let message = create_async_bash_completion_message(
+            4321,
+            "sleep 12; echo RW_WAKE_DONE",
+            0,
+            None,
+            1_000,
+        );
         assert_eq!(message.custom_type, "async_bash_completion");
         assert!(message.display);
         assert_eq!(message.timestamp, 1_000);
@@ -760,7 +802,8 @@ state
         assert_eq!(details["pid"], 4321);
         assert_eq!(details["command"], "sleep 12; echo RW_WAKE_DONE");
         assert_eq!(details["exitCode"], 0);
-        let message = create_async_bash_completion_message(11, "echo \"done\" && exit 2", 2, 2_000);
+        let message =
+            create_async_bash_completion_message(11, "echo \"done\" && exit 2", 2, None, 2_000);
         assert_eq!(message.timestamp, 2_000);
         assert!(matches!(message.content, UserContent::Text(text)
             if text.starts_with("[bash-done pid:11 exit:2]\n\nCommand: \"echo \\\"done\\\" && exit 2\"")));
