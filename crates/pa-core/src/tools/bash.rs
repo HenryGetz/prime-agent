@@ -745,9 +745,12 @@ pub async fn execute_bash(
             // (see on_spawn), so a worker crash or restart reaps its
             // process group instead of leaking it behind a wake that can
             // never arrive.
+            // The pid-less guard ran before the claim: only a reported
+            // pid can name the job in the `[bash-done]` wake row, so the
+            // promoted job is its pid — there is no fallback job id.
             let job = match pid {
                 Some(pid) => pid.to_string(),
-                None => format!("bash-{}", JOB_SEQUENCE.fetch_add(1, Ordering::SeqCst)),
+                None => unreachable!("the pid-less guard refused the promotion"),
             };
             let window_text = if window.as_millis() % 1000 == 0 {
                 format!("{}s", window.as_secs())
@@ -851,10 +854,6 @@ const HANDOFF_ABORTED: u8 = 3;
 /// Grace for the promotion-edge recv: a DONE-claimed task's channel send is
 /// microseconds away; the bound only guards a panicked task.
 const PROMOTION_EDGE_RECV: Duration = Duration::from_millis(500);
-
-/// Job-number fallback for promotion when the operations backend reports no
-/// pid.
-static JOB_SEQUENCE: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(1);
 
 pub fn bash_tool_schema() -> serde_json::Value {
     json!({
