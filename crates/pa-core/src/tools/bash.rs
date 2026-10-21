@@ -450,14 +450,22 @@ pub async fn execute_bash(
                 let Some(run_signal) = gate_run_signal else {
                     return;
                 };
-                while !run_signal.is_cancelled() {
-                    if gate_handoff.load(Ordering::SeqCst) != HANDOFF_RUNNING {
-                        // The handoff settled (promotion, completion, or a
-                        // competing abort): the gate is closed — exit now,
-                        // so it never outlives the call it guarded.
-                        return;
+                loop {
+                    tokio::select! {
+                        // Immediate: an abort that lands while the call is
+                        // still inline must reach the claim race without
+                        // waiting out a poll interval.
+                        () = run_signal.cancelled() => break,
+                        () = tokio::time::sleep(Duration::from_millis(50)) => {
+                            if gate_handoff.load(Ordering::SeqCst) != HANDOFF_RUNNING {
+                                // The handoff settled (promotion,
+                                // completion, or a competing abort): the
+                                // gate is closed — exit now, so it never
+                                // outlives the call it guarded.
+                                return;
+                            }
+                        }
                     }
-                    tokio::time::sleep(Duration::from_millis(50)).await;
                 }
                 // Claim the abort edge ONLY from RUNNING, exactly like the
                 // promotion and the completion edges: an abort at the
@@ -486,6 +494,12 @@ pub async fn execute_bash(
                 let pid_slot = Arc::clone(&pid_slot);
                 move |pid: u32| {
                     *pid_slot.lock().unwrap() = Some(pid);
+                    // Kernel `bash()` lane parity: the orphan record is
+                    // journaled at spawn, with the process identity captured
+                    // while the child is live (a fast exit and PID reuse
+                    // cannot strand an unidentifiable record). The
+                    // completion releases it on both handoff branches.
+                    crate::kernel::orphan_journal::record_orphan_process_state(pid as i32, true);
                 }
             };
             let exec_fut = ops.exec(
@@ -570,6 +584,12 @@ pub async fn execute_bash(
                 (snapshot, acc.get_last_line_bytes())
             };
             let pid = *pid_slot.lock().unwrap();
+            // The spawn-time orphan record is released at completion,
+            // whichever way the handoff settled (best-effort, kernel-lane
+            // parity; the write is ordered after the spawn's active write).
+            if let Some(pid) = pid {
+                crate::kernel::orphan_journal::record_orphan_process_state(pid as i32, false);
+            }
             let claimed_done = handoff
                 .compare_exchange(
                     HANDOFF_RUNNING,
@@ -602,12 +622,6 @@ pub async fn execute_bash(
                     let line = format!("Command timed out after {secs} seconds");
                     status = Some(line.clone());
                     output = append_status(&output, &line);
-                }
-                // The promoted job was journaled active at the
-                // promotion edge: the exited process releases its record
-                // (best-effort, kernel-lane parity).
-                if let Some(pid) = pid {
-                    crate::kernel::orphan_journal::record_orphan_process_state(pid as i32, false);
                 }
                 notice(pa_agent::auto_background::AutoBackgroundCompletion {
                     pid,
@@ -668,16 +682,12 @@ pub async fn execute_bash(
             },
             // The window edge claims the promotion only from RUNNING: the
             // exec task may have completed at the same instant (claimed
-            // DONE), or the abort gate may have claimed ABORTED. The
-            // orphan record is written BEFORE the claim and released when
-            // the claim loses, so the record's active/inactive pair is
-            // always write-ordered (the completion's inactive write can
-            // only follow a won claim, which follows the active write).
+            // DONE), or the abort gate may have claimed ABORTED.
             ExecEvent::Promoted => {
-                let pid = *pid_slot.lock().unwrap();
-                if let Some(pid) = pid {
-                    crate::kernel::orphan_journal::record_orphan_process_state(pid as i32, true);
-                }
+                // No claim-time journaling: the orphan record was written at
+                // spawn with the identity captured while the child was live
+                // (kernel-lane parity; see on_spawn), and the completion
+                // releases it whichever way the edge settles.
                 if handoff
                     .compare_exchange(
                         HANDOFF_RUNNING,
@@ -690,14 +700,7 @@ pub async fn execute_bash(
                     ExecEvent::Promoted
                 } else {
                     // The claim lost the edge (completion or abort gate):
-                    // the job never detached, so the orphan record is
-                    // spent immediately.
-                    if let Some(pid) = pid {
-                        crate::kernel::orphan_journal::record_orphan_process_state(
-                            pid as i32, false,
-                        );
-                    }
-                    // A DONE-claimed task's channel send is microseconds
+                    // the job never detached; a DONE-claimed task's channel send is microseconds
                     // away (only a task panic can drop it); an ABORTED
                     // task delivers its result at the killed process's
                     // exit. Wait instead of failing the call.
@@ -738,10 +741,10 @@ pub async fn execute_bash(
                 acc.force_spill();
                 acc.snapshot()
             };
-            // The orphan record for this pid was written BEFORE the
-            // promotion claim (see the edge race above), so a worker
-            // crash or restart reaps its process group instead of leaking
-            // it behind a wake that can never arrive.
+            // The orphan record for this pid was written at spawn
+            // (see on_spawn), so a worker crash or restart reaps its
+            // process group instead of leaking it behind a wake that can
+            // never arrive.
             let job = match pid {
                 Some(pid) => pid.to_string(),
                 None => format!("bash-{}", JOB_SEQUENCE.fetch_add(1, Ordering::SeqCst)),
