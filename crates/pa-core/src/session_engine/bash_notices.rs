@@ -39,7 +39,6 @@ impl KernelNotice {
     /// live handle; a promoted job's only durable output is the spill
     /// file, and its exit -1 needs its reason).
     #[must_use]
-    #[allow(clippy::too_many_arguments)]
     pub fn bash_completion(
         pid: u32,
         command: &str,
