@@ -110,69 +110,6 @@ pub(crate) struct ExecutedToolCallOutcome {
     is_error: bool,
 }
 
-/// The streamed-update lane for one tool execution: the `on_update`
-/// callback the tool calls with partial results, the emitter task that
-/// forwards them as `ToolExecutionUpdate` events, and the accepting flag.
-fn spawn_update_emitter(
-    prepared: &PreparedToolCall,
-    progress: ToolProgressCadence,
-    signal: Option<&AbortSignal>,
-    emit: &AgentEventSink,
-) -> (
-    Arc<std::sync::atomic::AtomicBool>,
-    AgentToolUpdateCallback,
-    tokio::sync::mpsc::UnboundedSender<AgentToolResult>,
-    tokio::task::JoinHandle<anyhow::Result<()>>,
-) {
-    let accepting_updates = Arc::new(std::sync::atomic::AtomicBool::new(true));
-    let (update_tx, mut update_rx) = tokio::sync::mpsc::unbounded_channel::<AgentToolResult>();
-    let update_tx_for_callback = update_tx.clone();
-
-    let tool_call_id = prepared.tool_call.id.clone();
-    let tool_name = prepared.tool.name().to_string();
-    let args = prepared.tool_call.arguments.clone();
-    let sink = Arc::clone(emit);
-    let started_at = std::time::Instant::now();
-    // Lifecycle heartbeat: quiet until `progress.after_ms`, then one
-    // `ToolExecutionProgress` event every `progress.every_ms` while the call
-    // still runs. The guard aborts the task on EVERY exit path — return,
-    // panic, and cancellation of this frame — so the unbounded tick loop
-    // never leaks as a detached task.
-    let mut heartbeat = HeartbeatGuard(Some(spawn_tool_heartbeat(
-        Arc::clone(emit),
-        tool_call_id.clone(),
-        tool_name.clone(),
-        started_at,
-        progress,
-    )));
-    let signal_for_updates = signal.cloned().unwrap_or_default();
-    let emit_updates = tokio::spawn(async move {
-        while let Some(partial_result) = update_rx.recv().await {
-            sink(AgentEvent::ToolExecutionUpdate {
-                tool_call_id: tool_call_id.clone(),
-                tool_name: tool_name.clone(),
-                args: args.clone(),
-                partial_result,
-            })
-            .await?;
-        }
-        Ok(())
-    });
-
-    let on_update: AgentToolUpdateCallback = {
-        let accepting_updates = Arc::clone(&accepting_updates);
-        Arc::new(move |partial_result: AgentToolResult| {
-            if !accepting_updates.load(std::sync::atomic::Ordering::SeqCst)
-                || signal_for_updates.is_aborted()
-            {
-                return;
-            }
-            let _ = update_tx_for_callback.send(partial_result);
-        })
-    };
-
-    (accepting_updates, on_update, update_tx, emit_updates)
-}
 
 /// One inline bash call's watchdog registration: the arm is consumed by
 /// the bash dispatch; the drop removes an unconsumed arm.
@@ -222,12 +159,34 @@ impl Drop for AutoBackgroundArmGuard {
 /// the tool fails (or aborts, with the TS message "Tool execution aborted").
 pub(crate) async fn execute_prepared_tool_call(
     prepared: &PreparedToolCall,
+    progress: ToolProgressCadence,
     signal: Option<&AbortSignal>,
     emit: &AgentEventSink,
     auto_background: &crate::auto_background::AutoBackgroundDirective,
 ) -> ExecutedToolCallOutcome {
-    let (accepting_updates, on_update, update_tx, emit_updates) =
-        spawn_update_emitter(prepared, signal, emit);
+    let accepting_updates = Arc::new(std::sync::atomic::AtomicBool::new(true));
+    let (update_tx, mut update_rx) = tokio::sync::mpsc::unbounded_channel::<AgentToolResult>();
+    let update_tx_for_callback = update_tx.clone();
+
+    let tool_call_id = prepared.tool_call.id.clone();
+    let tool_name = prepared.tool.name().to_string();
+    let args = prepared.tool_call.arguments.clone();
+    let sink = Arc::clone(emit);
+    let started_at = std::time::Instant::now();
+    // Lifecycle heartbeat: quiet until `progress.after_ms`, then one
+    // `ToolExecutionProgress` event every `progress.every_ms` while the call
+    // still runs. The guard aborts the task on EVERY exit path — return,
+    // panic, and cancellation of this frame — so the unbounded tick loop
+    // never leaks as a detached task.
+    let mut heartbeat = HeartbeatGuard(Some(spawn_tool_heartbeat(
+        Arc::clone(emit),
+        tool_call_id.clone(),
+        tool_name.clone(),
+        started_at,
+        progress,
+    )));
+    let signal_for_updates = signal.cloned().unwrap_or_default();
+
     // The inline-bash watchdog: arm the promotion window for this call so
     // the bash dispatch (pa-core) can promote a command that outlives it.
     // The arm is consumed by the dispatch; the guard removes anything left
@@ -237,6 +196,31 @@ pub(crate) async fn execute_prepared_tool_call(
         &prepared.tool_call.id,
         prepared.tool.name(),
     );
+    let _auto_background_guard = auto_background_guard;
+    let emit_updates = tokio::spawn(async move {
+        while let Some(partial_result) = update_rx.recv().await {
+            sink(AgentEvent::ToolExecutionUpdate {
+                tool_call_id: tool_call_id.clone(),
+                tool_name: tool_name.clone(),
+                args: args.clone(),
+                partial_result,
+            })
+            .await?;
+        }
+        Ok(())
+    });
+
+    let on_update: AgentToolUpdateCallback = {
+        let accepting_updates = Arc::clone(&accepting_updates);
+        Arc::new(move |partial_result: AgentToolResult| {
+            if !accepting_updates.load(std::sync::atomic::Ordering::SeqCst)
+                || signal_for_updates.is_aborted()
+            {
+                return;
+            }
+            let _ = update_tx_for_callback.send(partial_result);
+        })
+    };
 
     let execute_result = race_with_abort(
         (Arc::clone(&prepared.tool)).execute(
@@ -250,8 +234,6 @@ pub(crate) async fn execute_prepared_tool_call(
     .await;
     heartbeat.stop();
     let elapsed_ms = elapsed_ms_since(started_at);
-
-    drop(auto_background_guard);
 
     accepting_updates.store(false, std::sync::atomic::Ordering::SeqCst);
     drop(update_tx);
@@ -292,7 +274,6 @@ pub(crate) async fn execute_prepared_tool_call(
         }
     }
 }
-
 /// Aborts the heartbeat task on every exit path. Dropping the bare
 /// `JoinHandle` only detaches the unbounded tick task: on a panic or a
 /// cancellation (a dropped `execute_prepared_tool_call` future) the explicit
@@ -562,7 +543,20 @@ mod tests {
             every_ms: 25,
         };
         let execution = tokio::spawn(async move {
-            execute_prepared_tool_call(&prepared, progress, None, &sink).await;
+            execute_prepared_tool_call(
+                &prepared,
+                progress,
+                None,
+                &sink,
+                &crate::auto_background::AutoBackgroundDirective {
+                    window: std::time::Duration::from_millis(0),
+                    notice: None,
+                    registry: std::sync::Arc::new(
+                        crate::auto_background::AutoBackgroundRegistry::new(),
+                    ),
+                },
+            )
+            .await;
         });
         let count = || *ticks.lock().unwrap();
         // Bounded first-tick wait: a broken heartbeat fails the test
