@@ -564,15 +564,18 @@ pub async fn execute_bash(
                 // timeout:N), so the diagnostic survives the promotion;
                 // the row itself stays kernel-parity (no exit code).
                 let mut output = snapshot.content.clone();
+                let mut status = None;
                 let failure = exec_result.as_ref().err().map(ToString::to_string);
                 if failure.as_deref() == Some("aborted") {
+                    status = Some("Command aborted".to_string());
                     output = append_status(&output, "Command aborted");
                 } else if let Some(secs) = failure
                     .as_deref()
                     .and_then(|failure| failure.strip_prefix("timeout:"))
                 {
-                    output =
-                        append_status(&output, &format!("Command timed out after {secs} seconds"));
+                    let line = format!("Command timed out after {secs} seconds");
+                    status = Some(line.clone());
+                    output = append_status(&output, &line);
                 }
                 // The promoted job was journaled active at the
                 // promotion edge: the exited process releases its record
@@ -586,6 +589,7 @@ pub async fn execute_bash(
                     command: notice_command,
                     output,
                     full_output_path: snapshot.full_output_path,
+                    status,
                 });
             }
         });

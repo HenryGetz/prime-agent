@@ -219,6 +219,7 @@ pub fn create_async_bash_completion_message(
     command: &str,
     exit_code: i64,
     full_output_path: Option<&str>,
+    status: Option<&str>,
     timestamp: u64,
 ) -> pa_types::session::CustomMessage {
     // TS `JSON.stringify(details.command)`: the quoted, escaped command.
@@ -237,6 +238,11 @@ pub fn create_async_bash_completion_message(
         use std::fmt::Write as _;
         let _ = write!(content, "\n\nOutput: {path}");
         details["fullOutputPath"] = serde_json::json!(path);
+    }
+    if let Some(status) = status {
+        use std::fmt::Write as _;
+        let _ = write!(content, "\n\n{status}");
+        details["status"] = serde_json::json!(status);
     }
     pa_types::session::CustomMessage {
         custom_type: ASYNC_BASH_COMPLETION_CUSTOM_TYPE.to_string(),
@@ -763,6 +769,7 @@ state
             "sleep 61; echo done",
             0,
             Some("/tmp/spill/bash-7100.out"),
+            None,
             3_000,
         );
         let UserContent::Text(content) = &message.content else {
@@ -777,6 +784,28 @@ state
             details["fullOutputPath"],
             serde_json::json!("/tmp/spill/bash-7100.out")
         );
+        // A job that died without an exit code carries its reason: the
+        // row's exit:-1 must not be a mystery.
+        let message = create_async_bash_completion_message(
+            7101,
+            "sleep 61",
+            -1,
+            Some("/tmp/spill/bash-7101.out"),
+            Some("Command timed out after 1 seconds"),
+            3_001,
+        );
+        let UserContent::Text(content) = &message.content else {
+            panic!("text row");
+        };
+        assert_eq!(
+            content,
+            "[bash-done pid:7101 exit:-1]\n\nCommand: \"sleep 61\"\n\nOutput: /tmp/spill/bash-7101.out\n\nCommand timed out after 1 seconds"
+        );
+        let details = message.details.unwrap();
+        assert_eq!(
+            details["status"],
+            serde_json::json!("Command timed out after 1 seconds")
+        );
     }
 
     #[test]
@@ -785,6 +814,7 @@ state
             4321,
             "sleep 12; echo RW_WAKE_DONE",
             0,
+            None,
             None,
             1_000,
         );
@@ -802,8 +832,14 @@ state
         assert_eq!(details["pid"], 4321);
         assert_eq!(details["command"], "sleep 12; echo RW_WAKE_DONE");
         assert_eq!(details["exitCode"], 0);
-        let message =
-            create_async_bash_completion_message(11, "echo \"done\" && exit 2", 2, None, 2_000);
+        let message = create_async_bash_completion_message(
+            11,
+            "echo \"done\" && exit 2",
+            2,
+            None,
+            None,
+            2_000,
+        );
         assert_eq!(message.timestamp, 2_000);
         assert!(matches!(message.content, UserContent::Text(text)
             if text.starts_with("[bash-done pid:11 exit:2]\n\nCommand: \"echo \\\"done\\\" && exit 2\"")));

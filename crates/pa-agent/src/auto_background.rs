@@ -27,6 +27,10 @@ pub struct AutoBackgroundCompletion {
     pub output: String,
     /// The spilled full-output file, when output was truncated.
     pub full_output_path: Option<String>,
+    /// The terminal failure status line ("Command aborted" /
+    /// "Command timed out after N seconds") when the job died without an
+    /// exit code, so the wake row can explain the -1.
+    pub status: Option<String>,
 }
 
 /// The wake contract for a promoted job: the embedding wires this to the
