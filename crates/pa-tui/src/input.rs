@@ -77,6 +77,9 @@ pub(crate) enum ReaderInput {
     Event(Event),
     Mouse(crate::mouse::MouseEvent),
     BurstPaste(String),
+    /// The end of one terminal write: every input of the chunk was delivered before it. Not sent
+    /// while the kitty probe shares crossterm's reader lock (the write boundary is unknown then).
+    ChunkEnd,
 }
 
 /// Start the terminal input reader: whole terminal writes that look like
@@ -126,14 +129,17 @@ where
             // costs no wakeups. Two bounded exceptions: a held sequence's flush deadline, and the
             // Kitty setup and its answer window: an indefinite park before the first draw
             // would hold crossterm's reader lock and prevent the deferred probe from reading replies.
-            // A held burst's continuation deadline bounds the wait the same way.
+            // While the probe shares the lock, a zero-timeout poll can miss it and end the drain
+            // mid-write: a round marks its chunk end only when no probe ran around it. A held
+            // burst's continuation deadline bounds the wait like a held sequence's.
+            let probe_pending = crate::enhanced_keys::kitty_probe_pending();
             let now = Instant::now();
             let held_deadline = match (guard.poll_deadline(now), coalescer.poll_deadline(now)) {
                 (Some(sequence), Some(burst)) => Some(sequence.min(burst)),
                 (sequence, burst) => sequence.or(burst),
             };
             let timeout = held_deadline.or_else(|| {
-                if thread_waker.is_none() || crate::enhanced_keys::kitty_probe_pending() {
+                if thread_waker.is_none() || probe_pending {
                     Some(Duration::from_millis(POLL_TIMEOUT_MS))
                 } else {
                     None
@@ -144,7 +150,8 @@ where
                     let now = Instant::now();
                     let mut rounds = coalescer.flush_expired(now);
                     rounds.extend(coalescer.push_round(guard.flush_expired(now), now));
-                    if !forward_rounds(rounds, &mut on_input) {
+                    let whole = !probe_pending && !crate::enhanced_keys::kitty_probe_pending();
+                    if !forward_rounds(rounds, whole, &mut on_input) {
                         return;
                     }
                 }
@@ -180,7 +187,8 @@ where
                         outputs.extend(guard.feed(event, Instant::now()));
                     }
                     let rounds = coalescer.push_round(outputs, Instant::now());
-                    if !forward_rounds(rounds, &mut on_input) {
+                    let whole = !probe_pending && !crate::enhanced_keys::kitty_probe_pending();
+                    if !forward_rounds(rounds, whole, &mut on_input) {
                         return;
                     }
                 }
@@ -193,6 +201,20 @@ where
         stop,
         waker,
     });
+}
+
+/// [`forward`] one drained round, then mark its end with [`ReaderInput::ChunkEnd`] when the round
+/// is a `whole` terminal write (an empty round delivers nothing). Returns `false` when the surface
+/// stopped the reader.
+fn forward_chunk(
+    outputs: Vec<GuardOutput>,
+    whole: bool,
+    on_input: &mut dyn FnMut(ReaderInput) -> bool,
+) -> bool {
+    if outputs.is_empty() {
+        return true;
+    }
+    forward(outputs, on_input) && (!whole || on_input(ReaderInput::ChunkEnd))
 }
 
 /// Holds a marker-less keystroke burst open across drain rounds for [`BURST_CONTINUATION`], so a
@@ -259,12 +281,15 @@ impl BurstCoalescer {
     }
 }
 
-/// Forward each ready round in order; `false` when the surface stopped the reader.
+/// [`forward_chunk`] each ready round in order; `false` when the surface stopped the reader.
 fn forward_rounds(
     rounds: Vec<Vec<GuardOutput>>,
+    whole: bool,
     on_input: &mut dyn FnMut(ReaderInput) -> bool,
 ) -> bool {
-    rounds.into_iter().all(|round| forward(round, on_input))
+    rounds
+        .into_iter()
+        .all(|round| forward_chunk(round, whole, on_input))
 }
 
 /// The burst reading of one round: the text a paste would carry and its count of text presses, or
@@ -840,6 +865,29 @@ mod tests {
         );
     }
 
+    #[test]
+    fn a_forwarded_chunk_ends_with_its_marker() {
+        let outputs = vec![
+            GuardOutput::Event(key(KeyCode::Char('/'), KeyModifiers::NONE)),
+            GuardOutput::Event(key(KeyCode::Char('l'), KeyModifiers::NONE)),
+            GuardOutput::Event(key(KeyCode::Enter, KeyModifiers::NONE)),
+        ];
+        let mut inputs = Vec::new();
+        assert!(forward_chunk(outputs, true, &mut |input| {
+            inputs.push(input);
+            true
+        }));
+        assert_eq!(
+            inputs,
+            vec![
+                ReaderInput::Event(key(KeyCode::Char('/'), KeyModifiers::NONE)),
+                ReaderInput::Event(key(KeyCode::Char('l'), KeyModifiers::NONE)),
+                ReaderInput::Event(key(KeyCode::Enter, KeyModifiers::NONE)),
+                ReaderInput::ChunkEnd,
+            ]
+        );
+    }
+
     /// `forward` against a capturing sink (the paste-aware surface).
     fn collect_forwarded(outputs: Vec<GuardOutput>) -> Vec<ReaderInput> {
         let mut inputs = Vec::new();
@@ -1126,10 +1174,14 @@ mod tests {
         };
         for (offset, round) in rounds {
             let ready = coalescer.push_round(round, start + Duration::from_millis(offset));
-            assert!(forward_rounds(ready, &mut sink));
+            assert!(forward_rounds(ready, false, &mut sink));
         }
         let idle = start + Duration::from_secs(60);
-        assert!(forward_rounds(coalescer.flush_expired(idle), &mut sink));
+        assert!(forward_rounds(
+            coalescer.flush_expired(idle),
+            false,
+            &mut sink
+        ));
         assert_eq!(coalescer.poll_deadline(idle), None);
         inputs
     }
