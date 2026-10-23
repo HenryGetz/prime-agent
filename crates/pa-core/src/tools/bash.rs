@@ -1800,59 +1800,68 @@ mod auto_background_tests {
             auto_background_registry: Some(Arc::new(registry)),
             ..BashToolOptions::default()
         };
-        let result = execute_bash(
-            "call-journal",
-            ".",
-            &options,
-            "sleep 2; echo journaled-lander",
-            None,
-            None,
-            None,
-            None,
-        )
-        .await
-        .expect("promotion returns Ok");
-        let details = result.details.clone().expect("promotion details");
-        let pid = details["pid"].as_u64().expect("pid reported") as usize;
         let journal_rows = || std::fs::read_to_string(&journal).unwrap_or_default();
-        // The active row is written at the promotion edge, before the call
-        // returns; poll briefly so a contended host cannot flake.
-        let mut active_seen = false;
-        for _ in 0..10 {
-            if journal_rows().contains(&format!("\"pid\":{pid},\"ownerPid\":")) {
-                active_seen = true;
-                break;
-            }
-            tokio::time::sleep(Duration::from_millis(100)).await;
-        }
+        let call = tokio::spawn(async move {
+            execute_bash(
+                "call-journal",
+                ".",
+                &options,
+                "sleep 2; echo journaled-lander",
+                None,
+                None,
+                None,
+                None,
+            )
+            .await
+        });
+        // The active row is journaled in `on_spawn`, synchronously with the
+        // child's spawn — before the promotion edge, while the call is still
+        // inline. Reading mid-window pins that ordering: a registration
+        // moved back to the promotion edge leaves the journal empty here.
+        tokio::time::sleep(Duration::from_millis(100)).await;
+        let pid = journal_rows()
+            .lines()
+            .find_map(|line| {
+                let row: serde_json::Value = serde_json::from_str(line).ok()?;
+                if row["active"].as_bool() == Some(true) {
+                    row["pid"].as_u64().map(|pid| pid as usize)
+                } else {
+                    None
+                }
+            })
+            .expect("the orphan row is journaled at spawn, before the promotion edge");
+        let result = call
+            .await
+            .expect("the promoted call joins")
+            .expect("promotion returns Ok");
+        let details = result.details.clone().expect("promotion details");
+        assert_eq!(
+            details["pid"].as_u64().expect("pid reported") as usize,
+            pid,
+            "the journaled row must be the promoted job's"
+        );
+        // The spawn-time row is already on disk when the promotion returns.
         assert!(
-            active_seen,
+            journal_rows().contains(&format!("\"pid\":{pid},\"ownerPid\":")),
             "the promoted job must be journaled active at promotion"
         );
-        // Completion releases the record.
+        // Completion releases the record: the exec task writes the
+        // inactive row before it sends the notice, so no polling — the
+        // release must already be the last row for this pid when the
+        // notice arrives.
         let completion = tokio::time::timeout(Duration::from_secs(10), rx.recv())
             .await
             .expect("completion lands")
             .expect("notice lane open");
         assert_eq!(completion.exit_code, Some(0));
-        // The journal is append-only: the LAST row for this pid must be
-        // the inactive release.
-        let mut released = false;
-        for _ in 0..20 {
-            let rows = journal_rows();
-            let last_row = rows
-                .lines()
-                .rev()
-                .find(|line| line.contains(&format!("\"pid\":{pid},")));
-            if last_row.is_some_and(|line| line.contains("\"active\":false")) {
-                released = true;
-                break;
-            }
-            tokio::time::sleep(Duration::from_millis(100)).await;
-        }
+        let rows = journal_rows();
+        let last_row = rows
+            .lines()
+            .rev()
+            .find(|line| line.contains(&format!("\"pid\":{pid},")));
         assert!(
-            released,
-            "the completed job must release its journal record"
+            last_row.is_some_and(|line| line.contains("\"active\":false")),
+            "the completed job must release its journal record before the notice"
         );
     }
 
