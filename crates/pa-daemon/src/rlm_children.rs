@@ -508,7 +508,9 @@ impl SupervisorChildSessions {
     /// The worker started a parent turn: spawns admitted from here on hold
     /// their task prompt until the turn completes.
     pub fn notify_turn_started(&self) {
-        self.inner.parent_turn.send_modify(|turn| turn.running = true);
+        self.inner
+            .parent_turn
+            .send_modify(|turn| turn.running = true);
     }
 
     /// The worker saw the parent's turn end: release prompt tasks waiting
