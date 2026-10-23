@@ -102,8 +102,32 @@ Supported configuration fields are deliberately narrow:
 PreCompact and Stop, matching upstream behavior. Common controls are rejected on
 tool events in this bounded subset. SessionEnd ignores successful stdout entirely.
 
-This version provides tracing diagnostics, not a `/hooks` browser or TUI status
-messages. Review and record trust outside the agent run; there is no automatic
+There is no `/hooks` browser. Hook diagnostics are shown to the user as
+display-only `hook_notice` transcript rows; they are never model context:
+
+- The TUI shows each one as a warning status line. Daemon clients, through the
+  supervisor or a direct worker connection, receive it as a durable custom row
+  (`message_start`/`message_end`).
+- Print mode writes each one to stderr as `Warning: <text>`; `--mode json` and
+  `--mode rpc` also stream the row as a `message_end` event with
+  `customType: "hook_notice"`.
+- Load diagnostics (an untrusted or invalid source, or disabled hooks) appear once
+  per session, at the first lifecycle dispatch. Command failures, timeouts and
+  `systemMessage` output name the event and the command (whitespace collapsed,
+  first 120 characters). Identical diagnostics are shown once per session, and at
+  most 32 distinct ones are shown before the rest are suppressed.
+- A diagnostic raised outside an active run, for example by a late PostToolUse
+  observer, appears with the next admitted prompt. SessionEnd failures happen
+  while the session closes and are not shown.
+
+An untrusted source reports its path and the fingerprint to trust, for example:
+
+```text
+Hooks skipped: /work/repo/.prime/hooks.json is not trusted for /work/repo. Trust covers the file's path and bytes and the session directory, so an edit or another directory needs a new entry. After reviewing it, add this fingerprint to /home/me/.prime/agent/hook-trust.json (see docs/hooks.md):
+<sha256>
+```
+
+Review and record trust outside the agent run; there is no automatic
 trust action or bypass flag. To calculate a fingerprint without changing trust:
 
 ```python
@@ -252,8 +276,8 @@ Empty reasons are callback failures; they do not invent a veto. SessionStart and
 PreCompact treat every nonzero exit as a callback failure. Exit 0 with empty stdout
 is success without a decision. Non-JSON plain stdout is ignored for tool
 events, matching Codex. A background observer should exit 0 with no output;
-it cannot block a completed tool. `systemMessage` is accepted as a tracing
-warning for every supported event except SessionEnd, whose stdout is ignored; it is not injected into model context.
+it cannot block a completed tool. `systemMessage` is shown to the user as a hook
+diagnostic for every supported event except SessionEnd, whose stdout is ignored; it is not injected into model context.
 Unsupported structured control fields must
 be diagnosed rather than silently interpreted as an approval or rewrite.
 
@@ -371,7 +395,7 @@ hook veto. Missing/unreadable/invalid configuration or trust, mismatched
 fingerprints, regex execution errors, process spawn failure, timeout (including
 slot waiting), input above 1 MiB, output above 64 KiB per stream, malformed output,
 unsupported fields, nonzero exits other than valid exit 2, and empty deny reasons
-leave the operation unchanged. Tracing reports failures, but there is no required
+leave the operation unchanged. A hook diagnostic reports failures, but there is no required
 policy mode, fail-closed option, or interactive/headless admission error for an
 unavailable security hook. Another successfully parsed handler can still deny.
 Cancellation remains governed by the host's abort handling; a discarded hook

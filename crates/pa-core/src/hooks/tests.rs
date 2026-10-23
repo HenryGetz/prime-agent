@@ -364,3 +364,119 @@ async fn finish_cancels_and_joins_synchronous_commands_before_end() {
         HookOutcome::default()
     );
 }
+
+#[cfg(unix)]
+fn recorded_notices(runtime: &HookRuntime) -> Arc<Mutex<Vec<String>>> {
+    let notices = Arc::new(Mutex::new(Vec::new()));
+    let sink = Arc::clone(&notices);
+    runtime.set_on_notice(Arc::new(move |text| {
+        sink.lock().unwrap().push(text);
+        Box::pin(async {})
+    }));
+    notices
+}
+
+#[cfg(unix)]
+#[tokio::test]
+async fn failed_hooks_report_their_event_and_command_once() {
+    let _command_guard = crate::hooks::test_command_guard().await;
+    let (_dir, runtime) = fixture(&json!({"hooks":{"PreToolUse":[{"hooks":[
+        {"type":"command","command":"cat >/dev/null; echo lint broke >&2;\n  exit 1"},
+        {"type":"command","command":"cat >/dev/null; sleep 5","timeout":1},
+        {"type":"command","command":"printf '{\"systemMessage\":\"lint is slow\"}'"}
+    ]}]}}));
+    let notices = recorded_notices(&runtime);
+    for _ in 0..2 {
+        assert_eq!(
+            runtime
+                .evaluate(input("PreToolUse"), AbortSignal::default())
+                .await,
+            None
+        );
+    }
+    let mut notices = notices.lock().unwrap().clone();
+    notices.sort();
+    assert_eq!(
+        notices,
+        [
+            "PreToolUse hook failed, operation unchanged: command exited with status 1: lint broke\ncommand: cat >/dev/null; echo lint broke >&2; exit 1",
+            "PreToolUse hook message: lint is slow",
+            "PreToolUse hook timed out after 1s, operation unchanged\ncommand: cat >/dev/null; sleep 5",
+        ]
+    );
+}
+
+#[cfg(unix)]
+#[tokio::test]
+async fn untrusted_sources_are_reported_once_per_session() {
+    let dir = tempfile::tempdir().unwrap();
+    let cwd = dir.path().join("project");
+    let agent = dir.path().join("agent");
+    std::fs::create_dir_all(&cwd).unwrap();
+    std::fs::create_dir_all(&agent).unwrap();
+    std::fs::write(
+        agent.join("hooks.json"),
+        br#"{"hooks":{"Stop":[{"hooks":[{"type":"command","command":"true"}]}]}}"#,
+    )
+    .unwrap();
+    let runtime = HookRuntime::new(cwd, agent.clone());
+    let notices = recorded_notices(&runtime);
+    for _ in 0..2 {
+        runtime
+            .dispatch(input("PreToolUse"), AbortSignal::default())
+            .await;
+    }
+    let notices = notices.lock().unwrap().clone();
+    assert_eq!(notices.len(), 1, "{notices:?}");
+    assert!(
+        notices[0].starts_with(&format!(
+            "Hooks skipped: {} is not trusted for ",
+            agent.canonicalize().unwrap().join("hooks.json").display()
+        )),
+        "{notices:?}"
+    );
+}
+
+#[cfg(unix)]
+#[tokio::test]
+async fn unsafe_trust_reports_that_hooks_are_disabled() {
+    use std::os::unix::fs::PermissionsExt;
+    let (_dir, runtime) = fixture(&json!({"hooks":{"Stop":[{"hooks":[
+        {"type":"command","command":"true"}
+    ]}]}}));
+    let trust = runtime.state.agent_dir.join("hook-trust.json");
+    std::fs::set_permissions(&trust, std::fs::Permissions::from_mode(0o666)).unwrap();
+    let notices = recorded_notices(&runtime);
+    runtime
+        .dispatch(input("Stop"), AbortSignal::default())
+        .await;
+    assert_eq!(
+        *notices.lock().unwrap(),
+        [format!(
+            "Hooks disabled for this session: {} must be owned by the current user and not group/world writable. See docs/hooks.md.",
+            trust.canonicalize().unwrap().display()
+        )]
+    );
+}
+
+#[test]
+fn diagnostics_are_capped_per_session() {
+    let runtime = HookRuntime::new(".".into(), ".".into());
+    let notices = Arc::new(Mutex::new(Vec::new()));
+    let sink = Arc::clone(&notices);
+    runtime.set_on_notice(Arc::new(move |text| {
+        sink.lock().unwrap().push(text);
+        Box::pin(async {})
+    }));
+    for index in 0..40 {
+        if let Some((sink, text)) = runtime.state.admit_notice(format!("notice {index}")) {
+            drop(sink(text));
+        }
+    }
+    let notices = notices.lock().unwrap();
+    assert_eq!(notices.len(), NOTICE_LIMIT + 1);
+    assert_eq!(
+        notices.last().unwrap(),
+        "Further hook diagnostics in this session are suppressed."
+    );
+}

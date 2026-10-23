@@ -23,7 +23,15 @@ pub(crate) struct HookOutcome {
     pub message: Option<String>,
 }
 
+/// Delivers one user-facing hook diagnostic. The session engine renders it as a
+/// display-only transcript row; implementations must not block on the session.
+pub(crate) type HookNoticeSink = Arc<dyn Fn(String) -> pa_agent::BoxFut<'static, ()> + Send + Sync>;
+
 const INPUT_LIMIT: usize = 1024 * 1024;
+// Distinct diagnostics surfaced per session; repeats of the same text are dropped.
+const NOTICE_LIMIT: usize = 32;
+const COMMAND_PREVIEW_CHARS: usize = 120;
+const MESSAGE_PREVIEW_CHARS: usize = 1000;
 static COMMAND_SLOTS: Semaphore = Semaphore::const_new(4);
 // Observers cannot consume the final slot reserved for synchronous decisions.
 static OBSERVER_COMMAND_SLOTS: Semaphore = Semaphore::const_new(3);
@@ -51,6 +59,8 @@ struct State {
     disabled: bool,
     executed: AtomicBool,
     on_execute: OnceLock<Arc<dyn Fn() + Send + Sync>>,
+    on_notice: OnceLock<HookNoticeSink>,
+    notices: Mutex<Vec<String>>,
     shutdown: AbortController,
     active: watch::Sender<usize>,
 }
@@ -75,6 +85,8 @@ impl HookRuntime {
                 disabled: std::env::var_os("PRIME_AGENT_HOOK_ACTIVE").is_some(),
                 executed: AtomicBool::new(false),
                 on_execute: OnceLock::new(),
+                on_notice: OnceLock::new(),
+                notices: Mutex::new(Vec::new()),
                 shutdown: AbortController::new(),
                 active: watch::channel(0).0,
             }),
@@ -97,6 +109,10 @@ impl HookRuntime {
 
     pub(crate) fn set_on_execute(&self, callback: Arc<dyn Fn() + Send + Sync>) {
         let _ = self.state.on_execute.set(callback);
+    }
+
+    pub(crate) fn set_on_notice(&self, sink: HookNoticeSink) {
+        let _ = self.state.on_notice.set(sink);
     }
 
     pub(crate) async fn evaluate(&self, input: Value, signal: AbortSignal) -> Option<String> {
@@ -195,12 +211,17 @@ impl HookRuntime {
         }
         let Ok(slot) = self.observer_slots.clone().try_acquire_owned() else {
             tracing::warn!("PostToolUse observer queue full; observation dropped");
+            self.state.notify_detached(
+                "PostToolUse hook observation dropped: at most 8 observations may be pending per session.".into(),
+            );
             return;
         };
         let input = match bounded_input(input) {
             Ok(input) => Arc::new(input),
             Err(error) => {
                 tracing::warn!(%error, "hook observation rejected");
+                self.state
+                    .notify_detached(format!("PostToolUse hook observation dropped: {error:#}."));
                 return;
             }
         };
@@ -266,6 +287,11 @@ impl State {
             Ok(input) => Arc::new(input),
             Err(error) => {
                 tracing::warn!(%error, "hook input rejected");
+                self.notify(format!(
+                    "{} hooks skipped, operation unchanged: {error:#}.",
+                    event.name()
+                ))
+                .await;
                 return HookOutcome::default();
             }
         };
@@ -305,28 +331,72 @@ impl State {
                 }
                 let cwd = self.cwd.clone();
                 let agent_dir = self.agent_dir.clone();
+                // Diagnostics surface once: the snapshot initializes once per session.
                 match tokio::task::spawn_blocking(move || -> anyhow::Result<_> {
                     let cwd = cwd.canonicalize()?;
-                    let hooks = config::load(&cwd, &agent_dir)?;
-                    Ok((cwd, hooks))
+                    let loaded = config::load(&cwd, &agent_dir)?;
+                    Ok((cwd, loaded))
                 })
                 .await
                 {
-                    Ok(Ok((cwd, hooks))) => {
+                    Ok(Ok((cwd, loaded))) => {
                         let _ = self.execution_cwd.set(cwd);
-                        hooks
+                        for diagnostic in loaded.diagnostics {
+                            self.notify(diagnostic).await;
+                        }
+                        loaded.hooks
                     }
                     Ok(Err(error)) => {
                         tracing::warn!(%error, "hooks disabled: invalid configuration or trust");
+                        self.notify(format!(
+                            "Hooks disabled for this session: {error:#}. See docs/hooks.md."
+                        ))
+                        .await;
                         Vec::new()
                     }
                     Err(error) => {
                         tracing::warn!(%error, "hook discovery failed");
+                        self.notify(format!(
+                            "Hooks disabled for this session: discovery failed: {error}."
+                        ))
+                        .await;
                         Vec::new()
                     }
                 }
             })
             .await
+    }
+
+    /// Surface one diagnostic to the session's user, once per distinct text.
+    async fn notify(&self, text: String) {
+        if let Some((sink, text)) = self.admit_notice(text) {
+            sink(text).await;
+        }
+    }
+
+    /// The synchronous observer path cannot await the session; delivery is detached.
+    fn notify_detached(&self, text: String) {
+        if let Some((sink, text)) = self.admit_notice(text) {
+            tokio::spawn(sink(text));
+        }
+    }
+
+    fn admit_notice(&self, text: String) -> Option<(HookNoticeSink, String)> {
+        let sink = self.on_notice.get()?;
+        let mut seen = self
+            .notices
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        if seen.contains(&text) || seen.len() > NOTICE_LIMIT {
+            return None;
+        }
+        let text = if seen.len() == NOTICE_LIMIT {
+            "Further hook diagnostics in this session are suppressed.".to_string()
+        } else {
+            text
+        };
+        seen.push(text.clone());
+        Some((Arc::clone(sink), text))
     }
 
     async fn run(
@@ -384,19 +454,45 @@ impl State {
             () = shutdown.aborted(), if hook.event != Event::SessionEnd => return None,
             result = tokio::time::timeout(hook.timeout, operation) => result,
         };
+        let event = hook.event.name();
+        let command = preview(
+            &hook
+                .command
+                .split_whitespace()
+                .collect::<Vec<_>>()
+                .join(" "),
+            COMMAND_PREVIEW_CHARS,
+        );
         match result {
             Ok(Ok(outcome)) => {
                 if let Some(message) = &outcome.message {
-                    tracing::warn!(%message, "hook systemMessage");
+                    tracing::warn!(%message, event, %command, "hook systemMessage");
+                    let message = preview(message, MESSAGE_PREVIEW_CHARS);
+                    self.notify(format!("{event} hook message: {message}"))
+                        .await;
                 }
                 Some(outcome)
             }
-            Ok(Err(error)) => {
-                tracing::warn!(%error, "hook failed; operation unchanged");
+            // The runner's own deadline (stdin, pipes and exit) is the same timeout.
+            Ok(Err(error))
+                if error
+                    .downcast_ref::<tokio::time::error::Elapsed>()
+                    .is_none() =>
+            {
+                tracing::warn!(%error, event, %command, "hook failed; operation unchanged");
+                self.notify(format!(
+                    "{event} hook failed, operation unchanged: {error:#}\ncommand: {command}"
+                ))
+                .await;
                 None
             }
-            Err(_) => {
-                tracing::warn!("hook deadline exceeded; operation unchanged");
+            Ok(Err(_)) | Err(_) => {
+                tracing::warn!(event, %command, "hook deadline exceeded; operation unchanged");
+                self.notify(format!(
+                    "{event} hook timed out after {}s, operation unchanged\ncommand: {command}",
+                    hook.timeout.as_secs()
+                ))
+                .await;
                 None
             }
         }
@@ -411,6 +507,16 @@ impl Drop for ActiveCommand<'_> {
     fn drop(&mut self) {
         self.0.active.send_modify(|count| *count -= 1);
     }
+}
+
+/// Hook-supplied text bounded for a diagnostic row.
+fn preview(text: &str, limit: usize) -> String {
+    let text = text.trim();
+    let mut preview: String = text.chars().take(limit).collect();
+    if preview.len() < text.len() {
+        preview.push('…');
+    }
+    preview
 }
 
 fn append_bounded(target: &mut Option<String>, text: &str) {

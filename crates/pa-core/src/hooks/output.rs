@@ -56,10 +56,23 @@ pub(super) fn parse(event: Event, output: CommandOutput) -> anyhow::Result<HookO
             }
         });
     }
-    ensure!(
-        code == Some(0),
-        "hook command failed (exit {code:?}); operation unchanged"
-    );
+    if code != Some(0) {
+        let status = code.map_or_else(|| "a signal".to_string(), |code| format!("status {code}"));
+        // The first stderr line names the cause in diagnostics, bounded.
+        let stderr = String::from_utf8_lossy(&stderr);
+        let detail: String = stderr
+            .trim()
+            .lines()
+            .next()
+            .unwrap_or_default()
+            .chars()
+            .take(200)
+            .collect();
+        if detail.is_empty() {
+            bail!("command exited with {status}");
+        }
+        bail!("command exited with {status}: {detail}");
+    }
     // SessionEnd is advisory: successful stdout has no contract, even JSON or non-UTF8.
     if event == Event::SessionEnd {
         return Ok(HookOutcome::default());

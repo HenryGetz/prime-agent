@@ -54,9 +54,9 @@ fn exact_approval_enables_hooks_and_changes_revoke_it() {
     let fixture = Fixture::new();
     let bytes = configuration();
     std::fs::write(&fixture.source, &bytes).unwrap();
-    assert!(load(&fixture.cwd, &fixture.agent).unwrap().is_empty());
+    assert!(load(&fixture.cwd, &fixture.agent).unwrap().hooks.is_empty());
     fixture.approve(&[&fixture.source]);
-    let hooks = load(&fixture.cwd, &fixture.agent).unwrap();
+    let hooks = load(&fixture.cwd, &fixture.agent).unwrap().hooks;
     assert_eq!(hooks.len(), 1);
     assert_eq!(hooks[0].command, "exit 2");
     assert!(hooks[0].matches(Event::PreToolUse, "bash"));
@@ -64,18 +64,68 @@ fn exact_approval_enables_hooks_and_changes_revoke_it() {
     assert!(!hooks[0].matches(Event::PostToolUse, "bash"));
     let subdir = fixture.cwd.join("subdir");
     std::fs::create_dir(&subdir).unwrap();
-    assert!(load(&subdir, &fixture.agent).unwrap().is_empty());
+    assert!(load(&subdir, &fixture.agent).unwrap().hooks.is_empty());
     let mut changed = bytes;
     changed.push(b' ');
     std::fs::write(&fixture.source, changed).unwrap();
-    assert!(load(&fixture.cwd, &fixture.agent).unwrap().is_empty());
+    assert!(load(&fixture.cwd, &fixture.agent).unwrap().hooks.is_empty());
 }
 
 #[test]
 fn project_local_trust_cannot_authorize_hooks() {
     let fixture = Fixture::new();
     std::fs::write(&fixture.source, configuration()).unwrap();
-    assert!(load(&fixture.cwd, &fixture.cwd.join(".prime")).is_err());
+    let error = load(&fixture.cwd, &fixture.cwd.join(".prime"))
+        .err()
+        .unwrap();
+    let cwd = fixture.cwd.canonicalize().unwrap();
+    assert_eq!(
+        format!("{error:#}"),
+        format!(
+            "the agent directory {} is inside the project root {}, and project-local agent directories cannot authorize hooks; start the session from a directory outside it",
+            cwd.join(".prime").display(),
+            cwd.display()
+        )
+    );
+}
+
+#[test]
+fn untrusted_source_reports_its_path_and_fingerprint() {
+    let fixture = Fixture::new();
+    std::fs::write(&fixture.source, configuration()).unwrap();
+    let loaded = load(&fixture.cwd, &fixture.agent).unwrap();
+    let cwd = fixture.cwd.canonicalize().unwrap();
+    let digest = fingerprint(
+        &fixture.source.canonicalize().unwrap(),
+        &cwd,
+        &configuration(),
+    );
+    assert!(loaded.hooks.is_empty());
+    assert_eq!(
+        loaded.diagnostics,
+        [format!(
+            "Hooks skipped: {} is not trusted for {}. Trust covers the file's path and bytes and the session directory, so an edit or another directory needs a new entry. After reviewing it, add this fingerprint to {} (see docs/hooks.md):\n{digest}",
+            cwd.join(".prime/hooks.json").display(),
+            cwd.display(),
+            fixture.agent.canonicalize().unwrap().join("hook-trust.json").display(),
+        )]
+    );
+}
+
+#[test]
+fn trusted_invalid_source_reports_why_it_was_skipped() {
+    let fixture = Fixture::new();
+    std::fs::write(&fixture.source, br#"{"hooks":{"UnsupportedEvent":[]}}"#).unwrap();
+    fixture.approve(&[&fixture.source]);
+    let loaded = load(&fixture.cwd, &fixture.agent).unwrap();
+    assert!(loaded.hooks.is_empty());
+    assert_eq!(
+        loaded.diagnostics,
+        [format!(
+            "Hooks skipped: {}: unsupported hook event UnsupportedEvent. Other trusted hook sources remain active.",
+            fixture.cwd.canonicalize().unwrap().join(".prime/hooks.json").display()
+        )]
+    );
 }
 
 #[test]
@@ -100,7 +150,7 @@ fn trusted_invalid_source_preserves_other_trusted_policies() {
     std::fs::write(&user_source, configuration()).unwrap();
     std::fs::write(&fixture.source, br#"{"hooks":{"UnsupportedEvent":[]}}"#).unwrap();
     fixture.approve(&[&user_source, &fixture.source]);
-    let hooks = load(&fixture.cwd, &fixture.agent).unwrap();
+    let hooks = load(&fixture.cwd, &fixture.agent).unwrap().hooks;
     assert_eq!(hooks.len(), 1);
     assert_eq!(hooks[0].command, "exit 2");
 }
@@ -138,7 +188,7 @@ fn caps_groups_even_when_they_have_no_handlers() {
     std::fs::write(&fixture.source, &bytes).unwrap();
     std::fs::write(&user_source, &bytes).unwrap();
     fixture.approve(&[&fixture.source, &user_source]);
-    let hooks = load(&fixture.cwd, &fixture.agent).unwrap();
+    let hooks = load(&fixture.cwd, &fixture.agent).unwrap().hooks;
     assert_eq!(hooks.len(), 1);
     assert_eq!(hooks[0].command, "exit 2");
 }
@@ -165,7 +215,7 @@ fn rejects_symlink_sources_and_symlink_trust() {
     let actual = fixture.cwd.join("actual.json");
     std::fs::write(&actual, configuration()).unwrap();
     symlink(&actual, &fixture.source).unwrap();
-    assert!(load(&fixture.cwd, &fixture.agent).unwrap().is_empty());
+    assert!(load(&fixture.cwd, &fixture.agent).unwrap().hooks.is_empty());
     std::fs::remove_file(&fixture.source).unwrap();
     std::fs::write(&fixture.source, configuration()).unwrap();
     fixture.approve(&[&fixture.source]);
@@ -233,7 +283,7 @@ fn malicious_project_sources_cannot_disable_trusted_user_denials() {
             .unwrap(),
             _ => unreachable!(),
         }
-        let hooks = load(&fixture.cwd, &fixture.agent).unwrap();
+        let hooks = load(&fixture.cwd, &fixture.agent).unwrap().hooks;
         assert_eq!(hooks.len(), 1, "source kind: {source_kind}");
         assert_eq!(hooks[0].command, "exit 2");
         std::fs::remove_file(&fixture.source).unwrap();
@@ -249,7 +299,7 @@ fn combined_handler_limit_retains_the_accepted_user_source() {
     std::fs::write(&user_source, &bytes).unwrap();
     std::fs::write(&fixture.source, &bytes).unwrap();
     fixture.approve(&[&user_source, &fixture.source]);
-    let hooks = load(&fixture.cwd, &fixture.agent).unwrap();
+    let hooks = load(&fixture.cwd, &fixture.agent).unwrap().hooks;
     assert_eq!(hooks.len(), 17);
     assert!(hooks.iter().all(|hook| hook.command == "exit 2"));
 }

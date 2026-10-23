@@ -681,3 +681,52 @@ async fn compact_mark_arriving_during_dispatch_survives_for_next_gate() {
         vec![json!("startup"), json!("compact"), json!("compact")]
     );
 }
+
+#[tokio::test]
+async fn hook_diagnostics_persist_as_display_rows_and_never_reach_the_model() {
+    let _command_guard = crate::hooks::test_command_guard().await;
+    let fixture = Fixture::new(&json!({"hooks": {"Stop": [{"hooks": [{
+        "type": "command", "command": "cat >/dev/null; printf '{\"decision\":'"
+    }]}]}}));
+    let provider = Arc::new(ScriptedProvider::new(Model::unknown()));
+    provider.push_text_turn("first answer");
+    provider.push_text_turn("second answer");
+    let engine = create_session(fixture.config(&provider)).await.unwrap();
+    engine
+        .prompt("first", PromptOptions::default())
+        .await
+        .unwrap();
+    engine
+        .prompt("second", PromptOptions::default())
+        .await
+        .unwrap();
+    let notices: Vec<_> = engine
+        .session
+        .entries()
+        .await
+        .into_iter()
+        .filter_map(|entry| match entry {
+            pa_types::session::FileEntry::CustomMessage { payload, .. }
+                if payload.custom_type == super::messages::HOOK_NOTICE_CUSTOM_TYPE =>
+            {
+                Some((payload.content.text(), payload.display))
+            }
+            _ => None,
+        })
+        .collect();
+    let notice = "Stop hook failed, operation unchanged: EOF while parsing a value at line 1 column 12\ncommand: cat >/dev/null; printf '{\"decision\":'";
+    // Identical failures surface once per session.
+    assert_eq!(notices, [(notice.to_string(), true)]);
+    let live = engine.session.agent().state().await.messages;
+    assert!(live.iter().any(|message| matches!(
+        message,
+        pa_agent::types::AgentMessage::Custom(custom)
+            if custom.payload["customType"] == super::messages::HOOK_NOTICE_CUSTOM_TYPE
+    )));
+    for call in provider.calls() {
+        assert!(
+            !format!("{:?}", call.messages).contains("Stop hook failed"),
+            "hook diagnostics are never model context"
+        );
+    }
+}

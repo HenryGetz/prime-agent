@@ -804,6 +804,11 @@ pub async fn create_session(mut config: SessionEngineConfig) -> anyhow::Result<S
 
     let agent = Arc::new(agent);
     if let Some(hooks) = &tool_hooks {
+        // Weak: the agent's callbacks own the hook runtime that owns this sink.
+        hooks.runtime.set_on_notice(super::hooks::notice_sink(
+            Arc::downgrade(&agent),
+            Arc::clone(&boot_notice_rows),
+        ));
         let run_id = Arc::clone(&hooks.run_id);
         agent
             .subscribe(move |event, _signal| {

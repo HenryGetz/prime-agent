@@ -107,6 +107,12 @@ impl ConfiguredHook {
     }
 }
 
+/// One immutable snapshot plus the user-facing reasons any source was skipped.
+pub(super) struct Loaded {
+    pub hooks: Vec<ConfiguredHook>,
+    pub diagnostics: Vec<String>,
+}
+
 pub(super) fn fingerprint(source: &Path, cwd: &Path, bytes: &[u8]) -> String {
     let mut hash = Sha256::new();
     hash.update(source.as_os_str().as_encoded_bytes());
@@ -124,11 +130,14 @@ enum SourceKind {
 }
 
 #[cfg(unix)]
-fn validate_owner(metadata: &std::fs::Metadata, label: &str) -> anyhow::Result<()> {
+fn validate_owner(metadata: &std::fs::Metadata, path: &Path) -> anyhow::Result<()> {
     use std::os::unix::fs::MetadataExt;
     if metadata.uid() != crate::platform::process::current_user_id() || metadata.mode() & 0o022 != 0
     {
-        bail!("{label} must be owned by the current user and not group/world writable");
+        bail!(
+            "{} must be owned by the current user and not group/world writable",
+            path.display()
+        );
     }
     Ok(())
 }
@@ -153,7 +162,7 @@ fn read_bounded(path: &Path, kind: SourceKind) -> anyhow::Result<Option<Vec<u8>>
     }
     #[cfg(unix)]
     if matches!(kind, SourceKind::Trust) {
-        validate_owner(&metadata, "hook-trust.json")?;
+        validate_owner(&metadata, path)?;
     }
     #[cfg(not(unix))]
     let _ = kind;
@@ -229,7 +238,7 @@ fn parse(bytes: &[u8], group_count: &mut usize) -> anyhow::Result<Vec<Configured
     Ok(hooks)
 }
 
-pub(super) fn load(cwd: &Path, agent_dir: &Path) -> anyhow::Result<Vec<ConfiguredHook>> {
+pub(super) fn load(cwd: &Path, agent_dir: &Path) -> anyhow::Result<Loaded> {
     let cwd = cwd
         .canonicalize()
         .context("hook working directory unavailable")?;
@@ -241,22 +250,28 @@ pub(super) fn load(cwd: &Path, agent_dir: &Path) -> anyhow::Result<Vec<Configure
     let project_source = root.join(".prime/hooks.json");
     // Missing files are normal. Avoid even reading trust in the common no-hooks case.
     if !user_source.exists() && !project_source.exists() {
-        return Ok(Vec::new());
+        return Ok(Loaded {
+            hooks: Vec::new(),
+            diagnostics: Vec::new(),
+        });
     }
     let agent_dir = agent_dir
         .canonicalize()
         .context("hook trust directory unavailable")?;
     if agent_dir.starts_with(root) {
         bail!(
-            "hook trust directory must be outside the project; project-local agent directories cannot authorize hooks"
+            "the agent directory {} is inside the project root {}, and project-local agent directories cannot authorize hooks; start the session from a directory outside it",
+            agent_dir.display(),
+            root.display()
         );
     }
     #[cfg(unix)]
-    validate_owner(&std::fs::metadata(&agent_dir)?, "hook trust directory")?;
+    validate_owner(&std::fs::metadata(&agent_dir)?, &agent_dir)?;
     let trust_path = agent_dir.join("hook-trust.json");
     let trusted = match read_bounded(&trust_path, SourceKind::Trust)? {
         Some(bytes) => {
-            let trust: Trust = serde_json::from_slice(&bytes).context("invalid hook trust file")?;
+            let trust: Trust = serde_json::from_slice(&bytes)
+                .with_context(|| format!("invalid hook trust file {}", trust_path.display()))?;
             if trust.version != 1 || trust.trusted.len() > 256 {
                 bail!("hook trust requires version 1 and at most 256 fingerprints");
             }
@@ -266,6 +281,7 @@ pub(super) fn load(cwd: &Path, agent_dir: &Path) -> anyhow::Result<Vec<Configure
     };
     let mut group_count = 0;
     let mut result = Vec::new();
+    let mut diagnostics = Vec::new();
     for (source, project) in [(user_source, false), (project_source, true)] {
         // Commit a complete source only after all its checks pass. A project
         // file must never erase an already accepted user policy.
@@ -281,6 +297,12 @@ pub(super) fn load(cwd: &Path, agent_dir: &Path) -> anyhow::Result<Vec<Configure
             if !trusted.contains(&digest) {
                 tracing::warn!(source = %source.display(), fingerprint = %digest,
                     "hooks skipped: review exact source and add its fingerprint to user hook-trust.json (see docs/hooks.md)");
+                diagnostics.push(format!(
+                    "Hooks skipped: {} is not trusted for {}. Trust covers the file's path and bytes and the session directory, so an edit or another directory needs a new entry. After reviewing it, add this fingerprint to {} (see docs/hooks.md):\n{digest}",
+                    source.display(),
+                    cwd.display(),
+                    trust_path.display(),
+                ));
                 return Ok(None);
             }
             let mut candidate_groups = group_count;
@@ -299,10 +321,17 @@ pub(super) fn load(cwd: &Path, agent_dir: &Path) -> anyhow::Result<Vec<Configure
             Err(error) => {
                 tracing::warn!(source = %source.display(), %error,
                     "hook source skipped; other trusted sources remain active");
+                diagnostics.push(format!(
+                    "Hooks skipped: {}: {error:#}. Other trusted hook sources remain active.",
+                    source.display()
+                ));
             }
         }
     }
-    Ok(result)
+    Ok(Loaded {
+        hooks: result,
+        diagnostics,
+    })
 }
 
 #[cfg(test)]

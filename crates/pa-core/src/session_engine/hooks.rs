@@ -2,13 +2,13 @@
 //! These callbacks never acquire session or agent state locks.
 
 use std::path::PathBuf;
-use std::sync::{Arc, RwLock};
+use std::sync::{Arc, Mutex, RwLock, Weak};
 
 use pa_agent::agent_loop::{AfterToolCallFn, BeforeToolCallFn};
 use pa_agent::types::{BeforeToolCallResult, ToolCall};
 use serde_json::{json, Value};
 
-use crate::hooks::HookRuntime;
+use crate::hooks::{HookNoticeSink, HookRuntime};
 
 pub(super) struct ToolHooks {
     pub runtime: Arc<HookRuntime>,
@@ -105,6 +105,39 @@ impl ToolHooks {
             lifecycle,
         }
     }
+}
+
+/// Hook diagnostics become display-only `hook_notice` rows. Inside a run (where
+/// load diagnostics and synchronous hook failures arise) the row lands through
+/// the loop's event path, so every host persists and streams it like any other
+/// settled message. Outside a run (late observers, close) it rides the next
+/// admitted turn's prompt rows instead.
+pub(super) fn notice_sink(
+    agent: Weak<pa_agent::agent::Agent>,
+    next_turn_rows: Arc<Mutex<Vec<pa_types::session::CustomMessage>>>,
+) -> HookNoticeSink {
+    Arc::new(move |text| {
+        let row = super::messages::create_hook_notice_message(&text);
+        let agent = agent.upgrade().filter(|agent| agent.signal().is_some());
+        let next_turn_rows = Arc::clone(&next_turn_rows);
+        Box::pin(async move {
+            if let Some(agent) = agent {
+                if let Some(message) = super::session_message_to_loop(
+                    &pa_types::session::AgentMessage::Custom(row.clone()),
+                ) {
+                    let deliver = agent.event_sink();
+                    let event = pa_agent::types::AgentEvent::MessageEnd { message };
+                    if deliver(event).await.is_ok() {
+                        return;
+                    }
+                }
+            }
+            next_turn_rows
+                .lock()
+                .unwrap_or_else(std::sync::PoisonError::into_inner)
+                .push(row);
+        })
+    })
 }
 
 pub(super) struct Identity {

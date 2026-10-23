@@ -1523,6 +1523,34 @@ async fn run_prompts_and_emit(
                 .await,
         );
     }
+    // Hook diagnostics reach a headless user on stderr in both output modes; json
+    // mode also streams the row itself.
+    let hook_notices = engine
+        .session
+        .agent()
+        .subscribe(|event, _signal| {
+            if let pa_agent::types::AgentEvent::MessageEnd {
+                message: pa_agent::types::AgentMessage::Custom(custom),
+            } = &event
+            {
+                if custom
+                    .payload
+                    .get("customType")
+                    .and_then(serde_json::Value::as_str)
+                    == Some(pa_core::session_engine::messages::HOOK_NOTICE_CUSTOM_TYPE)
+                {
+                    if let Some(text) = custom
+                        .payload
+                        .get("content")
+                        .and_then(serde_json::Value::as_str)
+                    {
+                        eprintln!("Warning: {text}");
+                    }
+                }
+            }
+            Box::pin(async { Ok(()) })
+        })
+        .await;
     // The goal continuation surface: wired in every output mode — the loop runs in text mode too,
     // only silently.
     let goal = std::sync::Arc::new(crate::print_goal::PrintGoalSurface::new(json_mode));
@@ -1651,6 +1679,7 @@ async fn run_prompts_and_emit(
     // exit 1 — no later prompts ran, and the disposal drain still runs.
     if let Some(error) = command_failure {
         eprintln!("{error}");
+        hook_notices.unsubscribe().await;
         goal_accounting.unsubscribe().await;
         accounting.unsubscribe().await;
         if let Some(subscription) = unsubscribe {
@@ -1737,6 +1766,7 @@ async fn run_prompts_and_emit(
         }
         break;
     }
+    hook_notices.unsubscribe().await;
     goal_accounting.unsubscribe().await;
     accounting.unsubscribe().await;
     if let Some(subscription) = unsubscribe {

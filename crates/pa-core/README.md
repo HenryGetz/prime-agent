@@ -123,6 +123,11 @@ identified by `PRIME_AGENT_HOOK_PROTOCOL_VERSION=1`; stdin keeps upstream fields
 First execution records the existing primitive-only feature outcome counter
 `feature_hooks_initiated_count`, through the session telemetry background client.
 No config discovery, command, or telemetry delivery is awaited on session creation.
+Hook diagnostics (skipped or untrusted sources, disabled hooks, command failures,
+timeouts, `systemMessage`) become display-only rows of the public
+`session_engine::messages::HOOK_NOTICE_CUSTOM_TYPE` (built by
+`create_hook_notice_message`), delivered through the agent's event path during a
+run and as a next-turn row otherwise; `convert_to_llm` drops them.
 
 The private lifecycle adapter supplies SessionStart, UserPromptSubmit, Stop and
 PreCompact decisions at cancellable runtime boundaries. Deferred custom rows are
