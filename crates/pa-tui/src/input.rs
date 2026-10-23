@@ -555,7 +555,7 @@ fn plain_press_char(event: &Event) -> Option<char> {
 /// releases — marks the burst as not a raw paste (TS bails on any escape byte).
 ///
 /// The Windows console synthesizes each pasted character as the key that types it, modifiers
-/// included: a shifted symbol carries SHIFT, an AltGr character carries CONTROL and ALT, and a
+/// included: a shifted symbol carries SHIFT, an `AltGr` character carries CONTROL and ALT, and a
 /// bare LF is Ctrl+Enter. Those shapes carry their text too.
 fn printable_text(event: &Event) -> Option<String> {
     let Event::Key(key) = event else {
