@@ -1292,3 +1292,147 @@ async fn parent_renames_a_child_end_to_end() {
         .expect("the child's ledger edge");
     assert_eq!(edge.name, "bench-runner", "the ledger rename landed");
 }
+
+/// The cell that reads its own transcript twice (everything, then the user
+/// rows) and records what `rlm.session.messages` returned.
+fn transcript_cell(receipts_dir: &Path) -> String {
+    let receipt_path = receipts_dir.join("transcript.json").display().to_string();
+    let error_path = receipts_dir.join("transcript.error").display().to_string();
+    format!(
+        "import json, traceback\ntry:\n    everything = await rlm.session.messages()\n    users = await rlm.session.messages(role=\"user\")\n    open({receipt_path:?}, \"w\").write(json.dumps({{\"all\": [[m.index, m.role, m.text] for m in everything], \"users\": [m.index for m in users]}}))\nexcept Exception:\n    open({error_path:?}, \"w\").write(traceback.format_exc())\n    raise",
+    )
+}
+
+/// `rlm.session.messages` end to end: a kernel cell in a daemon session reads
+/// its own transcript through the real host handler and supervisor route,
+/// including the rows its compaction summarized away (the summary in place),
+/// and the cell's tool result carries one `transcriptReads` record per read.
+#[tokio::test]
+async fn session_messages_reads_the_whole_transcript_end_to_end() {
+    let Some(kernel_python) = kernel_python() else {
+        return;
+    };
+    let dir = tempfile::TempDir::new().expect("temp dir");
+    let socket = dir.path().join("daemon.sock");
+    let agent_dir = dir.path().join("agent");
+    let sessions_dir = agent_dir.join("sessions");
+    std::fs::create_dir_all(&sessions_dir).expect("sessions dir");
+    let receipts_dir = dir.path().join("receipts");
+    std::fs::create_dir_all(&receipts_dir).expect("receipts dir");
+
+    let time = "2026-01-01T00:00:00.000Z";
+    let user = |id: &str, parent: Option<&str>, text: &str| {
+        json!({
+            "type": "message",
+            "id": id,
+            "parentId": parent,
+            "timestamp": time,
+            "message": { "role": "user", "content": text, "timestamp": 1000 },
+        })
+    };
+    let rows = [
+        json!({ "type": "session", "version": 3, "id": "transcript-e2e", "timestamp": time, "cwd": dir.path().to_string_lossy() }),
+        user("m1", None, "the first prompt"),
+        user("m2", Some("m1"), "compacted away"),
+        user("m3", Some("m2"), "kept"),
+        json!({
+            "type": "compaction",
+            "id": "m4",
+            "parentId": "m3",
+            "timestamp": time,
+            "summary": "the story",
+            "firstKeptEntryId": "m3",
+            "tokensBefore": 4000,
+        }),
+        user("m5", Some("m4"), "after compaction"),
+    ];
+    let session_path = sessions_dir.join("transcript-e2e.jsonl");
+    std::fs::write(
+        &session_path,
+        rows.iter()
+            .map(Value::to_string)
+            .collect::<Vec<_>>()
+            .join("\n"),
+    )
+    .expect("write session");
+    let script = write_faux_script(
+        dir.path(),
+        "reader",
+        &cell_turn(&transcript_cell(&receipts_dir)),
+    );
+
+    let _daemon = spawn_supervisor(&socket, &agent_dir, &kernel_python);
+    wait_socket_ready(&socket);
+    let (mut client, hello) = Client::connect(&socket);
+    assert_eq!(hello["type"], "daemon_hello");
+    client.send_command(
+        "create-reader",
+        &json!({
+            "type": "create",
+            "sessionPath": session_path.to_string_lossy(),
+            "config": {
+                "cwd": dir.path().to_string_lossy(),
+                "sessionDir": sessions_dir.to_string_lossy(),
+                "script": script.to_string_lossy(),
+            },
+        }),
+    );
+    let created = client.read_response("create-reader");
+    assert_eq!(created["success"], true, "create failed: {created}");
+    let active_session_id = created["data"]["activeSessionId"]
+        .as_str()
+        .or_else(|| created["data"]["id"].as_str())
+        .expect("active session id")
+        .to_string();
+
+    client.send_command(
+        "prompt-reader",
+        &json!({
+            "type": "prompt_and_wait",
+            "activeSessionId": active_session_id,
+            "message": "read the transcript",
+        }),
+    );
+    let turn = client.read_response("prompt-reader");
+    assert_eq!(turn["success"], true, "turn failed: {turn}");
+    if let Ok(error) = std::fs::read_to_string(receipts_dir.join("transcript.error")) {
+        panic!("transcript cell failed: {error}");
+    }
+    let read = read_recorded(&receipts_dir, "transcript.json");
+    let all = read["all"].as_array().expect("all rows");
+    assert_eq!(
+        all[..6],
+        [
+            json!([0, "user", "the first prompt"]),
+            json!([1, "user", "compacted away"]),
+            json!([2, "user", "kept"]),
+            json!([3, "compactionSummary", "the story"]),
+            json!([4, "user", "after compaction"]),
+            json!([5, "user", "read the transcript"]),
+        ],
+        "the whole branch in order, the compacted rows included: {read}"
+    );
+    assert_eq!(read["users"], json!([0, 1, 2, 4, 5]));
+
+    client.send_command(
+        "messages-reader",
+        &json!({ "type": "get_messages", "activeSessionId": active_session_id }),
+    );
+    let messages = client.read_response("messages-reader");
+    let cell_result = messages["data"]["messages"]
+        .as_array()
+        .expect("messages")
+        .iter()
+        .find(|message| message["role"] == "toolResult")
+        .expect("the cell's tool result")
+        .clone();
+    let total = all.len();
+    assert_eq!(
+        cell_result["details"]["transcriptReads"],
+        json!([
+            { "count": total, "total": total, "first": 0, "last": total - 1, "role": null },
+            { "count": 5, "total": total, "first": 0, "last": 5, "role": "user" },
+        ]),
+        "one record per read rides the tool result: {cell_result}"
+    );
+}

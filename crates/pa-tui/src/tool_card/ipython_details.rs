@@ -1,7 +1,7 @@
 //! Parsing of ipython execution `details` for the cell card: the
 //! details record, the background-shell handle repr, literal shell
-//! launches, and the edit-confirmation and agent-message-receipt
-//! suppressions.
+//! launches, the transcript reads, and the edit-confirmation and
+//! agent-message-receipt suppressions.
 
 use serde_json::Value;
 
@@ -18,6 +18,7 @@ pub(crate) struct IpythonDetails {
     pub(crate) diffs: Vec<Value>,
     pub(crate) sent_agent_messages: Vec<Value>,
     pub(crate) bash_commands: Option<BashCommands>,
+    pub(crate) transcript_reads: Vec<TranscriptRead>,
 }
 
 pub(crate) struct IpythonError {
@@ -47,6 +48,51 @@ fn read_bash_commands(value: &Value) -> Option<BashCommands> {
             .as_u64()
             .and_then(|lines| usize::try_from(lines).ok())?,
     })
+}
+
+/// One `transcriptReads` entry: an `rlm.session.messages` call's count,
+/// transcript size, read index range (`None` when nothing matched), and
+/// role filter.
+pub(crate) struct TranscriptRead {
+    count: u64,
+    total: u64,
+    range: Option<(u64, u64)>,
+    role: Option<String>,
+}
+
+impl TranscriptRead {
+    fn parse(value: &Value) -> Option<TranscriptRead> {
+        let index = |key: &str| value.get(key).and_then(Value::as_u64);
+        Some(TranscriptRead {
+            count: index("count")?,
+            total: index("total")?,
+            range: index("first").zip(index("last")),
+            role: value
+                .get("role")
+                .and_then(Value::as_str)
+                .map(str::to_string),
+        })
+    }
+
+    /// `read 12 user messages · #3–#398 of 412`.
+    pub(crate) fn summary(&self) -> String {
+        let role = self
+            .role
+            .as_deref()
+            .map_or_else(String::new, |role| format!("{role} "));
+        let noun = if self.count == 1 {
+            "message"
+        } else {
+            "messages"
+        };
+        let read = format!("read {} {role}{noun}", self.count);
+        match self.range {
+            Some((first, last)) => {
+                format!("{read} \u{b7} #{first}\u{2013}#{last} of {}", self.total)
+            }
+            None => format!("{read} of {}", self.total),
+        }
+    }
 }
 
 pub(crate) fn read_error_details(value: &Value) -> Option<IpythonError> {
@@ -86,6 +132,7 @@ impl IpythonDetails {
             diffs: Vec::new(),
             sent_agent_messages: Vec::new(),
             bash_commands: None,
+            transcript_reads: Vec::new(),
         };
         let Some(record) = details.as_object() else {
             return empty;
@@ -131,6 +178,11 @@ impl IpythonDetails {
                 .cloned()
                 .unwrap_or_default(),
             bash_commands: record.get("bashCommands").and_then(read_bash_commands),
+            transcript_reads: record
+                .get("transcriptReads")
+                .and_then(Value::as_array)
+                .map(|reads| reads.iter().filter_map(TranscriptRead::parse).collect())
+                .unwrap_or_default(),
         }
     }
 }

@@ -1,8 +1,8 @@
 //! The `rlm.*` kernel host-request bridge: wire validation, the child-session
 //! host seam, and handler registration for `rlm.spawn` (`rlm.run`),
 //! `rlm.create_session`, `rlm.find_models`, `rlm.list_subagents`,
-//! `rlm.collect`, `rlm.progress.note`, `rlm.delete_subagent`, and
-//! `rlm.rename`.
+//! `rlm.collect`, `rlm.progress.note`, `rlm.delete_subagent`,
+//! `rlm.rename`, and `rlm.session.messages`.
 //!
 //! Wire contract: the Python side (`rlm/__init__.py`) sends typed requests and
 //! parses strict `snake_case` replies. Pure normalization lives in
@@ -178,6 +178,13 @@ pub trait RlmSubagentHost: Send + Sync {
     /// Rename the current session (`session_id` absent) or one direct
     /// child (TS `rlm.rename`); answers the applied name.
     fn rename(&self, name: String, session_id: Option<String>) -> RlmHostFuture<String>;
+    /// The current session's display transcript, oldest first: every message
+    /// on the active branch, including the rows a compaction summarized away
+    /// (each compaction in place as its summary message). Only the daemon
+    /// keeps that transcript.
+    fn session_messages(&self) -> RlmHostFuture<Vec<Value>> {
+        Box::pin(async { anyhow::bail!("rlm.session.messages requires a daemon-backed session") })
+    }
 }
 
 /// Host behavior for sessions with no child runtime: truthful empties and the
@@ -513,6 +520,7 @@ pub fn register_rlm_host_handlers(handlers: &mut HostRequestHandlers, bridge: &A
     register_delete_subagent(handlers, bridge);
     register_collect(handlers, bridge);
     register_rename(handlers, bridge);
+    register_session_messages(handlers, bridge);
 }
 
 fn register_find_models(handlers: &mut HostRequestHandlers, bridge: &Arc<RlmHostBridge>) {
@@ -838,6 +846,20 @@ fn register_rename(handlers: &mut HostRequestHandlers, bridge: &Arc<RlmHostBridg
                 };
                 let name = host.rename(name, session_id).await?;
                 Ok(json!({ "name": name }))
+            })
+        }),
+    );
+}
+
+fn register_session_messages(handlers: &mut HostRequestHandlers, bridge: &Arc<RlmHostBridge>) {
+    let host = Arc::clone(&bridge.host);
+    handlers.register(
+        "rlm.session.messages",
+        host_handler(move |_payload| {
+            let host = Arc::clone(&host);
+            Box::pin(async move {
+                let messages = host.session_messages().await?;
+                Ok(json!({ "messages": messages }))
             })
         }),
     );

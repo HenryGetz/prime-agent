@@ -386,6 +386,82 @@ async fn pages_continue_into_pre_compaction_history_with_one_summary() {
     );
 }
 
+/// `rlm.session.messages` reads the whole display transcript as one page: the
+/// windowed store hydrates, and the rows a compaction summarized away come
+/// back in order with the summary once in place.
+#[tokio::test]
+async fn the_whole_transcript_page_reads_through_compaction_on_a_windowed_store() {
+    let dir = session_dir();
+    let path = dir.join("whole-transcript.jsonl");
+    let user = |text: &str| json!({ "role": "user", "content": text, "timestamp": 1000 });
+    let mut store = crate::session_store::SessionFile::create("/tmp", None, 0);
+    store.set_path(path.clone());
+    for _ in 0..3 {
+        store.append_message(&user("compacted away"));
+    }
+    let first_kept = store.append_message(&user("retained"));
+    store.append_message(&user("retained"));
+    store.append_entry(
+        "compaction",
+        json!({ "summary": "the story", "firstKeptEntryId": first_kept, "tokensBefore": 4000 }),
+    );
+    for _ in 0..2 {
+        store.append_message(&user("after compaction"));
+    }
+    store.rewrite().unwrap();
+
+    let worker = worker_over(&dir, &path).await;
+    assert!(
+        worker
+            .core
+            .lock()
+            .unwrap()
+            .store
+            .as_ref()
+            .is_some_and(|store| store.window.is_some()),
+        "the session opens windowed"
+    );
+    let response = worker
+        .dispatch(
+            "get_messages",
+            &json!({
+                "page": crate::rlm_children::WHOLE_TRANSCRIPT,
+                "capabilities": ["elide_snapshot_images"],
+            }),
+        )
+        .await;
+    assert!(
+        response.success,
+        "the whole-transcript page failed: {response:?}"
+    );
+    let data = response.data.expect("page data");
+    assert_eq!(data["more"], false);
+    let texts: Vec<&str> = data["messages"]
+        .as_array()
+        .expect("messages")
+        .iter()
+        .map(|message| {
+            message["content"]
+                .as_str()
+                .or_else(|| message["summary"].as_str())
+                .unwrap_or_default()
+        })
+        .collect();
+    assert_eq!(
+        texts,
+        [
+            "compacted away",
+            "compacted away",
+            "compacted away",
+            "retained",
+            "retained",
+            "the story",
+            "after compaction",
+            "after compaction",
+        ]
+    );
+}
+
 #[tokio::test]
 async fn a_windowed_attach_preserves_iso_and_fractional_prompt_times() {
     for timestamp in [

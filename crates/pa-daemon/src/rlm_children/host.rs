@@ -10,7 +10,7 @@ use super::{
     RlmCreateSessionRequest, RlmDeleteSubagentResult, RlmHostFuture, RlmSpawnHandle,
     RlmSpawnRequest, RlmSubagentEntry, RlmSubagentHost, SpawnNameReservationGuard,
     SupervisorChildSessions, SupervisorChildSessionsInner, Value, KILL_TIMEOUT_MS,
-    RENAME_TIMEOUT_MS,
+    RENAME_TIMEOUT_MS, STATE_TIMEOUT_MS, WHOLE_TRANSCRIPT,
 };
 
 /// Resolve the child model with the daemon `allowedModels` allowlist enforced, refusing loudly with
@@ -739,6 +739,27 @@ impl RlmSubagentHost for SupervisorChildSessions {
                 record.lock().await.session_name = name.clone();
             }
             Ok(name)
+        })
+    }
+
+    /// The same `get_messages` page the TUI scrolls with, sized to the whole
+    /// branch: a `Start` page hydrates a windowed store first, and image
+    /// payloads stay out of the reply.
+    fn session_messages(&self) -> RlmHostFuture<Vec<Value>> {
+        let this = Arc::clone(&self.inner);
+        Box::pin(async move {
+            let command = DaemonCommand::GetMessages {
+                id: None,
+                active_session_id: this.parent_active_session_id.clone(),
+                page: Some(WHOLE_TRANSCRIPT),
+                capabilities: Some(vec!["elide_snapshot_images".to_string()]),
+                rest: serde_json::Map::default(),
+            };
+            let mut data = this.command(&command, STATE_TIMEOUT_MS).await?;
+            let Some(Value::Array(messages)) = data.get_mut("messages").map(Value::take) else {
+                bail!("get_messages returned no messages array");
+            };
+            Ok(messages)
         })
     }
 }

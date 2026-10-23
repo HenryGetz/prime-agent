@@ -382,6 +382,39 @@ fn bash_dominated_cell_renders_as_bash() {
 }
 
 #[test]
+fn transcript_reads_render_one_row_each_below_the_summary() {
+    let card = cell_card(
+        "users = await rlm.session.messages(role='user')",
+        json!({
+            "status": "ok",
+            "durationMs": 40,
+            "transcriptReads": [
+                { "count": 12, "total": 412, "first": 3, "last": 398, "role": "user" },
+                { "count": 0, "total": 412, "first": null, "last": null, "role": "bashExecution" },
+            ],
+        }),
+        false,
+        false,
+    );
+    let lines = render(&card, 0, Detail::Overview, &theme(), 100, true);
+    let rows: Vec<String> = lines.iter().map(text_of).collect();
+    assert_eq!(
+        rows[1..],
+        [
+            " \u{2261} transcript \u{b7} read 12 user messages \u{b7} #3\u{2013}#398 of 412",
+            " \u{2261} transcript \u{b7} read 0 bashExecution messages of 412",
+        ]
+    );
+    for detail in [Detail::Overview, Detail::All] {
+        assert_eq!(
+            count(&card, 0, detail, &theme(), 100, true),
+            render(&card, 0, detail, &theme(), 100, true).len(),
+            "the row count matches the painted rows"
+        );
+    }
+}
+
+#[test]
 fn bash_minority_cell_stays_python() {
     let code = "async def sh(cmd):\n    return await bash(cmd)\nr = await sh(\"ls\")\nprint(r.pid)";
     let card = cell_card(

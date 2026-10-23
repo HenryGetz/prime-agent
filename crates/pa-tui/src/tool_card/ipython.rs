@@ -162,10 +162,12 @@ fn layout(
     // collapsed; the body opens up only when expanded.
     if !detail.tool_output_expanded() {
         render_sent_agent_messages(lines, &details, false, theme, width);
+        render_transcript_reads(lines, &details, false, theme, width);
         return;
     }
     let has_code = render_code(lines, code, theme, width);
     render_sent_agent_messages(lines, &details, true, theme, width);
+    render_transcript_reads(lines, &details, true, theme, width);
     render_output(card, &details, lines, has_code, show_images, theme, width);
     // Image blocks render below the card when shown (TS adds these rows
     // for every tool shell).
@@ -501,6 +503,34 @@ fn render_sent_agent_messages(
                 }
             }
         }
+    }
+}
+
+/// One summary row per `rlm.session.messages` read, shaped like the sent
+/// agent-message rows; the expanded view sets the group off from the code.
+fn render_transcript_reads(
+    lines: &mut RowOutput,
+    details: &IpythonDetails,
+    expanded: bool,
+    theme: &Theme,
+    width: usize,
+) {
+    if expanded && !details.transcript_reads.is_empty() {
+        lines.blank();
+    }
+    for read in &details.transcript_reads {
+        lines.push(|| {
+            let row: Line = vec![
+                Span::raw(" "),
+                Span::styled(
+                    "\u{2261} transcript".to_string(),
+                    theme.fg_style(ThemeColor::Muted),
+                ),
+                Span::styled(" \u{b7} ".to_string(), theme.fg_style(ThemeColor::Dim)),
+                Span::styled(read.summary(), theme.fg_style(ThemeColor::Dim)),
+            ];
+            truncate_line(&row, width, "\u{2026}")
+        });
     }
 }
 

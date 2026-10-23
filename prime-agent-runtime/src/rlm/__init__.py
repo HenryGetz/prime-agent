@@ -5,6 +5,7 @@ from __future__ import annotations
 import sys
 import types
 from dataclasses import dataclass
+from datetime import datetime
 from pathlib import Path
 from typing import Any
 
@@ -82,6 +83,22 @@ class RLMSubagent:
 class RLMProgressNoteResult:
     accepted: bool
     retry_after_ms: int | None = None
+
+
+@dataclass(frozen=True)
+class RLMMessage:
+    """One message of this session's transcript, from `rlm.session.messages()`.
+
+    `index` is the message's position in the whole transcript, so it stays the
+    same across calls and filters. `raw` is the stored message (tool calls,
+    thinking, tool-result details).
+    """
+
+    index: int
+    role: str
+    text: str
+    timestamp: int | None
+    raw: dict[str, Any]
 
 
 @dataclass(frozen=True)
@@ -628,8 +645,79 @@ class _RLMFactoryNamespace:
         return FACTORY_HELP
 
 
+# Display MIME the host carries to the cell card: one summary row per read.
+_TRANSCRIPT_READ_MIME = "application/vnd.prime-agent.transcript-read+json"
+
+
+def _message_text(message: dict[str, Any]) -> str:
+    role = message["role"]
+    if role in ("compactionSummary", "branchSummary"):
+        return message.get("summary", "")
+    if role == "bashExecution":
+        return "\n".join(part for part in (message.get("command"), message.get("output")) if part)
+    content = message.get("content")
+    if isinstance(content, str):
+        return content
+    return "\n".join(block["text"] for block in content or [] if block.get("type") == "text")
+
+
+def _message_timestamp(message: dict[str, Any]) -> int | None:
+    value = message.get("timestamp")
+    if isinstance(value, str):
+        # Custom rows carry their row's ISO time; every other row carries epoch ms.
+        return int(datetime.fromisoformat(value).timestamp() * 1000)
+    return None if value is None else int(value)
+
+
+class _RLMSessionNamespace:
+    """This session's own transcript as data: ``await rlm.session.messages()``."""
+
+    async def messages(
+        self,
+        role: str | None = None,
+        start: int | None = None,
+        end: int | None = None,
+    ) -> list[RLMMessage]:
+        """Return this session's transcript on the active branch, oldest first.
+
+        It includes the messages a compaction summarized away; each compaction
+        appears in place as one ``compactionSummary`` message. ``start``/``end``
+        slice the transcript like a Python list, then ``role`` keeps only
+        messages of that role (``"user"``, ``"assistant"``, ``"toolResult"``,
+        ``"custom"``, ...).
+        """
+        payload = await host_request("rlm.session.messages")
+        rows = payload.get("messages")
+        if not isinstance(rows, list):
+            raise RuntimeError("rlm.session.messages returned an invalid messages list")
+        selected = [
+            RLMMessage(
+                index=index,
+                role=row["role"],
+                text=_message_text(row),
+                timestamp=_message_timestamp(row),
+                raw=row,
+            )
+            for index, row in list(enumerate(rows))[start:end]
+            if role is None or row["role"] == role
+        ]
+        emit(
+            {
+                _TRANSCRIPT_READ_MIME: {
+                    "count": len(selected),
+                    "total": len(rows),
+                    "first": selected[0].index if selected else None,
+                    "last": selected[-1].index if selected else None,
+                    "role": role,
+                }
+            }
+        )
+        return selected
+
+
 class _RLMNamespace:
     harness = _harness_state
+    session = _RLMSessionNamespace()
     get_harness_state = staticmethod(get_harness_state)
 
     async def spawn(
@@ -708,6 +796,7 @@ __all__ = [
     "McpToolError",
     "NotEnabled",
     "RLMCreateSessionHandle",
+    "RLMMessage",
     "RLMModel",
     "RLMProgressNoteResult",
     "RLMSpawnHandle",

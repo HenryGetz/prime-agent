@@ -74,6 +74,14 @@ const RENAME_TIMEOUT_MS: u64 = 30_000;
 /// Grace over a collect budget passed to the worker `wait_for_idle`.
 const IDLE_WAIT_GRACE_MS: u64 = 5_000;
 const NOTICE_DELIVERY_TIMEOUT_MS: u64 = 30_000;
+/// The whole display transcript as one `get_messages` page: the branch
+/// start through the leaf (`rlm.session.messages`).
+pub(crate) const WHOLE_TRANSCRIPT: pa_types::daemon::TranscriptPage =
+    pa_types::daemon::TranscriptPage::Start {
+        after: None,
+        until: None,
+        limit: usize::MAX,
+    };
 /// Prompts longer than this are not mirrored into create runtime metadata.
 const RUNTIME_METADATA_PROMPT_MAX: usize = 4096;
 /// One wait slice of the settle watcher; longer runs re-slice.
