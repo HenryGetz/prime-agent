@@ -122,6 +122,10 @@ where
         let mut coalescer = BurstCoalescer::new(BURST_CONTINUATION);
         loop {
             if thread_stop.load(Ordering::Acquire) {
+                // A held burst was read before the stop: deliver it like a drained round.
+                let held = coalescer.take_held();
+                let whole = !crate::enhanced_keys::kitty_probe_pending();
+                let _ = forward_rounds(held, whole, &mut on_input);
                 break;
             }
             // The wait never runs past a held escape sequence's deadline (the guard flushes on the
@@ -255,13 +259,25 @@ impl BurstCoalescer {
         }
     }
 
+    /// The held burst as one round regardless of its window (the reader is stopping).
+    fn take_held(&mut self) -> Vec<Vec<GuardOutput>> {
+        match self.deadline.take() {
+            Some(_) => vec![std::mem::take(&mut self.held)],
+            None => Vec::new(),
+        }
+    }
+
     /// Take one drained round; returns the rounds now ready to forward, in stream order.
     fn push_round(&mut self, outputs: Vec<GuardOutput>, now: Instant) -> Vec<Vec<GuardOutput>> {
         let mut ready = self.flush_expired(now);
         if outputs.is_empty() {
             return ready;
         }
-        let text_presses = burst_text(&outputs).map(|(_, presses)| presses);
+        // A control shortcut (Ctrl+C) is never paste continuation: it must reach dispatch and the
+        // exit guard as a key, so its round releases the hold.
+        let text_presses = burst_text(&outputs)
+            .filter(|(text, _)| !text.chars().any(is_control_shortcut))
+            .map(|(_, presses)| presses);
         if self.deadline.is_some() {
             if text_presses.is_some() {
                 self.held.extend(outputs);
@@ -279,6 +295,11 @@ impl BurstCoalescer {
         }
         ready
     }
+}
+
+/// A control byte other than the line breaks and tab a paste carries.
+fn is_control_shortcut(c: char) -> bool {
+    c.is_control() && !matches!(c, '\r' | '\n' | '\t')
 }
 
 /// [`forward_chunk`] each ready round in order; `false` when the surface stopped the reader.
@@ -1299,5 +1320,39 @@ mod tests {
         assert_eq!(coalescer.push_round(first.clone(), now), vec![first]);
         assert_eq!(coalescer.push_round(second.clone(), now), vec![second]);
         assert_eq!(coalescer.poll_deadline(now), None);
+    }
+
+    /// A Ctrl+C round during a held paste releases the paste and still dispatches as a key (the
+    /// exit guard and interrupt see it).
+    #[test]
+    fn a_ctrl_c_round_is_never_joined_to_a_held_paste() {
+        let _guard = crate::enhanced_keys::TEST_STATE_LOCK
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        crate::enhanced_keys::set_kitty_active_for_tests(false);
+        let ctrl_c = GuardOutput::Event(key(KeyCode::Char('c'), KeyModifiers::CONTROL));
+        let inputs = drive(
+            WINDOWS_WINDOW,
+            vec![(0, windows_paste("a\rb")), (5, vec![ctrl_c])],
+        );
+        assert_eq!(
+            inputs,
+            vec![
+                ReaderInput::BurstPaste("a\rb".into()),
+                ReaderInput::Event(key(KeyCode::Char('c'), KeyModifiers::CONTROL)),
+            ]
+        );
+    }
+
+    /// A reader stop inside the window hands the held burst over instead of dropping it.
+    #[test]
+    fn a_stop_takes_the_held_burst() {
+        let mut coalescer = BurstCoalescer::new(WINDOWS_WINDOW);
+        let now = Instant::now();
+        let paste = windows_paste("a\rb");
+        assert!(coalescer.push_round(paste.clone(), now).is_empty());
+        assert_eq!(coalescer.take_held(), vec![paste]);
+        assert_eq!(coalescer.poll_deadline(now), None);
+        assert!(coalescer.take_held().is_empty());
     }
 }
