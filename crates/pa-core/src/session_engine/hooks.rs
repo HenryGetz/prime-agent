@@ -1,5 +1,7 @@
 //! Command-hook adapters at the loop's existing tool-decision boundaries.
-//! These callbacks never acquire session or agent state locks.
+//! These callbacks never acquire session or agent state locks. The diagnostic
+//! sink only uses the agent's event delivery, which the loop never holds while
+//! it awaits a hook.
 
 use std::path::PathBuf;
 use std::sync::{Arc, Mutex, RwLock, Weak};
