@@ -959,13 +959,14 @@ mod auto_background_tests {
     //! tool result returns immediately with the synthetic text, and a call
     //! under the window (or with promotion disabled) runs inline unchanged.
 
-    use std::sync::Arc;
+    use std::sync::{Arc, MutexGuard};
     use std::time::{Duration, Instant};
 
     use super::{
         execute_bash, output_tail_note, BashOperations, BashToolOptions, ExecFuture, ExecOptions,
         OUTPUT_TAIL_CHARS,
     };
+    use crate::kernel::orphan_journal::ORPHAN_PROCESS_JOURNAL_ENV;
     use pa_agent::auto_background::AutoBackgroundCompletion;
 
     #[tokio::test]
@@ -1741,6 +1742,41 @@ mod auto_background_tests {
         assert!(note.chars().rev().take(512).all(|c| c == 'é'));
     }
 
+    /// The orphan-journal path is process env, so a test that arms it must
+    /// clear it on every exit path: `Drop` runs on unwind too, so a
+    /// panicking (or timed-out) test still restores the environment
+    /// instead of stranding a stale path whose `TempDir` is already gone.
+    /// The lock serializes every taker of the env var.
+    struct JournalEnv {
+        #[allow(dead_code)]
+        lock: MutexGuard<'static, ()>,
+        saved: Option<std::ffi::OsString>,
+    }
+
+    impl JournalEnv {
+        fn arm(journal: &std::path::Path) -> Self {
+            let lock = journal_env_lock();
+            let saved = std::env::var_os(ORPHAN_PROCESS_JOURNAL_ENV);
+            std::env::set_var(ORPHAN_PROCESS_JOURNAL_ENV, journal.display().to_string());
+            JournalEnv { lock, saved }
+        }
+    }
+
+    impl Drop for JournalEnv {
+        fn drop(&mut self) {
+            match &self.saved {
+                Some(value) => std::env::set_var(ORPHAN_PROCESS_JOURNAL_ENV, value),
+                None => std::env::remove_var(ORPHAN_PROCESS_JOURNAL_ENV),
+            }
+        }
+    }
+
+    fn journal_env_lock() -> MutexGuard<'static, ()> {
+        static LOCK: std::sync::Mutex<()> = std::sync::Mutex::new(());
+        LOCK.lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
+    }
+
     #[tokio::test]
     async fn a_promoted_job_journals_orphan_state() {
         // The promoted job is journaled in the same orphan-process journal
@@ -1748,10 +1784,7 @@ mod auto_background_tests {
         // reaps its process group instead of leaking it.
         let dir = tempfile::TempDir::new().expect("temp dir");
         let journal = dir.path().join("t.orphans.jsonl");
-        std::env::set_var(
-            "PRIME_AGENT_INTERNAL_ORPHAN_PROCESS_JOURNAL",
-            journal.display().to_string(),
-        );
+        let _journal_env = JournalEnv::arm(&journal);
         let registry = pa_agent::auto_background::AutoBackgroundRegistry::new();
         let (tx, mut rx) = tokio::sync::mpsc::unbounded_channel::<AutoBackgroundCompletion>();
         registry.arm(
@@ -1817,10 +1850,33 @@ mod auto_background_tests {
             }
             tokio::time::sleep(Duration::from_millis(100)).await;
         }
-        std::env::remove_var("PRIME_AGENT_INTERNAL_ORPHAN_PROCESS_JOURNAL");
         assert!(
             released,
             "the completed job must release its journal record"
+        );
+    }
+
+    #[test]
+    fn a_panicking_test_still_clears_the_journal_env() {
+        // The unwind contract of `JournalEnv`: a panic between arm and the
+        // tail must still clear the journal path, or later tests inherit
+        // a path whose TempDir is already gone.
+        let dir = tempfile::TempDir::new().expect("temp dir");
+        let journal = dir.path().join("t.orphans.pin.jsonl");
+        let armed = journal.display().to_string();
+        let panicked = std::panic::catch_unwind(|| {
+            let _guard = JournalEnv::arm(&journal);
+            assert_eq!(
+                std::env::var_os(ORPHAN_PROCESS_JOURNAL_ENV),
+                Some(armed.clone().into())
+            );
+            panic!("boom");
+        });
+        assert!(panicked.is_err());
+        assert_ne!(
+            std::env::var_os(ORPHAN_PROCESS_JOURNAL_ENV),
+            Some(armed.into()),
+            "the panicking test leaked its journal path into the process env"
         );
     }
 }
