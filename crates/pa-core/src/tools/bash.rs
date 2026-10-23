@@ -1748,6 +1748,7 @@ mod auto_background_tests {
     /// instead of stranding a stale path whose `TempDir` is already gone.
     /// The lock serializes every taker of the env var.
     struct JournalEnv {
+        // Held for the guard's lifetime; the lock's value is never read.
         #[allow(dead_code)]
         lock: MutexGuard<'static, ()>,
         saved: Option<std::ffi::OsString>,
@@ -1771,9 +1772,11 @@ mod auto_background_tests {
         }
     }
 
+    static JOURNAL_ENV_LOCK: std::sync::Mutex<()> = std::sync::Mutex::new(());
+
     fn journal_env_lock() -> MutexGuard<'static, ()> {
-        static LOCK: std::sync::Mutex<()> = std::sync::Mutex::new(());
-        LOCK.lock()
+        JOURNAL_ENV_LOCK
+            .lock()
             .unwrap_or_else(std::sync::PoisonError::into_inner)
     }
 
@@ -1886,6 +1889,23 @@ mod auto_background_tests {
             std::env::var_os(ORPHAN_PROCESS_JOURNAL_ENV),
             Some(armed.into()),
             "the panicking test leaked its journal path into the process env"
+        );
+    }
+
+    #[test]
+    fn an_armed_journal_env_holds_the_env_lock() {
+        // The dead-code allow on `lock` documents a contract: the field is
+        // never read, it only holds the env-var mutex from arm until Drop.
+        // A cleanup that deletes the field (and arm's acquisition) turns
+        // this pin red: the try_lock below then succeeds, because nothing
+        // in the binary takes the lock anymore. Held as it is, the same-
+        // thread try_lock fails with no scheduling involved, no sleeps.
+        let dir = tempfile::TempDir::new().expect("temp dir");
+        let journal = dir.path().join("t.orphans.hold.jsonl");
+        let _guard = JournalEnv::arm(&journal);
+        assert!(
+            JOURNAL_ENV_LOCK.try_lock().is_err(),
+            "the env-var lock was free while a JournalEnv was armed"
         );
     }
 }
