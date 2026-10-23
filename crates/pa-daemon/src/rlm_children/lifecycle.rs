@@ -1,6 +1,8 @@
 //! The child-lifecycle concern: session creation (create/launch), the
 //! prompt/kill/close routing, settle watching with its notices, and the
 //! spawn-admission outbox types (`CreatedSessionIds`, `CreatedChild`).
+use pa_core::session_engine::semantic_edges::ChildCancelledReason;
+
 use super::{
     anyhow, cap_text, compact_rlm_text, create_rlm_child_failure_message,
     create_rlm_child_terminal_notice, json, now_ms, Arc, ChildCloseReason, ChildObservationSource,
@@ -500,6 +502,22 @@ impl SupervisorChildSessionsInner {
             self.refresh_record(record).await;
             let settled = record.lock().await.settled_status.is_some();
             if settled {
+                // A delete in flight (`retiring`) owns this run's terminal
+                // edge: the watcher must not run the settle tail into the
+                // delete's kill window. The tail would record nothing
+                // (`record_child_return` holds the mark), deliver the
+                // terminal notice and exit, so a failed kill would strand
+                // a settled row with no watcher and no ledger line, and a
+                // confirmed kill would race its cancel line with the
+                // notice, the goal hook and the display flip. Park
+                // instead: a failed kill clears the mark and the loop
+                // settles the run normally, and a confirmed kill closes
+                // the record (`closed_by_parent` ends the watch at the
+                // loop top).
+                if record.lock().await.retiring {
+                    tokio::time::sleep(Duration::from_millis(WATCH_POLL_INTERVAL_MS)).await;
+                    continue;
+                }
                 // Stability re-check: a prompt admitted to an idle worker
                 // can read idle once between the admission and the turn
                 // pop (the queue snapshot and the busy flag change under
@@ -508,9 +526,24 @@ impl SupervisorChildSessionsInner {
                 // (a queued continuation) keeps watching. An unreachable
                 // worker (an idle passivation, a crash) leaves the settled
                 // verdict standing, as in `refresh_record`.
+                //
+                // The re-check wipes only a WATCHER-set settle (the
+                // premature `done` of the admission race): a
+                // registry-set `cancelled` (a user abort or a parent kill
+                // in flight, `cancel_child_run`/`close_children_inner`)
+                // stands — wiping it would let this watcher refresh the
+                // still-live run back to `done` and record a clean
+                // `child_returned` beside the cancel line, so the row
+                // keeps its registry settle and this loop keeps watching
+                // until the abort lands (the cancel path owns the
+                // terminal handling).
                 tokio::time::sleep(Duration::from_millis(WATCH_SETTLE_GRACE_MS)).await;
                 if matches!(self.child_busy(&active_session_id).await, Ok(true)) {
-                    record.lock().await.settled_status = None;
+                    let mut record = record.lock().await;
+                    if matches!(record.settled_status, Some("done")) {
+                        record.settled_status = None;
+                    }
+                    drop(record);
                     continue;
                 }
                 self.refresh_record(record).await;
@@ -593,10 +626,12 @@ impl SupervisorChildSessionsInner {
     /// committed request, read from the child's own ledger file (the
     /// cross-process form of TS's in-process
     /// `child.semanticEdges.lastCommittedRequestId`). Only a `done` or
-    /// `error` settle returns — TS never records a cancelled run (its done
-    /// arm throws on `run.error` and the record gates on `status ===
-    /// "error"`). A child without a durable session id, or a parent
-    /// without a recorder, records nothing.
+    /// `error` settle returns — a cancelled run never returns (it is the
+    /// parent's action, so it records through
+    /// [`Self::record_child_cancelled`] instead, nano-rlm #202) — and a
+    /// delete in flight ([`ChildRecord::retiring`]) returns nothing either.
+    /// A child without a durable session id, or a parent without a
+    /// recorder, records nothing.
     async fn record_child_return(&self, record: &Arc<Mutex<ChildRecord>>) {
         let recorder = self
             .semantic_edges
@@ -608,7 +643,10 @@ impl SupervisorChildSessionsInner {
         };
         let (child_session_id, child_dir) = {
             let record = record.lock().await;
-            if !matches!(record.settled_status, Some("done" | "error")) {
+            // A delete in flight owns this child's terminal edge: the
+            // delete records a cancel line, so a watcher that wakes inside
+            // the kill window must not append a clean return beside it.
+            if record.retiring || !matches!(record.settled_status, Some("done" | "error")) {
                 return;
             }
             (record.session_id.clone(), record.session_dir.clone())
@@ -631,6 +669,34 @@ impl SupervisorChildSessionsInner {
         .ok()
         .flatten();
         recorder.record_child_returned(&child_session_id, last_committed);
+    }
+
+    /// Record a parent-cancelled child in the parent's semantic-edge
+    /// ledger (nano-rlm #202's `recordSubagentCancel`): the cancel twin
+    /// of a spawn — an action the PARENT took, anchored to the parent's
+    /// in-flight (cancelling) request, never a passive child return.
+    /// `reason` names the parent-side action (a delete, a user cancel,
+    /// the session-kill close walk) on the line; a daemon lifecycle
+    /// close never reaches here. A child without a durable session id,
+    /// or a parent without a recorder, records nothing.
+    pub(super) async fn record_child_cancelled(
+        &self,
+        record: &Arc<Mutex<ChildRecord>>,
+        reason: ChildCancelledReason,
+    ) {
+        let recorder = self
+            .semantic_edges
+            .lock()
+            .expect("semantic edges lock")
+            .clone();
+        let Some(recorder) = recorder else {
+            return;
+        };
+        let child_session_id = record.lock().await.session_id.clone();
+        let Some(child_session_id) = child_session_id else {
+            return;
+        };
+        recorder.record_child_cancelled(&child_session_id, reason);
     }
 
     /// Deliver the no-reply terminal notice for a settled child that never
