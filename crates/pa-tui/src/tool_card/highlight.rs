@@ -373,7 +373,7 @@ fn string_at(text: &str, i: usize) -> Option<usize> {
         let rest = &text[cursor..];
         if rest.starts_with('\\') {
             // Backslash escape: consumed inside the string.
-            let escaped = rest.char_indices().nth(1).map_or(1, |(idx, _)| idx + 1);
+            let escaped = rest[1..].chars().next().map_or(1, |c| 1 + c.len_utf8());
             cursor += escaped;
             continue;
         }
@@ -519,8 +519,12 @@ fn header_mode(
 ) -> Option<usize> {
     let mut i = at + keyword_len;
     let gap_start = i;
-    while code[i..].starts_with(|c: char| c.is_whitespace()) && !code[i..].starts_with('\n') {
-        i += 1;
+    while let Some(c) = code[i..]
+        .chars()
+        .next()
+        .filter(|c| c.is_whitespace() && *c != '\n')
+    {
+        i += c.len_utf8();
     }
     let name_len = code[i..]
         .char_indices()
@@ -588,6 +592,8 @@ fn header_mode(
 
 #[cfg(test)]
 mod tests {
+    use proptest::prelude::*;
+
     use super::*;
     use crate::theme::{ColorMode, Theme};
 
@@ -615,6 +621,32 @@ mod tests {
                 (")".into(), Scope::Plain),
             ]
         );
+    }
+
+    #[test]
+    fn multibyte_chars_after_escapes_and_headers_stay_whole() {
+        assert!(scopes(r#"s = r"\é""#).contains(&(r#"r"\é""#.into(), Scope::String)));
+        assert!(scopes("def\u{a0}f():").contains(&("f".into(), Scope::Title)));
+    }
+
+    fn fragment() -> impl Strategy<Value = String> {
+        prop_oneof![
+            3 => prop::sample::select(vec![
+                "'", "\"", "'''", "\"\"\"", "\\", "r", "b", "f", "u", "def", "class", "def ",
+                "class ", "#", "0", "7", "1.5e", "0x", "(", ")", "\n", " ", "é", "界", "\u{a0}",
+                "\u{3000}", "\u{1f980}",
+            ])
+            .prop_map(str::to_string),
+            1 => any::<char>().prop_map(String::from),
+        ]
+    }
+
+    proptest! {
+        #[test]
+        fn highlight_python_never_panics(parts in prop::collection::vec(fragment(), 0..24)) {
+            let code = parts.concat();
+            prop_assert!(!highlight_python(&code, &SyntaxPalette::from_theme(&theme())).is_empty());
+        }
     }
 
     #[test]
