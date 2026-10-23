@@ -1804,6 +1804,13 @@ mod auto_background_tests {
             ..BashToolOptions::default()
         };
         let journal_rows = || std::fs::read_to_string(&journal).unwrap_or_default();
+        // `ORPHAN_PROCESS_JOURNAL_ENV` is process-global, so a concurrent
+        // bash test's spawn can land its active row in this journal before
+        // this test's own row. Seed exactly such a foreign row through the
+        // real journaling path: the selection below must identify this
+        // job's own row, never the first active one. A pid past the OS pid
+        // range can never be this job's.
+        crate::kernel::orphan_journal::record_orphan_process_state(999_999, true);
         let call = tokio::spawn(async move {
             execute_bash(
                 "call-journal",
@@ -1819,29 +1826,26 @@ mod auto_background_tests {
         });
         // The active row is journaled in `on_spawn`, synchronously with the
         // child's spawn — before the promotion edge, while the call is still
-        // inline. Reading mid-window pins that ordering: a registration
-        // moved back to the promotion edge leaves the journal empty here.
+        // inline. Snapshot the journal mid-window to pin that ordering: a
+        // registration moved back to the promotion edge leaves this job's
+        // row out of the snapshot. The row is identified by the promoted
+        // job's own pid once the result reports it — never by row order.
         tokio::time::sleep(Duration::from_millis(100)).await;
-        let pid = journal_rows()
-            .lines()
-            .find_map(|line| {
-                let row: serde_json::Value = serde_json::from_str(line).ok()?;
-                if row["active"].as_bool() == Some(true) {
-                    row["pid"].as_u64().map(|pid| pid as usize)
-                } else {
-                    None
-                }
-            })
-            .expect("the orphan row is journaled at spawn, before the promotion edge");
+        let mid_window_rows = journal_rows();
         let result = call
             .await
             .expect("the promoted call joins")
             .expect("promotion returns Ok");
         let details = result.details.clone().expect("promotion details");
-        assert_eq!(
-            details["pid"].as_u64().expect("pid reported") as usize,
-            pid,
-            "the journaled row must be the promoted job's"
+        let pid = details["pid"].as_u64().expect("pid reported") as usize;
+        assert!(
+            mid_window_rows.lines().any(|line| {
+                let Ok(row) = serde_json::from_str::<serde_json::Value>(line) else {
+                    return false;
+                };
+                row["active"].as_bool() == Some(true) && row["pid"].as_u64() == Some(pid as u64)
+            }),
+            "the orphan row is journaled at spawn, before the promotion edge"
         );
         // The spawn-time row is already on disk when the promotion returns.
         assert!(
