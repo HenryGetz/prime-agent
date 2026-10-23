@@ -292,6 +292,7 @@ impl AgentSessionEngine {
                                     args: args.clone(),
                                 });
                             }
+                            AgentEvent::ToolExecutionProgress { .. } => {}
                             AgentEvent::ToolExecutionUpdate {
                                 tool_call_id,
                                 partial_result,

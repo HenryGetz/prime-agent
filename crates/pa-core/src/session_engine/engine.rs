@@ -84,6 +84,12 @@ pub struct SessionEngineConfig {
     /// Fires when the kernel's last live background `bash()` handle
     /// settles; `None` installs nothing.
     pub on_background_work_settled: Option<crate::kernel::shared::BackgroundWorkSettledCallback>,
+    /// The daemonless kernel-notice wake (TS `resumeIfIdle`): with it
+    /// the engine registers the `bash.completed`/`bash.consumed`/
+    /// `factory.progress` handlers whose in-process sinks steer the notice
+    /// row onto the session's agent and fire the wake. `None` installs nothing —
+    /// the daemon keeps its worker-lane sinks via the extra handlers.
+    pub bash_notice_wake: Option<super::bash_notices::BashNoticeWake>,
     /// An externally owned MCP manager: the engine adopts it instead of
     /// building its own, so ACP-admitted servers reach the prompt's MCP gating.
     pub mcp_manager: Option<std::sync::Arc<std::sync::Mutex<crate::mcp::McpManager>>>,
@@ -285,6 +291,9 @@ pub async fn create_session(mut config: SessionEngineConfig) -> anyhow::Result<S
     // factory host bridge's preflight facts (the daemon `allowedModels`
     // pin), like the request-timing snapshot above.
     let factory_allowed_models = settings.get_allowed_models();
+    // Captured before `settings` moves into the resource loader: the
+    // per-cell watchdog budget (default 60s, `0` disables).
+    let python_cell_timeout_ms = settings.get_python_cell_timeout_ms();
     let (mcp_skill_overrides, mcp_generic_servers, built_manager) =
         mcp_gating(&settings, config.agent_dir.clone()).await?;
     let mcp_manager = config
@@ -335,7 +344,6 @@ pub async fn create_session(mut config: SessionEngineConfig) -> anyhow::Result<S
     };
     let model_context_window = model.context_window;
 
-    let python_skills = super::runtime_wiring::kernel_python_skills(&resources.skills);
     let session_id = wiring.session.lock().await.get_session_id().to_string();
     let mut handlers = wiring.handlers.clone();
     if let Some(extra) = config.extra_host_handlers.clone() {
@@ -462,6 +470,26 @@ pub async fn create_session(mut config: SessionEngineConfig) -> anyhow::Result<S
         )
             as crate::kernel::provisioner::UnavailableSkillsCallback)
     };
+    // The daemonless bash-completion lane (TS registers the handlers in
+    // every mode): the in-process sinks steer the notice row onto this
+    // session's agent and fire the embedding's wake once the agent
+    // exists (the slot binds below).
+    let bash_notice_agent = super::bash_notices::BashNoticeAgentSlot::default();
+    if let Some(wake) = config.bash_notice_wake.clone() {
+        super::bash_notices::register_in_process_kernel_notice_handlers(
+            &wake,
+            &bash_notice_agent,
+            &mut handlers,
+        );
+    }
+    // One model-visible skill list, computed now that the host-handler
+    // registry is final (every registration, the refine handlers, and
+    // the in-process bash notices are in): a controller-backed bundled
+    // skill whose host request never registered drops out (TS
+    // `_modelVisibleSkills`).
+    let model_visible_skills =
+        super::runtime_wiring::model_visible_skills(resources.skills.clone(), &handlers);
+    let python_skills = super::runtime_wiring::kernel_python_skills(&model_visible_skills);
     // TS resolves the serper credential on the host: `!command` key refs
     // cannot run in-kernel (the websearch skill's auth.json fallback reads
     // literals and env-var names, not commands). The credential is read
@@ -482,16 +510,22 @@ pub async fn create_session(mut config: SessionEngineConfig) -> anyhow::Result<S
         .await
         .map_err(|join| anyhow::anyhow!("websearch key resolve join failed: {join}"))?
     };
+    // The per-cell watchdog: daemon-backed sessions arm the settings budget
+    // (default 60s, `0` disables); daemonless sessions keep `await bash()`
+    // unbounded by design (#3523), so their cells are never annotated.
+    let cell_timeout_ms =
+        super::runtime_wiring::arm_cell_timeout_ms(config.daemonless, python_cell_timeout_ms);
     let provisioner = super::runtime_wiring::kernel_provisioner(
         session_id,
         handlers,
-        python_skills,
+        python_skills.clone(),
         cwd.clone(),
         &config.agent_dir,
         kernel_shell_path,
         kernel_command_prefix,
         serper_api_key,
         session_artifact_dir,
+        cell_timeout_ms,
         on_restore,
         config.on_background_work_settled.clone(),
         on_unavailable_skills,
@@ -571,7 +605,7 @@ pub async fn create_session(mut config: SessionEngineConfig) -> anyhow::Result<S
                 .iter()
                 .map(|file| (file.path.display().to_string(), file.content.clone()))
                 .collect(),
-            skills: resources.skills.clone(),
+            skills: model_visible_skills.clone(),
             selected_tools: Some(
                 active_tool_names
                     .iter()
@@ -605,7 +639,7 @@ pub async fn create_session(mut config: SessionEngineConfig) -> anyhow::Result<S
             .iter()
             .any(|name| name == PYTHON_TOOL_NAME),
         include_shell_examples: active_tool_names.iter().any(|name| name == "bash"),
-        include_refine: resources.skills.iter().any(|skill| {
+        include_refine: model_visible_skills.iter().any(|skill| {
             !skill.disable_model_invocation
                 && skill.name == crate::prompts::system_prompt::REFINE_SKILL_NAME
         }),
@@ -786,6 +820,11 @@ pub async fn create_session(mut config: SessionEngineConfig) -> anyhow::Result<S
             })
             .await;
     }
+    // The in-process bash-notice sinks bind their agent late: their
+    // handlers registered before the agent existed.
+    *bash_notice_agent
+        .lock()
+        .expect("bash notice agent slot lock") = Some(Arc::downgrade(&agent));
     // TS `_startRlmChildRun`'s spawn anchor: the `rlm.spawn` host handler
     // names the parent's in-flight turn through this weak seam (the
     // bridge is built before the agent exists, and a strong edge would
@@ -808,6 +847,17 @@ pub async fn create_session(mut config: SessionEngineConfig) -> anyhow::Result<S
             .then_some(digest_context.clone()),
     )
     .await?;
+    // Receipts that landed after their cell's tool result persist as
+    // custom entries; the build patches them onto the rebuilt tool
+    // results (TS `_restoreLateIpythonSentAgentMessages`).
+    super::late_sent_messages::restore(&wiring.session, &agent).await;
+    // Receipts that record while their cell's row has not landed yet
+    // apply as the row lands (TS `_applyLateIpythonSentAgentMessages`):
+    // the landing seam runs under the same lock as the state push, so
+    // the live row and the persisted one both carry the receipt.
+    agent.set_message_end_transform(Some(super::late_sent_messages::landing_transform(
+        &wiring.session,
+    )));
     session.set_auto_refine(auto_refine_allowed, auto_refine_gates);
     session.lifecycle_hooks = tool_hooks
         .as_ref()
@@ -852,6 +902,9 @@ pub async fn create_session(mut config: SessionEngineConfig) -> anyhow::Result<S
         std::sync::Arc::downgrade(&provisioner),
     ));
     session.set_kernel_state_probe(Some(kernel_state_probe));
+    // The admission path's `/skill:` expansion reads the FULL loader
+    // inventory (TS `_expandSkillCommand` expands from the loader); the
+    // model-visible list only shapes the prompt, pre-import, and counts.
     session.set_skills(resources.skills.clone());
     session.set_image_model_router(config.image_model_router.clone());
     // The semantic-edge handoff: the daemon's child registry and retry
@@ -903,9 +956,8 @@ pub async fn create_session(mut config: SessionEngineConfig) -> anyhow::Result<S
     let telemetry = match (config.telemetry.take(), config.rlm_depth.unwrap_or(0)) {
         (Some(wiring), 0) => {
             let skill_counts = super::telemetry::SkillCounts {
-                skill_count: resources.skills.len(),
-                python_skill_count: super::runtime_wiring::kernel_python_skills(&resources.skills)
-                    .len(),
+                skill_count: model_visible_skills.len(),
+                python_skill_count: python_skills.len(),
             };
             let installed = super::telemetry::install_session_telemetry(
                 &telemetry_agent,
@@ -1000,6 +1052,17 @@ impl SessionEngine {
         std::sync::Arc::downgrade(&self.provisioner)
     }
 
+    /// Whether the session's kernel has live background `bash()` work
+    /// (TS `isSessionActive`'s `hasBackgroundWork`; the same read the
+    /// daemon's liveness probe uses).
+    #[must_use]
+    pub fn has_background_bash(&self) -> bool {
+        self.kernel_provisioner_weak()
+            .upgrade()
+            .and_then(|provisioner| provisioner.manager())
+            .is_some_and(|manager| manager.has_background_work())
+    }
+
     /// Expand a `/skill:<name>` submission into its `<skill>` block for
     /// the accepted-turn row (TS `_expandSkillCommand`; the row the daemon
     /// emits before admission must match the text the model turn
@@ -1008,6 +1071,28 @@ impl SessionEngine {
     /// `skill_use_count` counter counts at the admission, not here.
     pub fn expand_skill_submission(&self, text: &str) -> String {
         crate::skills::expand_skill_command(text, &self.skills).0
+    }
+
+    /// Record one late (fire-and-forget) `agent_message.send` receipt (TS
+    /// `_recordLateIpythonSentAgentMessage`): the receipt persists as a
+    /// custom entry and the newest matching `python_repl` tool result
+    /// carries it in its `sentAgentMessages` details.
+    ///
+    /// # Errors
+    ///
+    /// Returns the persistence failure so the embedding cannot report successful quiescence.
+    pub async fn record_late_sent_agent_message(
+        &self,
+        tool_call_id: &str,
+        message: crate::kernel::shared::KernelSentAgentMessage,
+    ) -> anyhow::Result<()> {
+        super::late_sent_messages::record(
+            self.session.session_handle(),
+            self.session.agent(),
+            tool_call_id,
+            &message,
+        )
+        .await
     }
 
     /// Withdraw the queued goal-context turns: a minted continuation waiting
