@@ -371,10 +371,9 @@ fn string_at(text: &str, i: usize) -> Option<usize> {
     let mut cursor = end + if triple { 3 } else { 1 };
     while cursor < text.len() {
         let rest = &text[cursor..];
-        if rest.starts_with('\\') {
+        if let Some(escaped) = rest.strip_prefix('\\') {
             // Backslash escape: consumed inside the string.
-            let escaped = rest[1..].chars().next().map_or(1, |c| 1 + c.len_utf8());
-            cursor += escaped;
+            cursor += 1 + escaped.chars().next().map_or(0, char::len_utf8);
             continue;
         }
         let ch = rest.chars().next()?;
