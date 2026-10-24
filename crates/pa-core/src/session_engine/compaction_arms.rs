@@ -184,6 +184,20 @@ impl AgentSession {
         }
     }
 
+    /// Drop harness rows from a summarizer input while refinements are disabled.
+    fn strip_disabled_refinements(
+        &self,
+        attempt: &mut crate::session_engine::compact_session::CompactionAttempt,
+    ) {
+        if !self.harness_refinements_enabled() {
+            attempt.history =
+                super::refinement_gate::without_refinements(std::mem::take(&mut attempt.history));
+            attempt.turn_prefix_messages = super::refinement_gate::without_refinements(
+                std::mem::take(&mut attempt.turn_prefix_messages),
+            );
+        }
+    }
+
     /// Start the background watermark's summarize; a no-op while the flight or
     /// the slot is held.
     #[cfg(test)]
@@ -218,7 +232,7 @@ impl AgentSession {
         }
         let settings = self.compaction_settings();
         let semantic_edges = self.semantic_edges();
-        let attempt = {
+        let mut attempt = {
             let session = self.session.lock().await;
             let options = crate::session_engine::compact_session::CompactOptions {
                 model: model.clone(),
@@ -236,6 +250,7 @@ impl AgentSession {
                 Err(_) => return,
             }
         };
+        self.strip_disabled_refinements(&mut attempt);
         let harness_digest = self.harness_digest_inputs().await;
         let model = model.clone();
         let auxiliary = self.auxiliary_model.clone();
@@ -537,10 +552,10 @@ impl AgentSession {
                 }
             }
             let background_abort = joined.as_ref().map(|summary| summary.abort.clone());
-            let (mut attempt, prepared, duration_ms) = if let Some(summary) = joined {
+            let (mut attempt, mut prepared, duration_ms) = if let Some(summary) = joined {
                 (summary.attempt, summary.prepared, summary.summarize_ms)
             } else {
-                let attempt = {
+                let mut attempt = {
                     let session = self.session.lock().await;
                     match crate::session_engine::compact_session::prepare_attempt(&session, options)
                     {
@@ -548,6 +563,7 @@ impl AgentSession {
                         Err(skip) => return Ok(CompactOutcome::Skipped(skip.user_message())),
                     }
                 };
+                self.strip_disabled_refinements(&mut attempt);
                 // The digest ranks the branch THIS attempt summarizes: a
                 // conflict retry prepares a new tree, and inputs captured
                 // once before the loop would rank the abandoned branch's
@@ -573,6 +589,12 @@ impl AgentSession {
                 .await?;
                 (attempt, prepared, started_at.elapsed().as_millis() as u64)
             };
+            // A toggle during the summarizer request (fresh or background)
+            // must not re-inject the captured digest.
+            if !self.harness_refinements_enabled() {
+                prepared.entry.harness_digest = None;
+                prepared.entry.harness_state_fingerprint = None;
+            }
             let committed = {
                 let mut session = self.session.lock().await;
                 // Linearize Stop with the synchronous commit. No await holds
