@@ -147,8 +147,11 @@ impl GoalDriver {
             }
             _ => {
                 // A different goal (or none) adopts: the previous goal's pending
-                // mint and deferral would block the adopted goal's continuations.
+                // mint and deferral would block the adopted goal's continuations,
+                // and its billed calls never charge the adopted goal.
                 self.continuation_consumed();
+                self.billed_tokens
+                    .store(0, std::sync::atomic::Ordering::SeqCst);
                 self.owed_continuation_for_rlm_work = false;
                 // The adopted goal's own durable streak applies; the backoff
                 // window does not survive the move.
@@ -416,16 +419,27 @@ impl GoalDriver {
         if self.state.status != GoalStatus::Active {
             return Ok(());
         }
-        self.set_state(
+        // Calls billed since the last accounted turn ran under this goal: the
+        // pause charges them (resume drops what the pause itself billed).
+        let billed_tokens = self
+            .billed_tokens
+            .swap(0, std::sync::atomic::Ordering::SeqCst);
+        let paused = self.set_state(
             session,
             GoalState {
                 active: false,
                 status: GoalStatus::Paused,
+                tokens_used: self.state.tokens_used + billed_tokens,
                 last_reason: Some(reason.to_string()),
                 last_error: None,
                 ..self.state.clone()
             },
-        )?;
+        );
+        if let Err(error) = paused {
+            self.billed_tokens
+                .fetch_add(billed_tokens, std::sync::atomic::Ordering::SeqCst);
+            return Err(error);
+        }
         // The deferral drops after the durable write: a failed persist
         // keeps the previous goal's deferral as it was.
         self.owed_continuation_for_rlm_work = false;

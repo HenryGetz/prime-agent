@@ -291,6 +291,7 @@ impl SessionFile {
         full.leaf_id.clone_from(&self.leaf_id);
         full.lease.clone_from(&self.lease);
         full.trace_upload.clone_from(&self.trace_upload);
+        full.billed_row_sink.clone_from(&self.billed_row_sink);
         full.child_usage_recovery
             .clone_from(&self.child_usage_recovery);
         // The merged store's leaf is the window's leaf: re-derive the gate
