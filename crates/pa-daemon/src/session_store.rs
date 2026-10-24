@@ -142,7 +142,10 @@ pub struct SessionFile {
     pub(crate) by_id: HashMap<String, usize>,
     /// Parallel to `entries`: each entry's parent-chain link (maintained with `by_id`).
     chain: Vec<index::ChainLink>,
-    pub(crate) leaf_id: Option<String>,
+    leaf_id: Option<String>,
+    /// The active branch's display rows by role, a window's unloaded prefix included: kept
+    /// by [`Self::set_leaf`], `None` while stale (the next read recounts).
+    branch_roles: Option<HashMap<String, usize>>,
     pub(crate) window: Option<SessionWindow>,
     pub(crate) trace_upload: Option<std::sync::Arc<pa_core::agent_traces::ContinuousTraceUpload>>,
     pub(crate) lease: Option<std::sync::Arc<crate::lease::SessionLease>>,
