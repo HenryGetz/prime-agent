@@ -107,11 +107,20 @@ pub struct SessionEntry {
 #[derive(Debug, Clone)]
 pub struct TranscriptPageRows {
     pub messages: Vec<Value>,
-    /// Each message's entry id, in `messages` order.
-    pub entry_ids: Vec<String>,
+    pub first_entry_id: Option<String>,
+    pub last_entry_id: Option<String>,
     /// Rows exist past the page's far side: older ones for an end page, newer
     /// ones before `until` for a start page.
     pub more: bool,
+}
+
+/// One `rlm.session.messages` slice ([`SessionFile::session_messages`]).
+#[derive(Debug, Clone)]
+pub struct SessionMessages {
+    /// Each row's index among the matching rows, entry id, and wire message, oldest first.
+    pub rows: Vec<(usize, String, Value)>,
+    /// How many rows match on the active branch.
+    pub total: usize,
 }
 
 /// The windowed sequence's summary scalars (newest timestamp, message count),

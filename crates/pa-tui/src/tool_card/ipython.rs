@@ -10,7 +10,8 @@ use serde_json::Value;
 
 use super::ipython_details::{
     format_duration, is_agent_message_receipt, is_edit_confirmation, parse_sent_agent_message,
-    read_background_shell, BackgroundShell, BashCommands, IpythonDetails, IpythonError,
+    read_background_shell, transcript_reads_summary, BackgroundShell, BashCommands, IpythonDetails,
+    IpythonError,
 };
 use super::layout::RowOutput;
 use super::{highlight, ToolCallCard};
@@ -515,7 +516,7 @@ fn render_transcript_reads(
     theme: &Theme,
     width: usize,
 ) {
-    if let Some(reads) = &details.transcript_reads {
+    if let Some(summary) = transcript_reads_summary(&details.transcript_reads) {
         if expanded {
             lines.blank();
         }
@@ -527,7 +528,7 @@ fn render_transcript_reads(
                     theme.fg_style(ThemeColor::Muted),
                 ),
                 Span::styled(" \u{b7} ".to_string(), theme.fg_style(ThemeColor::Dim)),
-                Span::styled(reads.summary(), theme.fg_style(ThemeColor::Dim)),
+                Span::styled(summary, theme.fg_style(ThemeColor::Dim)),
             ];
             truncate_line(&row, width, "\u{2026}")
         });

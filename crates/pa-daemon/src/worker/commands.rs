@@ -16,7 +16,7 @@ impl Worker {
         // Cancellation is deliberately excluded: it must reach the live turn immediately.
         let history_page = command_type == "get_messages"
             && transcript_page(payload).is_some_and(|page| page.reads_history());
-        if (history_page
+        if history_page
             || matches!(
                 command_type,
                 "get_session_tree"
@@ -27,43 +27,11 @@ impl Worker {
                     | "fork"
                     | "export_html"
                     | "export_jsonl"
-            ))
-            && self
-                .core
-                .lock()
-                .unwrap()
-                .store
-                .as_ref()
-                .is_some_and(|store| store.window.is_some())
+            )
         {
-            let path = self
-                .core
-                .lock()
-                .unwrap()
-                .store
-                .as_ref()
-                .unwrap()
-                .path
-                .clone();
-            let load_path = path.clone();
-            let hydrated = tokio::task::spawn_blocking(move || SessionFile::open(&load_path))
-                .await
-                .map_err(anyhow::Error::from)
-                .and_then(|result| result);
-            match hydrated {
-                Ok(full) => {
-                    let mut core = self.core.lock().unwrap();
-                    if let Some(store) = core.store.as_mut().filter(|store| store.path == path) {
-                        store.install_full_history(full);
-                    }
-                }
-                Err(error) => {
-                    return response_failure(None, command_type, &error.to_string(), None);
-                }
+            if let Err(error) = self.hydrate_history().await {
+                return response_failure(None, command_type, &error.to_string(), None);
             }
-            // The hydrated full file was a transient whole-file copy on
-            // top of the installed history: release its freed heap.
-            pa_types::memory_release::trim_freed_heap();
         }
         match command_type {
             "create" => self.handle_create(payload).await,
@@ -99,6 +67,7 @@ impl Worker {
             }
             "get_state" => self.handle_get_state(),
             "get_messages" => self.handle_get_messages(payload),
+            "get_session_messages" => self.handle_get_session_messages(payload).await,
             "get_session_header" => self.handle_get_session_header(),
             "get_session_stats" => self.handle_get_session_stats(),
             "get_model_catalog" => self.handle_get_model_catalog(),
@@ -514,13 +483,114 @@ impl Worker {
             "get_messages",
             Some(json!({
                 "messages": rows.messages,
-                "firstEntryId": rows.entry_ids.first(),
-                "lastEntryId": rows.entry_ids.last(),
-                "entryIds": rows.entry_ids,
+                "firstEntryId": rows.first_entry_id,
+                "lastEntryId": rows.last_entry_id,
                 "more": rows.more,
                 "historyLeafId": history_leaf,
             })),
         )
+    }
+
+    /// `get_session_messages` (`rlm.session.messages`): one slice of the session's display
+    /// transcript, filtered by role globs; a slice into a windowed store's unloaded prefix
+    /// hydrates the store first.
+    async fn handle_get_session_messages(&self, payload: &Value) -> DaemonResponse {
+        const NAME: &str = "get_session_messages";
+        if let Err(response) = self.require_created(NAME) {
+            return response;
+        }
+        let start = payload.get("start").and_then(Value::as_i64).unwrap_or(0);
+        let limit = payload
+            .get("limit")
+            .and_then(Value::as_u64)
+            .map_or(0, |limit| usize::try_from(limit).unwrap_or(usize::MAX));
+        let mut globs = globset::GlobSetBuilder::new();
+        for role in payload
+            .get("roles")
+            .and_then(Value::as_array)
+            .into_iter()
+            .flatten()
+            .filter_map(Value::as_str)
+        {
+            match globset::Glob::new(role) {
+                Ok(glob) => {
+                    globs.add(glob);
+                }
+                Err(error) => return response_failure(None, NAME, &error.to_string(), None),
+            }
+        }
+        let globs = match globs.build() {
+            Ok(globs) => globs,
+            Err(error) => return response_failure(None, NAME, &error.to_string(), None),
+        };
+        let read = || {
+            let core = self.core.lock().unwrap();
+            let slice = core.store.as_ref().and_then(|store| {
+                store.session_messages(
+                    start,
+                    limit,
+                    |role| globs.is_match(role),
+                    &core.running_tool_calls,
+                )
+            });
+            slice
+        };
+        let mut slice = read();
+        if slice.is_none() {
+            if let Err(error) = self.hydrate_history().await {
+                return response_failure(None, NAME, &error.to_string(), None);
+            }
+            slice = read();
+        }
+        let Some(slice) = slice else {
+            return response_failure(None, NAME, "Session history is unavailable", None);
+        };
+        let messages: Vec<Value> = slice
+            .rows
+            .into_iter()
+            .map(|(index, id, mut message)| {
+                crate::snapshot_stream::elide_snapshot_image_payloads(std::slice::from_mut(
+                    &mut message,
+                ));
+                json!({ "index": index, "id": id, "message": message })
+            })
+            .collect();
+        response_success(
+            None,
+            NAME,
+            Some(json!({ "messages": messages, "total": slice.total })),
+        )
+    }
+
+    /// Load a windowed store's full history in place; a full store stays as it is.
+    async fn hydrate_history(&self) -> Result<()> {
+        let Some(path) = self
+            .core
+            .lock()
+            .unwrap()
+            .store
+            .as_ref()
+            .filter(|store| store.window.is_some())
+            .map(|store| store.path.clone())
+        else {
+            return Ok(());
+        };
+        let load_path = path.clone();
+        let full = tokio::task::spawn_blocking(move || SessionFile::open(&load_path)).await??;
+        if let Some(store) = self
+            .core
+            .lock()
+            .unwrap()
+            .store
+            .as_mut()
+            .filter(|store| store.path == path)
+        {
+            store.install_full_history(full);
+        }
+        // The hydrated full file was a transient whole-file copy on
+        // top of the installed history: release its freed heap.
+        pa_types::memory_release::trim_freed_heap();
+        Ok(())
     }
 
     fn handle_get_queue(&self) -> DaemonResponse {

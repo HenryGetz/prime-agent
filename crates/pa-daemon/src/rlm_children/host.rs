@@ -742,16 +742,16 @@ impl RlmSubagentHost for SupervisorChildSessions {
         })
     }
 
-    /// The same `get_messages` page the TUI scrolls with, image payloads
-    /// left out.
-    fn session_messages(&self, page: pa_types::daemon::TranscriptPage) -> RlmHostFuture<Value> {
+    /// The session's own worker answers, image payloads left out.
+    fn session_messages(&self, start: i64, limit: u64, roles: Vec<String>) -> RlmHostFuture<Value> {
         let this = Arc::clone(&self.inner);
         Box::pin(async move {
-            let command = DaemonCommand::GetMessages {
+            let command = DaemonCommand::GetSessionMessages {
                 id: None,
                 active_session_id: this.parent_active_session_id.clone(),
-                page: Some(page),
-                capabilities: Some(vec!["elide_snapshot_images".to_string()]),
+                start,
+                limit,
+                roles,
                 rest: serde_json::Map::default(),
             };
             this.command(&command, STATE_TIMEOUT_MS).await

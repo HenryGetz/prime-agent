@@ -18,7 +18,7 @@ pub(crate) struct IpythonDetails {
     pub(crate) diffs: Vec<Value>,
     pub(crate) sent_agent_messages: Vec<Value>,
     pub(crate) bash_commands: Option<BashCommands>,
-    pub(crate) transcript_reads: Option<TranscriptReads>,
+    pub(crate) transcript_reads: Vec<TranscriptRead>,
 }
 
 pub(crate) struct IpythonError {
@@ -50,31 +50,61 @@ fn read_bash_commands(value: &Value) -> Option<BashCommands> {
     })
 }
 
-/// `transcriptReads`: the transcript pages the cell's `rlm.session.messages`
-/// reads fetched.
-pub(crate) struct TranscriptReads {
-    pages: u64,
-    messages: u64,
+/// One `transcriptReads` record: what one `rlm.session.messages` read returned.
+pub(crate) struct TranscriptRead {
+    returned: u64,
+    first: Option<u64>,
+    total: u64,
+    roles: Vec<String>,
 }
 
-impl TranscriptReads {
-    fn parse(value: &Value) -> Option<TranscriptReads> {
-        let count = |key: &str| value.get(key).and_then(Value::as_u64);
-        Some(TranscriptReads {
-            pages: count("pages")?,
-            messages: count("messages")?,
+impl TranscriptRead {
+    fn parse(value: &Value) -> Option<TranscriptRead> {
+        Some(TranscriptRead {
+            returned: value.get("returned")?.as_u64()?,
+            first: value.get("first").and_then(Value::as_u64),
+            total: value.get("total")?.as_u64()?,
+            roles: value
+                .get("roles")?
+                .as_array()?
+                .iter()
+                .filter_map(Value::as_str)
+                .map(str::to_string)
+                .collect(),
         })
     }
+}
 
-    /// `read 150 messages in 3 pages`.
-    pub(crate) fn summary(&self) -> String {
-        let plural =
-            |count: u64, noun: &str| format!("{count} {noun}{}", if count == 1 { "" } else { "s" });
-        format!(
+/// The card row for a cell's reads: `read 5 messages (role user) #12–#16 of 17`
+/// for one read, `read 13 messages in 3 reads` for several.
+pub(crate) fn transcript_reads_summary(reads: &[TranscriptRead]) -> Option<String> {
+    let plural =
+        |count: u64, noun: &str| format!("{count} {noun}{}", if count == 1 { "" } else { "s" });
+    match reads {
+        [] => None,
+        [read] => {
+            let roles = (read.roles != ["*"]).then(|| format!(" (role {})", read.roles.join("|")));
+            let range = read.first.filter(|_| read.returned > 0).map(|first| {
+                let last = first + read.returned - 1;
+                if first == last {
+                    format!(" #{first}")
+                } else {
+                    format!(" #{first}\u{2013}#{last}")
+                }
+            });
+            Some(format!(
+                "read {}{}{} of {}",
+                plural(read.returned, "message"),
+                roles.unwrap_or_default(),
+                range.unwrap_or_default(),
+                read.total
+            ))
+        }
+        _ => Some(format!(
             "read {} in {}",
-            plural(self.messages, "message"),
-            plural(self.pages, "page")
-        )
+            plural(reads.iter().map(|read| read.returned).sum(), "message"),
+            plural(reads.len() as u64, "read")
+        )),
     }
 }
 
@@ -115,7 +145,7 @@ impl IpythonDetails {
             diffs: Vec::new(),
             sent_agent_messages: Vec::new(),
             bash_commands: None,
-            transcript_reads: None,
+            transcript_reads: Vec::new(),
         };
         let Some(record) = details.as_object() else {
             return empty;
@@ -163,7 +193,9 @@ impl IpythonDetails {
             bash_commands: record.get("bashCommands").and_then(read_bash_commands),
             transcript_reads: record
                 .get("transcriptReads")
-                .and_then(TranscriptReads::parse),
+                .and_then(Value::as_array)
+                .map(|reads| reads.iter().filter_map(TranscriptRead::parse).collect())
+                .unwrap_or_default(),
         }
     }
 }

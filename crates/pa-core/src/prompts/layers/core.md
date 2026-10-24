@@ -140,10 +140,10 @@ prime-agent compacts automatically when there is only a given number of tokens l
 
 - `compact.run(instructions: str | None = None) -> dict`: schedule a compaction at the next assistant turn boundary
 - `compact.status() -> dict`: context usage & threshold before auto-compaction
-- `rlm.session.messages(limit: int = 50, before: str | None = None, after: str | None = None, role: str | None = None) -> list[RLMMessage]`: this session's own transcript as data, including the messages compaction summarized away (each compaction appears in place as a `compactionSummary` message); newest first, or oldest first with `after`; the next page is the same call with `msgs[-1].id` as the cursor; `role` keeps one role (`"user"`, `"assistant"`, `"toolResult"`, `"custom"`, ...)
-- `rlm.session.iter_messages(before=None, after=None, role=None)`: the same order as an async iterator that fetches pages as you go
+- `rlm.session.messages(start: int = -10, limit: int = 10, *, role: str | tuple[str, ...] = "*") -> list[RLMMessage]` / `rlm.session.count(role="*") -> int`: this session's own transcript on the active branch, oldest first, including the messages compaction summarized away (each compaction in place as a `compactionSummary` message); `messages` returns `rows[start:][:limit]` (Python slice semantics) of the rows whose role matches `role`, fnmatch globs over `user`, `assistant`, `toolResult`, `custom`, `compactionSummary`, `branchSummary`, `bashExecution`; `count` returns `len(rows)`
 - `RLMMessage`
-  - `id: str`: the entry id, usable as a cursor
+  - `index: int`: the position in `rows` for the same `role`; the page before `msgs` is `messages(max(0, i - k), min(k, i), role=role)` with `i = msgs[0].index`
+  - `id: str`: the entry id
   - `role: str`
   - `text: str`: the message's plain text
   - `timestamp: int | None`: milliseconds since the epoch
