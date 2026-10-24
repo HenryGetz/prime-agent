@@ -38,7 +38,7 @@ pub async fn prompt(state: &Arc<RpcState>, payload: &Value) -> Result<ResponseDa
         .session
         .prompt_with_images(
             message,
-            images,
+            images.clone(),
             PromptOptions {
                 streaming_behavior: behavior,
                 return_after_accepted: true,
@@ -60,7 +60,8 @@ pub async fn prompt(state: &Arc<RpcState>, payload: &Value) -> Result<ResponseDa
     // would deadlock.
     let model = handle.model.clone();
     let api_key = handle.api_key.clone();
-    let command_result = run_session_command(state, engine.clone(), &command, model, api_key).await;
+    let command_result =
+        run_session_command(state, engine.clone(), &command, model, api_key, &images).await;
     drop(handle);
     // The pump is scheduled only after the command settles: an earlier
     // kick would deliver parked rows into the rebuild's window.
@@ -101,6 +102,7 @@ async fn run_session_command(
     command: &pa_core::session_engine::slash_commands::SessionSlashCommand,
     model: pa_types::ai::Model,
     api_key: Option<String>,
+    images: &[pa_agent::types::ImageContent],
 ) -> Result<(), String> {
     let is_compact = command.name == "compact";
     // The compact frames carry the command's arguments as the
@@ -145,7 +147,7 @@ async fn run_session_command(
         };
         // The executor never errors out of the call: failures ride
         // `execution.error` and the session events.
-        execute_session_command(&engine, &mut params, command).await
+        execute_session_command(&engine, &mut params, command, images).await
     };
     if let Some(pending) = execution.pending_refinement.take() {
         let state = Arc::clone(state);

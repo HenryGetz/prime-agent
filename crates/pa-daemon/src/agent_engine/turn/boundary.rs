@@ -203,3 +203,63 @@ impl AgentSessionEngine {
         }
     }
 }
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::agent_engine::tests::{admit, faux_engine_with_settings};
+    use crate::agent_engine::FAUX_TEST_LOCK;
+    use pa_core::session_engine::turn_boundary::PendingRefine;
+    use serde_json::json;
+
+    #[test]
+    fn requested_refinement_commits_its_durable_outcome_row() {
+        let _faux = FAUX_TEST_LOCK
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        let (mut engine, dir) = faux_engine_with_settings(
+            &json!({"responses": [
+                {"text": "seed reply"},
+                {"text": json!({
+                    "summary": "No durable change justified",
+                    "rationale": "Fixture only",
+                    "expectedOutcome": "No change",
+                    "edits": []
+                }).to_string()}
+            ]}),
+            1,
+        );
+        engine.config.session_dir = Some(dir.path().join("sessions"));
+        admit(&engine, "seed turn".to_string(), &mut Vec::new());
+        {
+            let guard = engine.session.blocking_lock();
+            let session = guard.as_ref().expect("built session");
+            engine
+                .runtime
+                .block_on(session.turn_boundary.schedule_refine(PendingRefine {
+                    instructions: Some("Verify the completed outcome".to_string()),
+                    global: false,
+                }));
+        }
+        let (send, receive) = std::sync::mpsc::channel();
+        *engine.refinement_completion_sink.lock().unwrap() =
+            Some(std::sync::Arc::new(move |pending| {
+                send.send(pending).unwrap();
+            }));
+        let boundary = engine.run_turn_boundary(&mut |_| true);
+        assert!(matches!(boundary, BoundaryRun::Proceed));
+        let pending = receive
+            .try_recv()
+            .expect("completion handed to background sink");
+        let committed = engine.runtime.block_on(pending).unwrap().unwrap();
+        let outcomes = committed
+            .rows
+            .iter()
+            .filter(|row| row.custom_type == "refinement_outcome")
+            .count();
+        assert_eq!(
+            outcomes, 1,
+            "one durable outcome, including a no-op refinement"
+        );
+    }
+}

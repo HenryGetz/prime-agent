@@ -117,6 +117,7 @@ impl Origin {
                         engine,
                         &mut params,
                         &command,
+                        &[],
                     ),
                 )
                 .await
@@ -354,6 +355,7 @@ async fn a_print_refine_command_is_tracked_by_the_disposal_drain() {
         &autonomous,
         &mut boundary,
         &command,
+        &[],
     )
     .await;
     tokio::time::timeout(std::time::Duration::from_secs(5), started.notified())
