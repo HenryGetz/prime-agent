@@ -312,13 +312,18 @@ pub fn context_pressure(
         calculate_context_tokens(&assistant.usage)
     };
     let threshold = compaction_threshold(context_window, max_output_tokens, settings);
-    if threshold > 0 && context_tokens > threshold {
+    // A disabled trigger disables its background band too: no summary can
+    // relieve a zero threshold.
+    if threshold == 0 {
+        return ContextPressure::Below;
+    }
+    if context_tokens > threshold {
         return ContextPressure::Reserve;
     }
     let watermark = threshold
         .saturating_sub(BACKGROUND_COMPACTION_HEADROOMS.saturating_mul(headroom(settings)))
         .max(retention_floor(settings));
-    if watermark > 0 && context_tokens > watermark {
+    if context_tokens > watermark {
         return ContextPressure::Background;
     }
     ContextPressure::Below
@@ -750,6 +755,23 @@ mod tests {
         assert_eq!(
             compaction_threshold(128_000, 124_000, &CompactionSettings::default()),
             0
+        );
+    }
+
+    #[test]
+    fn a_disabled_threshold_never_starts_the_background_band() {
+        // No context fits beside a 124k output budget: the trigger is
+        // disabled, so a context far above the retention floor stays Below.
+        let settings = CompactionSettings::default();
+        assert_eq!(compaction_threshold(128_000, 124_000, &settings), 0);
+        assert_eq!(
+            context_pressure(
+                &[user_message("turn", 1), assistant_message(100_000, 2)],
+                128_000,
+                124_000,
+                &settings,
+            ),
+            ContextPressure::Below
         );
     }
 
