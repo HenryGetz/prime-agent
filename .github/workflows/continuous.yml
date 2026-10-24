@@ -13,11 +13,13 @@ on:
   push:
     branches:
       - main
+      - sebastian/int-test-8
+  workflow_dispatch:
 
 permissions: {}
 
 concurrency:
-  group: continuous-main
+  group: continuous-${{ github.ref_name }}
   cancel-in-progress: false
 
 env:
