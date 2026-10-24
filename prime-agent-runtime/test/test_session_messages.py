@@ -3,6 +3,7 @@ from __future__ import annotations
 import asyncio
 import importlib
 import unittest
+from pathlib import Path
 from unittest.mock import Mock, patch
 
 
@@ -83,6 +84,25 @@ class SessionMessagesTest(unittest.TestCase):
         self.assertEqual(count, 4)
         self.assertEqual(host.requests, [("rlm.session.messages", {"start": 0, "limit": 0, "roles": ["user"]})])
         self.assertEqual(reads, [])
+
+    def test_agent_reads_target_a_family_member(self) -> None:
+        row = {"index": 4, "id": "e4", "message": {"role": "user", "content": "go"}}
+        host = FakeHost({"messages": [row], "total": 5, "agent": "worker-a"})
+        handle = rlm_module.RLMSpawnHandle(rlm_child_id="sub-1", name="worker-a", session_dir=Path("/s"), model="m")
+
+        messages, reads = run(host, lambda session: session.messages(-1, 1, agent=handle))
+        count, _ = run(host, lambda session: session.count(agent="worker-a"))
+
+        self.assertEqual([m.text for m in messages], ["go"])
+        self.assertEqual(count, 5)
+        self.assertEqual(
+            host.requests,
+            [
+                ("agent_observe.session_messages", {"start": -1, "limit": 1, "roles": ["*"], "target": "sub-1"}),
+                ("agent_observe.session_messages", {"start": 0, "limit": 0, "roles": ["*"], "target": "worker-a"}),
+            ],
+        )
+        self.assertEqual(reads, [{"returned": 1, "first": 4, "total": 5, "roles": ["*"], "agent": "worker-a"}])
 
     def test_negative_limit_is_rejected(self) -> None:
         host = FakeHost({"messages": [], "total": 0})

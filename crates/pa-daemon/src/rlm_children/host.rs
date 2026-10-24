@@ -752,6 +752,7 @@ impl RlmSubagentHost for SupervisorChildSessions {
                 start,
                 limit,
                 roles,
+                session_file: None,
                 rest: serde_json::Map::default(),
             };
             this.command(&command, STATE_TIMEOUT_MS).await

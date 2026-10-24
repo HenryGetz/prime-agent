@@ -674,23 +674,30 @@ def _roles(role: str | tuple[str, ...]) -> list[str]:
 
 
 class _RLMSessionNamespace:
-    """This session's own transcript as data: ``await rlm.session.messages()``."""
+    """A session's transcript as data: ``await rlm.session.messages()``."""
 
     async def messages(
-        self, start: int = -10, limit: int = 10, *, role: str | tuple[str, ...] = "*"
+        self,
+        start: int = -10,
+        limit: int = 10,
+        *,
+        role: str | tuple[str, ...] = "*",
+        agent: str | RLMSpawnHandle | RLMSubagent | None = None,
     ) -> list[RLMMessage]:
-        """Return ``rows[start:][:limit]`` of this session's transcript on the active branch.
+        """Return ``rows[start:][:limit]`` of a session's transcript on the active branch.
 
         ``rows`` are the messages whose role matches ``role`` (an fnmatch glob or a
         tuple of globs), oldest first, including the messages compaction summarized
         away (each compaction appears in place as a ``compactionSummary`` message).
         ``start`` counts from the end when negative. Each message's ``index`` is its
-        position in ``rows``.
+        position in ``rows``. ``agent`` reads a nuclear-family member's transcript
+        instead of this session's: a name, child id, session id, spawn handle, or
+        ``list_subagents()`` row.
         """
         if limit < 0:
             raise ValueError("limit must not be negative")
         roles = _roles(role)
-        reply = await host_request("rlm.session.messages", {"start": start, "limit": limit, "roles": roles})
+        reply = await _read_transcript(start, limit, roles, agent)
         messages = [
             RLMMessage(
                 index=row["index"],
@@ -704,13 +711,30 @@ class _RLMSessionNamespace:
         ]
         first = messages[0].index if messages else None
         read = {"returned": len(messages), "first": first, "total": reply["total"], "roles": roles}
+        if agent is not None:
+            read["agent"] = reply["agent"]
         emit({_TRANSCRIPT_READ_MIME: read})
         return messages
 
-    async def count(self, role: str | tuple[str, ...] = "*") -> int:
-        """Return how many messages of this session's transcript match ``role``."""
-        reply = await host_request("rlm.session.messages", {"start": 0, "limit": 0, "roles": _roles(role)})
+    async def count(
+        self,
+        role: str | tuple[str, ...] = "*",
+        *,
+        agent: str | RLMSpawnHandle | RLMSubagent | None = None,
+    ) -> int:
+        """Return how many messages of the transcript match ``role`` (``agent`` as in ``messages``)."""
+        reply = await _read_transcript(0, 0, _roles(role), agent)
         return reply["total"]
+
+
+async def _read_transcript(
+    start: int, limit: int, roles: list[str], agent: str | RLMSpawnHandle | RLMSubagent | None
+) -> dict[str, Any]:
+    request = {"start": start, "limit": limit, "roles": roles}
+    if agent is None:
+        return await host_request("rlm.session.messages", request)
+    target = _collect_target_selector(agent, "agent")
+    return await host_request("agent_observe.session_messages", {**request, "target": target})
 
 
 class _RLMNamespace:

@@ -393,6 +393,10 @@ fn transcript_reads_render_one_summary_row_below_the_summary() {
             json!([read(3, 0, &["*"]), read(10, 7, &["user", "assistant"])]),
             "read 13 messages in 2 reads",
         ),
+        (
+            json!([{ "returned": 10, "first": 30, "total": 40, "roles": ["*"], "agent": "worker-a" }]),
+            "read 10 messages from worker-a #30\u{2013}#39 of 40",
+        ),
     ] {
         let card = cell_card(
             "msgs = await rlm.session.messages(role='user')",

@@ -56,6 +56,8 @@ pub(crate) struct TranscriptRead {
     first: Option<u64>,
     total: u64,
     roles: Vec<String>,
+    /// The family member whose transcript was read; `None` for the session's own.
+    agent: Option<String>,
 }
 
 impl TranscriptRead {
@@ -71,17 +73,26 @@ impl TranscriptRead {
                 .filter_map(Value::as_str)
                 .map(str::to_string)
                 .collect(),
+            agent: value
+                .get("agent")
+                .and_then(Value::as_str)
+                .map(str::to_string),
         })
     }
 }
 
 /// The card row for a cell's reads: `read 5 messages (role user) #12–#16 of 17`
-/// for one read, `read 13 messages in 3 reads` for several.
+/// for one read, `read 13 messages in 3 reads` for several. Reads of one family
+/// member's transcript name it: `read 10 messages from worker-a #0–#9 of 40`.
 pub(crate) fn transcript_reads_summary(reads: &[TranscriptRead]) -> Option<String> {
     let plural =
         |count: u64, noun: &str| format!("{count} {noun}{}", if count == 1 { "" } else { "s" });
+    let agent = reads.first()?.agent.as_deref();
+    let from = agent
+        .filter(|_| reads.iter().all(|read| read.agent.as_deref() == agent))
+        .map(|agent| format!(" from {agent}"))
+        .unwrap_or_default();
     match reads {
-        [] => None,
         [read] => {
             let roles = (read.roles != ["*"]).then(|| format!(" (role {})", read.roles.join("|")));
             let range = read.first.filter(|_| read.returned > 0).map(|first| {
@@ -93,7 +104,7 @@ pub(crate) fn transcript_reads_summary(reads: &[TranscriptRead]) -> Option<Strin
                 }
             });
             Some(format!(
-                "read {}{}{} of {}",
+                "read {}{from}{}{} of {}",
                 plural(read.returned, "message"),
                 roles.unwrap_or_default(),
                 range.unwrap_or_default(),
@@ -101,7 +112,7 @@ pub(crate) fn transcript_reads_summary(reads: &[TranscriptRead]) -> Option<Strin
             ))
         }
         _ => Some(format!(
-            "read {} in {}",
+            "read {}{from} in {}",
             plural(reads.iter().map(|read| read.returned).sum(), "message"),
             plural(reads.len() as u64, "read")
         )),
