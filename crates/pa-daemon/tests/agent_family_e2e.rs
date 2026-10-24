@@ -1293,22 +1293,23 @@ async fn parent_renames_a_child_end_to_end() {
     assert_eq!(edge.name, "bench-runner", "the ledger rename landed");
 }
 
-/// The cell that reads its own transcript twice (everything, then the user
-/// rows) and records what `rlm.session.messages` returned.
+/// The cell that pages through its own transcript (the whole branch newest
+/// first, cursor reads in both directions, the user rows) and records what
+/// `rlm.session.messages` returned.
 fn transcript_cell(receipts_dir: &Path) -> String {
     let receipt_path = receipts_dir.join("transcript.json").display().to_string();
     let error_path = receipts_dir.join("transcript.error").display().to_string();
     format!(
-        "import json, traceback\ntry:\n    everything = await rlm.session.messages()\n    users = await rlm.session.messages(role=\"user\")\n    open({receipt_path:?}, \"w\").write(json.dumps({{\"all\": [[m.index, m.role, m.text] for m in everything], \"users\": [m.index for m in users]}}))\nexcept Exception:\n    open({error_path:?}, \"w\").write(traceback.format_exc())\n    raise",
+        "import json, traceback\ntry:\n    newest = [m async for m in rlm.session.iter_messages()]\n    older = await rlm.session.messages(limit=2, before=\"m5\")\n    newer = await rlm.session.messages(limit=2, after=older[-1].id)\n    users = await rlm.session.messages(limit=10, role=\"user\")\n    open({receipt_path:?}, \"w\").write(json.dumps({{\"newest\": [[m.id, m.role, m.text] for m in newest], \"older\": [m.id for m in older], \"newer\": [m.id for m in newer], \"users\": [m.text for m in users]}}))\nexcept Exception:\n    open({error_path:?}, \"w\").write(traceback.format_exc())\n    raise",
     )
 }
 
-/// `rlm.session.messages` end to end: a kernel cell in a daemon session reads
-/// its own transcript through the real host handler and supervisor route,
-/// including the rows its compaction summarized away (the summary in place),
-/// and the cell's tool result carries one `transcriptReads` record per read.
+/// `rlm.session.messages` end to end: a kernel cell in a windowed daemon
+/// session pages through its own transcript via the real host handler and
+/// supervisor route, past the window into the rows its compaction summarized
+/// away (the summary in place), and the cell's tool result sums the pages.
 #[tokio::test]
-async fn session_messages_reads_the_whole_transcript_end_to_end() {
+async fn session_messages_pages_through_the_transcript_end_to_end() {
     let Some(kernel_python) = kernel_python() else {
         return;
     };
@@ -1349,10 +1350,13 @@ async fn session_messages_reads_the_whole_transcript_end_to_end() {
     let session_path = sessions_dir.join("transcript-e2e.jsonl");
     std::fs::write(
         &session_path,
-        rows.iter()
-            .map(Value::to_string)
-            .collect::<Vec<_>>()
-            .join("\n"),
+        format!(
+            "{}\n",
+            rows.iter()
+                .map(Value::to_string)
+                .collect::<Vec<_>>()
+                .join("\n")
+        ),
     )
     .expect("write session");
     let script = write_faux_script(
@@ -1399,20 +1403,35 @@ async fn session_messages_reads_the_whole_transcript_end_to_end() {
         panic!("transcript cell failed: {error}");
     }
     let read = read_recorded(&receipts_dir, "transcript.json");
-    let all = read["all"].as_array().expect("all rows");
+    let mut oldest_first = read["newest"].as_array().expect("newest rows").clone();
+    oldest_first.reverse();
     assert_eq!(
-        all[..6],
+        oldest_first[..5],
         [
-            json!([0, "user", "the first prompt"]),
-            json!([1, "user", "compacted away"]),
-            json!([2, "user", "kept"]),
-            json!([3, "compactionSummary", "the story"]),
-            json!([4, "user", "after compaction"]),
-            json!([5, "user", "read the transcript"]),
+            json!(["m1", "user", "the first prompt"]),
+            json!(["m2", "user", "compacted away"]),
+            json!(["m3", "user", "kept"]),
+            json!(["m4", "compactionSummary", "the story"]),
+            json!(["m5", "user", "after compaction"]),
         ],
-        "the whole branch in order, the compacted rows included: {read}"
+        "the whole branch, the compacted rows included: {read}"
     );
-    assert_eq!(read["users"], json!([0, 1, 2, 4, 5]));
+    assert_eq!(
+        oldest_first[5].as_array().expect("the prompt row")[1..],
+        [json!("user"), json!("read the transcript")]
+    );
+    assert_eq!(read["older"], json!(["m4", "m3"]));
+    assert_eq!(read["newer"], json!(["m4", "m5"]));
+    assert_eq!(
+        read["users"],
+        json!([
+            "read the transcript",
+            "after compaction",
+            "kept",
+            "compacted away",
+            "the first prompt",
+        ])
+    );
 
     client.send_command(
         "messages-reader",
@@ -1426,13 +1445,12 @@ async fn session_messages_reads_the_whole_transcript_end_to_end() {
         .find(|message| message["role"] == "toolResult")
         .expect("the cell's tool result")
         .clone();
-    let total = all.len();
+    // The windowed tail page, the page past the window, then one page per
+    // later read: `older` (four rows), `newer` (all after m3), `users` (all).
+    let total = oldest_first.len();
     assert_eq!(
         cell_result["details"]["transcriptReads"],
-        json!([
-            { "count": total, "total": total, "first": 0, "last": total - 1, "role": null },
-            { "count": 5, "total": total, "first": 0, "last": 5, "role": "user" },
-        ]),
-        "one record per read rides the tool result: {cell_result}"
+        json!({ "pages": 5, "messages": 3 * total + 1 }),
+        "the cell's page reads ride the tool result: {cell_result}"
     );
 }

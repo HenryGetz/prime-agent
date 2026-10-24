@@ -67,8 +67,7 @@ pub const AGENT_MESSAGE_DISPLAY_MIME: &str = "application/vnd.prime-agent.agent-
 pub const BASH_ACTIVITY_DISPLAY_MIME: &str = "application/vnd.prime-agent.bash-activity+json";
 /// One `bash()` call's command text (capped) and non-blank line count.
 pub const BASH_COMMAND_DISPLAY_MIME: &str = "application/vnd.prime-agent.bash-command+json";
-/// One `rlm.session.messages` read (counts and index range), carried to the
-/// cell card as is.
+/// One transcript page an `rlm.session.messages` read fetched (its message count).
 pub const TRANSCRIPT_READ_DISPLAY_MIME: &str = "application/vnd.prime-agent.transcript-read+json";
 /// The kernel host request that reports a background bash completion
 /// (the `[bash-done]` lane). The daemon registers the handler
@@ -186,6 +185,13 @@ pub struct KernelBashCommands {
     pub lines: usize,
 }
 
+/// The transcript pages one cell's `rlm.session.messages` reads fetched.
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
+pub struct KernelTranscriptReads {
+    pub pages: usize,
+    pub messages: usize,
+}
+
 /// A kernel error reported by a failed cell.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct KernelError {
@@ -209,8 +215,8 @@ pub struct ExecuteResult {
     pub sent_agent_messages: Option<Vec<KernelSentAgentMessage>>,
     /// The `bash()` commands this cell started, summarized for display.
     pub bash_commands: Option<KernelBashCommands>,
-    /// The transcript reads this cell made, in order.
-    pub transcript_reads: Option<Vec<Value>>,
+    /// The transcript pages this cell read, summarized for display.
+    pub transcript_reads: Option<KernelTranscriptReads>,
     /// Output that arrived without this cell's id (user threads, other cells' leftovers, raw fd writes).
     pub background_output: Option<String>,
     pub status: ExecuteStatus,

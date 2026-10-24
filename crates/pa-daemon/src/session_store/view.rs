@@ -479,13 +479,13 @@ impl SessionFile {
                 limit,
             } => self.start_page(after.as_deref(), until.as_deref(), *limit)?,
         };
+        let (entry_ids, messages) = rows
+            .into_iter()
+            .map(|(id, message)| (id.to_string(), message.into_owned()))
+            .unzip();
         Some(TranscriptPageRows {
-            first_entry_id: rows.first().map(|(id, _)| (*id).to_string()),
-            last_entry_id: rows.last().map(|(id, _)| (*id).to_string()),
-            messages: rows
-                .into_iter()
-                .map(|(_, message)| message.into_owned())
-                .collect(),
+            messages,
+            entry_ids,
             more,
         })
     }

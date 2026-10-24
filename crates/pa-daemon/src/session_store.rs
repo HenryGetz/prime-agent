@@ -107,8 +107,8 @@ pub struct SessionEntry {
 #[derive(Debug, Clone)]
 pub struct TranscriptPageRows {
     pub messages: Vec<Value>,
-    pub first_entry_id: Option<String>,
-    pub last_entry_id: Option<String>,
+    /// Each message's entry id, in `messages` order.
+    pub entry_ids: Vec<String>,
     /// Rows exist past the page's far side: older ones for an end page, newer
     /// ones before `until` for a start page.
     pub more: bool,

@@ -59,9 +59,9 @@ pub struct ExecuteResult {
     /// The `bash()` commands this cell started, summarized for display
     /// (`bashCommands` on the tool-result details).
     pub bash_commands: Option<crate::kernel::shared::KernelBashCommands>,
-    /// The cell's `rlm.session.messages` reads, in order
+    /// The transcript pages the cell's `rlm.session.messages` reads fetched
     /// (`transcriptReads` on the tool-result details).
-    pub transcript_reads: Vec<serde_json::Value>,
+    pub transcript_reads: Option<crate::kernel::shared::KernelTranscriptReads>,
 }
 
 /// The wire form of one sent agent message (TS `KernelSentAgentMessage`):
@@ -462,8 +462,8 @@ pub async fn execute_ipython(
             "lines": bash.lines,
         });
     }
-    if !r.transcript_reads.is_empty() {
-        details["transcriptReads"] = json!(r.transcript_reads);
+    if let Some(reads) = &r.transcript_reads {
+        details["transcriptReads"] = json!({ "pages": reads.pages, "messages": reads.messages });
     }
     if let Some(background) = &r.background_output {
         details["backgroundOutput"] = json!(background);

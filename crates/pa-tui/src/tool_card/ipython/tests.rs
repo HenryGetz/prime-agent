@@ -382,16 +382,13 @@ fn bash_dominated_cell_renders_as_bash() {
 }
 
 #[test]
-fn transcript_reads_render_one_row_each_below_the_summary() {
+fn transcript_reads_render_one_summary_row_below_the_summary() {
     let card = cell_card(
-        "users = await rlm.session.messages(role='user')",
+        "users = [m async for m in rlm.session.iter_messages(role='user')]",
         json!({
             "status": "ok",
             "durationMs": 40,
-            "transcriptReads": [
-                { "count": 12, "total": 412, "first": 3, "last": 398, "role": "user" },
-                { "count": 0, "total": 412, "first": null, "last": null, "role": "bashExecution" },
-            ],
+            "transcriptReads": { "pages": 3, "messages": 150 },
         }),
         false,
         false,
@@ -400,10 +397,7 @@ fn transcript_reads_render_one_row_each_below_the_summary() {
     let rows: Vec<String> = lines.iter().map(text_of).collect();
     assert_eq!(
         rows[1..],
-        [
-            " \u{2261} transcript \u{b7} read 12 user messages \u{b7} #3\u{2013}#398 of 412",
-            " \u{2261} transcript \u{b7} read 0 bashExecution messages of 412",
-        ]
+        [" \u{2261} transcript \u{b7} read 150 messages in 3 pages"]
     );
     for detail in [Detail::Overview, Detail::All] {
         assert_eq!(

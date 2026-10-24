@@ -506,8 +506,8 @@ fn render_sent_agent_messages(
     }
 }
 
-/// One summary row per `rlm.session.messages` read, shaped like the sent
-/// agent-message rows; the expanded view sets the group off from the code.
+/// One summary row for the cell's `rlm.session.messages` reads, shaped like
+/// the sent agent-message rows; the expanded view sets it off from the code.
 fn render_transcript_reads(
     lines: &mut RowOutput,
     details: &IpythonDetails,
@@ -515,10 +515,10 @@ fn render_transcript_reads(
     theme: &Theme,
     width: usize,
 ) {
-    if expanded && !details.transcript_reads.is_empty() {
-        lines.blank();
-    }
-    for read in &details.transcript_reads {
+    if let Some(reads) = &details.transcript_reads {
+        if expanded {
+            lines.blank();
+        }
         lines.push(|| {
             let row: Line = vec![
                 Span::raw(" "),
@@ -527,7 +527,7 @@ fn render_transcript_reads(
                     theme.fg_style(ThemeColor::Muted),
                 ),
                 Span::styled(" \u{b7} ".to_string(), theme.fg_style(ThemeColor::Dim)),
-                Span::styled(read.summary(), theme.fg_style(ThemeColor::Dim)),
+                Span::styled(reads.summary(), theme.fg_style(ThemeColor::Dim)),
             ];
             truncate_line(&row, width, "\u{2026}")
         });

@@ -514,8 +514,9 @@ impl Worker {
             "get_messages",
             Some(json!({
                 "messages": rows.messages,
-                "firstEntryId": rows.first_entry_id,
-                "lastEntryId": rows.last_entry_id,
+                "firstEntryId": rows.entry_ids.first(),
+                "lastEntryId": rows.entry_ids.last(),
+                "entryIds": rows.entry_ids,
                 "more": rows.more,
                 "historyLeafId": history_leaf,
             })),

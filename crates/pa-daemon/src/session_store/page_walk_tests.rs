@@ -160,8 +160,8 @@ type PageView = (Vec<Value>, Option<String>, Option<String>, bool);
 fn page_view(rows: TranscriptPageRows) -> PageView {
     (
         rows.messages,
-        rows.first_entry_id,
-        rows.last_entry_id,
+        rows.entry_ids.first().cloned(),
+        rows.entry_ids.last().cloned(),
         rows.more,
     )
 }

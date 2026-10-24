@@ -140,9 +140,10 @@ prime-agent compacts automatically when there is only a given number of tokens l
 
 - `compact.run(instructions: str | None = None) -> dict`: schedule a compaction at the next assistant turn boundary
 - `compact.status() -> dict`: context usage & threshold before auto-compaction
-- `rlm.session.messages(role: str | None = None, start: int | None = None, end: int | None = None) -> list[RLMMessage]`: this session's own transcript as data, oldest first, including the messages compaction summarized away (each compaction appears in place as a `compactionSummary` message); `start`/`end` slice it like a Python list, then `role` keeps one role (`"user"`, `"assistant"`, `"toolResult"`, `"custom"`, ...); search or filter the list with plain Python
+- `rlm.session.messages(limit: int = 50, before: str | None = None, after: str | None = None, role: str | None = None) -> list[RLMMessage]`: this session's own transcript as data, including the messages compaction summarized away (each compaction appears in place as a `compactionSummary` message); newest first, or oldest first with `after`; the next page is the same call with `msgs[-1].id` as the cursor; `role` keeps one role (`"user"`, `"assistant"`, `"toolResult"`, `"custom"`, ...)
+- `rlm.session.iter_messages(before=None, after=None, role=None)`: the same order as an async iterator that fetches pages as you go
 - `RLMMessage`
-  - `index: int`: position in the whole transcript
+  - `id: str`: the entry id, usable as a cursor
   - `role: str`
   - `text: str`: the message's plain text
   - `timestamp: int | None`: milliseconds since the epoch

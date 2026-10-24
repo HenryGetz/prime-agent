@@ -14,6 +14,7 @@ use std::future::Future;
 use std::sync::Arc;
 use std::time::Instant;
 
+use pa_types::daemon::TranscriptPage;
 use serde_json::{json, Map, Value};
 
 use crate::kernel::rlm_runtime::{
@@ -178,11 +179,11 @@ pub trait RlmSubagentHost: Send + Sync {
     /// Rename the current session (`session_id` absent) or one direct
     /// child (TS `rlm.rename`); answers the applied name.
     fn rename(&self, name: String, session_id: Option<String>) -> RlmHostFuture<String>;
-    /// The current session's display transcript, oldest first: every message
-    /// on the active branch, including the rows a compaction summarized away
-    /// (each compaction in place as its summary message). Only the daemon
-    /// keeps that transcript.
-    fn session_messages(&self) -> RlmHostFuture<Vec<Value>> {
+    /// One page of the current session's display transcript (the branch in
+    /// order, each compaction in place as its summary message): the
+    /// `get_messages` page reply with `messages`, `entryIds`, and `more`.
+    /// Only the daemon keeps that transcript.
+    fn session_messages(&self, _page: TranscriptPage) -> RlmHostFuture<Value> {
         Box::pin(async { anyhow::bail!("rlm.session.messages requires a daemon-backed session") })
     }
 }
@@ -855,11 +856,14 @@ fn register_session_messages(handlers: &mut HostRequestHandlers, bridge: &Arc<Rl
     let host = Arc::clone(&bridge.host);
     handlers.register(
         "rlm.session.messages",
-        host_handler(move |_payload| {
+        host_handler(move |payload| {
             let host = Arc::clone(&host);
             Box::pin(async move {
-                let messages = host.session_messages().await?;
-                Ok(json!({ "messages": messages }))
+                let page =
+                    serde_json::from_value(payload.data["page"].clone()).map_err(|error| {
+                        anyhow::anyhow!("rlm.session.messages page is invalid: {error}")
+                    })?;
+                host.session_messages(page).await
             })
         }),
     );
