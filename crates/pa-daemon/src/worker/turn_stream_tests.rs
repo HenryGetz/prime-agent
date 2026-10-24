@@ -493,6 +493,84 @@ async fn an_aborted_end_keeps_its_marker_after_the_request_flag_clears() {
     );
 }
 
+/// A failed run's `agent_end` goes out after the retry loop's next frame:
+/// the pending retry's `auto_retry_start` reaches clients before the end of
+/// the attempt it retries.
+#[tokio::test]
+async fn a_failed_runs_agent_end_follows_its_retry_start() {
+    let failed = json!({ "role": "assistant", "stopReason": "error", "errorMessage": "down" });
+    let events = gate_sighting_events(
+        vec![
+            EngineEvent::TurnEnd {
+                message: failed.clone(),
+                tool_results: Vec::new(),
+            },
+            EngineEvent::AgentEnd {
+                aborted: false,
+                messages: vec![failed],
+            },
+            EngineEvent::AutoRetryStart {
+                attempt: 1,
+                max_attempts: 3,
+                delay_ms: 1_000,
+                error_message: "down".to_string(),
+                reason: pa_core::session_engine::auto_retry::RetryStartReason::Quick,
+            },
+        ],
+        false,
+        false,
+    )
+    .await;
+    let order: Vec<&str> = events
+        .iter()
+        .filter_map(|event| event["type"].as_str())
+        .filter(|kind| ["turn_end", "auto_retry_start", "agent_end"].contains(kind))
+        .collect();
+    assert_eq!(
+        order,
+        ["turn_end", "auto_retry_start", "agent_end"],
+        "{events:?}"
+    );
+}
+
+/// The final failure's verdict also precedes the failed run's `agent_end`.
+#[tokio::test]
+async fn a_failed_runs_agent_end_follows_its_final_retry_end() {
+    let failed = json!({ "role": "assistant", "stopReason": "error", "errorMessage": "down" });
+    let events = gate_sighting_events(
+        vec![
+            EngineEvent::TurnEnd {
+                message: failed.clone(),
+                tool_results: Vec::new(),
+            },
+            EngineEvent::AgentEnd {
+                aborted: false,
+                messages: vec![failed],
+            },
+            EngineEvent::AutoRetryEnd {
+                aborted: false,
+                success: false,
+                attempt: 3,
+                final_error: Some("down".to_string()),
+                restored_model: None,
+            },
+        ],
+        false,
+        false,
+    )
+    .await;
+    let order: Vec<&str> = events
+        .iter()
+        .filter_map(|event| event["type"].as_str())
+        .filter(|kind| ["turn_end", "auto_retry_end", "agent_end"].contains(kind))
+        .collect();
+    assert_eq!(
+        order,
+        ["turn_end", "auto_retry_end", "agent_end"],
+        "{events:?}"
+    );
+}
+
 /// #4: the turn's tool executions count onto the session's `toolUseCount`
 /// (TS bumps the child's counter per `tool_execution_start`), the value the
 /// worker's roster deltas carry.
