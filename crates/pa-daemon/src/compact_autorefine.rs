@@ -459,6 +459,7 @@ mod tests {
             let execution = crate::session_commands::run_session_command(
                 &engine,
                 &refine_command(),
+                &[],
                 &mut |event| {
                     events.push(event);
                     true
