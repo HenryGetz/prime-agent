@@ -157,6 +157,59 @@ pub fn kill_pid(pid: i32, signal: Signal) -> bool {
     unsafe { libc::kill(pid, sig) == 0 }
 }
 
+/// Whether a process group currently exists, without delivering a signal.
+/// Existence alone never establishes ownership of a durable group's old id.
+///
+/// # Errors
+/// Returns the native probe error when group existence cannot be established.
+#[cfg(unix)]
+pub fn process_group_exists(pgid: i32) -> std::io::Result<bool> {
+    if pgid <= 1 {
+        return Ok(false);
+    }
+    if unsafe { libc::kill(-pgid, 0) } == 0 {
+        return Ok(true);
+    }
+    let error = std::io::Error::last_os_error();
+    if error.raw_os_error() == Some(libc::ESRCH) {
+        Ok(false)
+    } else {
+        Err(error)
+    }
+}
+
+/// No process groups: none exists.
+///
+/// # Errors
+///
+/// Never: the not-unix arm has no group to probe.
+#[cfg(not(unix))]
+pub fn process_group_exists(_pgid: i32) -> std::io::Result<bool> {
+    Ok(false)
+}
+
+/// Signal every member of process group `pgid` (`kill(-pgid, sig)`). Returns
+/// true only when the signal was delivered to at least one member.
+#[cfg(unix)]
+#[must_use]
+pub fn signal_process_group(pgid: i32, signal: Signal) -> bool {
+    if pgid <= 1 {
+        return false;
+    }
+    let sig = match signal {
+        Signal::Term => libc::SIGTERM,
+        Signal::Kill => libc::SIGKILL,
+    };
+    unsafe { libc::kill(-pgid, sig) == 0 }
+}
+
+#[cfg(not(unix))]
+#[must_use]
+pub fn signal_process_group(_pgid: i32, _signal: Signal) -> bool {
+    // No process groups: persistent shells are POSIX-only.
+    false
+}
+
 /// Windows: `OpenProcess(PROCESS_TERMINATE)` + `TerminateProcess` on the
 /// single pid (every signal terminates; the `Term`/`Kill` distinction
 /// collapses there). Descendants are NOT killed: teardown paths needing
@@ -360,9 +413,10 @@ pub async fn wait_for_exit(pid: u32) -> std::io::Result<()> {
         Err(error) if error.raw_os_error() == Some(libc::ESRCH) => return Ok(()),
         Err(error) => return Err(error),
     };
-    // SAFETY: `open_pidfd` returned a fresh descriptor this call owns
-    // (and closes on drop, on every path).
-    let fd = AsyncFd::with_interest(unsafe { OwnedFd::from_raw_fd(fd) }, Interest::READABLE)?;
+    // SAFETY: `open_pidfd` returned a fresh descriptor this call owns; the
+    // `AsyncFd` owns the `OwnedFd`, so it stays open and unchanged until drop.
+    let fd =
+        unsafe { AsyncFd::register_with_interest(OwnedFd::from_raw_fd(fd), Interest::READABLE) }?;
     // Every wake is confirmed by a zero-timeout poll (AsyncFd readiness
     // can be spurious).
     loop {
@@ -442,7 +496,8 @@ pub async fn wait_for_exit(pid: u32) -> std::io::Result<()> {
             };
         }
     }
-    let kq = AsyncFd::with_interest(kq, Interest::READABLE)?;
+    // SAFETY: the `AsyncFd` owns `kq`, so it stays open and unchanged until drop.
+    let kq = unsafe { AsyncFd::register_with_interest(kq, Interest::READABLE) }?;
     // Only the exit knote is registered, so a drained event is the exit.
     loop {
         let mut ready = kq.readable().await?;

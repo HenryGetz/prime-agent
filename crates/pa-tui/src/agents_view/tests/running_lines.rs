@@ -15,11 +15,8 @@ fn scoped_view_keeps_the_first_row_default() {
     assert_eq!(mode.rows.len(), 1, "the scope root is excluded");
     assert_eq!(mode.selected, 0);
     assert_eq!(mode.rows[0].summary["sessionId"], "c");
-    assert!(mode.anchor_selection_pending, "the wait never resolves");
     mode.handle_key("enter");
-    let opened = mode
-        .opened
-        .expect("the scoped view opens despite the never-resolving wait");
+    let opened = mode.opened.expect("the scoped view opens the first row");
     assert_eq!(
         opened.selection,
         SessionSelection::Attach("c-live".to_string())
@@ -152,7 +149,7 @@ fn mode_with_mixed_children() -> AgentsViewMode {
 fn enter_expands_the_one_line_to_the_full_roster_running_first() {
     let mut mode = mode_with_mixed_children();
     assert_eq!(mode.rows.len(), 2);
-    assert_eq!(mode.rows[1].title, "4 subagents (2 running)");
+    assert_eq!(mode.rows[1].title, "4 subagents · 2 running");
     assert_eq!(mode.rows[1].identity, "subagents:file:/x/p.jsonl");
     mode.handle_key("down");
     mode.handle_key("enter");
@@ -198,7 +195,7 @@ fn live_transitions_update_the_one_line_and_keep_the_selection() {
         .iter()
         .find(|row| row.kind == RowKind::SubagentSummary)
         .expect("the ONE line");
-    assert_eq!(line.title, "4 subagents (1 running)");
+    assert_eq!(line.title, "4 subagents · 1 running");
     assert!(line.expanded, "the line stays open through the flip");
     let settled = mode
         .rows
@@ -217,7 +214,7 @@ fn live_transitions_update_the_one_line_and_keep_the_selection() {
         .iter()
         .find(|row| row.kind == RowKind::SubagentSummary)
         .expect("the ONE line");
-    assert_eq!(line.title, "4 subagents (2 running)");
+    assert_eq!(line.title, "4 subagents · 2 running");
     assert!(mode
         .rows
         .iter()
@@ -240,11 +237,11 @@ fn frame_renders_the_one_line() {
     ));
     mode.rebuild_rows();
     assert_eq!(mode.rows.len(), 2, "the parent and its ONE line");
-    assert_eq!(mode.rows[1].title, "3 subagents (2 running)");
+    assert_eq!(mode.rows[1].title, "3 subagents · 2 running");
     let (lines, _) = mode.render_frame(120, 36);
     let frame = lines.iter().map(flat).collect::<Vec<_>>().join("\n");
     assert!(
-        frame.contains("\u{25b8} 3 subagents (2 running)"),
+        frame.contains("\u{25b8} 3 subagents · 2 running"),
         "frame: {frame}"
     );
     assert!(

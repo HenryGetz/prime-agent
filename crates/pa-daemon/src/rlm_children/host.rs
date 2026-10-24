@@ -173,6 +173,7 @@ impl RlmSubagentHost for SupervisorChildSessions {
                     prompt_admitted: false,
                     error: None,
                     closed_by_parent: false,
+                    retiring: false,
                     retirement_finished: false,
                     retirement_notified: false,
                     retirement_roster_emitted: false,
@@ -250,7 +251,6 @@ impl RlmSubagentHost for SupervisorChildSessions {
                 if watcher_record.lock().await.closed_by_parent {
                     return;
                 }
-                watcher_record.lock().await.prompt_admitted = true;
                 if let Err(error) = watcher_this
                     .prompt_child(
                         &child_active_session_id,
@@ -286,15 +286,14 @@ impl RlmSubagentHost for SupervisorChildSessions {
                             .kill_child(&child_active_session_id, ChildCloseReason::Killed)
                             .await;
                         watcher_this
-                            .settle_failed(
-                                &watcher_record,
-                                format!("{retry_error:#}"),
-                                super::lifecycle::FailedArm::Prompt,
-                            )
+                            .settle_failed(&watcher_record, format!("{retry_error:#}"))
                             .await;
                         return;
                     }
                 }
+                // The worker accepted the task: from here an idle read is a
+                // finished run, never the pre-prompt idle worker.
+                watcher_record.lock().await.prompt_admitted = true;
                 watcher_this.watch_child_settle(&watcher_record).await;
             });
             Ok(RlmSpawnHandle {
@@ -508,14 +507,37 @@ impl RlmSubagentHost for SupervisorChildSessions {
                 ]),
             };
             drop(record_guard);
-            let was_running = record.lock().await.settled_status.is_none();
+            let was_running = {
+                // A delete of a LIVE run must not let a settle watcher that
+                // wakes inside the kill window append a clean
+                // `child_returned` beside the cancel line. The gate is this
+                // mark, not a fake settle: a fake settle would make the
+                // watcher treat the live run as finished and exit, which a
+                // failed kill would then strand (a live, unwatched child).
+                // A settled child's delete records no cancel line, so it
+                // leaves its return alone.
+                let mut row = record.lock().await;
+                let was_running = row.settled_status.is_none();
+                if was_running {
+                    row.retiring = true;
+                }
+                was_running
+            };
             // Capture before the kill: a deleted running child's durable
             // rows are its last observable spend on the parent side.
             if !already_terminated {
                 this.emit_child_usage(&record).await;
-                this.command(&command, KILL_TIMEOUT_MS)
+                if let Err(error) = this
+                    .command(&command, KILL_TIMEOUT_MS)
                     .await
-                    .with_context(|| format!("kill RLM child \"{target}\""))?;
+                    .with_context(|| format!("kill RLM child \"{target}\""))
+                {
+                    // The kill never landed: clear the mark so the
+                    // still-live child stays watchable and a later cancel
+                    // can still record the parent -> child edge.
+                    record.lock().await.retiring = false;
+                    return Err(error);
+                }
                 this.retain_retired_usage(&record, super::RetirementIntent::Delete { was_running });
                 // Observe any rows that landed before the acknowledged kill.
                 this.emit_child_usage(&record).await;
