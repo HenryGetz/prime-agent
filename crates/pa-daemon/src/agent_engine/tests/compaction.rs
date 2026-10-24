@@ -1159,6 +1159,8 @@ fn faux_engine_with_registration(
 }
 
 /// The reserve landing the measured crossing usage inside the background band.
+/// The band starts no lower than the retention floor (`keep + 2 * reserve`),
+/// so the crossing must be large (~65k tokens) to land above it.
 fn background_band_reserve(seed_usage: u64, crossing_usage: u64) -> u64 {
     (2 * (128_000 - FAUX_REQUEST_BUDGET) - seed_usage - crossing_usage) / 6
 }
@@ -1225,7 +1227,7 @@ fn background_watermark_summarizes_without_blocking_the_next_turn() {
     let _faux = FAUX_TEST_LOCK
         .lock()
         .unwrap_or_else(std::sync::PoisonError::into_inner);
-    let band_prompt = format!("seed turn {} crossing", "x".repeat(48_000));
+    let band_prompt = format!("seed turn {} crossing", "x".repeat(260_000));
     let usages = probe_usages(&["seed turn".to_string(), band_prompt.clone()]);
     let (engine, _engine_dir, registration) = faux_engine_with_registration(
         &serde_json::json!({
@@ -1385,7 +1387,7 @@ fn a_finished_background_summary_commits_at_the_next_boundary() {
     let _faux = FAUX_TEST_LOCK
         .lock()
         .unwrap_or_else(std::sync::PoisonError::into_inner);
-    let band_prompt = format!("seed turn {} crossing", "x".repeat(48_000));
+    let band_prompt = format!("seed turn {} crossing", "x".repeat(260_000));
     let usages = probe_usages(&["seed turn".to_string(), band_prompt.clone()]);
     let (engine, _engine_dir, registration) = faux_engine_with_registration(
         &serde_json::json!({
@@ -1448,7 +1450,7 @@ fn a_failed_background_summarize_never_blocks_the_watermark_band() {
     let _faux = FAUX_TEST_LOCK
         .lock()
         .unwrap_or_else(std::sync::PoisonError::into_inner);
-    let band_prompt = format!("seed turn {} crossing", "x".repeat(48_000));
+    let band_prompt = format!("seed turn {} crossing", "x".repeat(260_000));
     let usages = probe_usages(&["seed turn".to_string(), band_prompt.clone()]);
     let (engine, _engine_dir, registration) = faux_engine_with_registration(
         &serde_json::json!({ "responses": [] }),
@@ -1614,7 +1616,7 @@ fn an_unrelieving_finished_background_summary_never_blocks_the_watermark_band() 
     let _faux = FAUX_TEST_LOCK
         .lock()
         .unwrap_or_else(std::sync::PoisonError::into_inner);
-    let band_prompt = format!("seed turn {} crossing", "x".repeat(48_000));
+    let band_prompt = format!("seed turn {} crossing", "x".repeat(260_000));
     let usages = probe_usages(&["seed turn".to_string(), band_prompt.clone()]);
     let (engine, _engine_dir, _replaced) = faux_engine_with_registration(
         &serde_json::json!({ "responses": [] }),
@@ -1717,7 +1719,7 @@ fn stop_discards_a_finished_background_summary_before_the_next_boundary() {
     let _faux = FAUX_TEST_LOCK
         .lock()
         .unwrap_or_else(std::sync::PoisonError::into_inner);
-    let band_prompt = format!("seed turn {} crossing", "x".repeat(48_000));
+    let band_prompt = format!("seed turn {} crossing", "x".repeat(260_000));
     let usages = probe_usages(&["seed turn".to_string(), band_prompt.clone()]);
     let (engine, _dir, registration) = faux_engine_with_registration(
         &json!({"responses": [
@@ -1763,7 +1765,7 @@ fn stop_cancels_a_held_background_summary_and_allows_a_fresh_flight() {
     let _faux = FAUX_TEST_LOCK
         .lock()
         .unwrap_or_else(std::sync::PoisonError::into_inner);
-    let band_prompt = format!("seed turn {} crossing", "x".repeat(48_000));
+    let band_prompt = format!("seed turn {} crossing", "x".repeat(260_000));
     let usages = probe_usages(&["seed turn".to_string(), band_prompt.clone()]);
     let (engine, _dir, registration) = faux_engine_with_registration(
         &json!({"responses": [
@@ -1805,7 +1807,7 @@ fn stop_at_compaction_start_never_restarts_a_cancelled_background_join() {
     let _faux = FAUX_TEST_LOCK
         .lock()
         .unwrap_or_else(std::sync::PoisonError::into_inner);
-    let band_prompt = format!("seed turn {} crossing", "x".repeat(48_000));
+    let band_prompt = format!("seed turn {} crossing", "x".repeat(260_000));
     let usages = probe_usages(&["seed turn".to_string(), band_prompt.clone()]);
     let (engine, _dir, registration) = faux_engine_with_registration(
         &json!({"responses": [
@@ -1866,7 +1868,7 @@ fn stop_before_the_core_consult_does_not_start_a_replacement_flight() {
     let _faux = FAUX_TEST_LOCK
         .lock()
         .unwrap_or_else(std::sync::PoisonError::into_inner);
-    let band_prompt = format!("seed turn {} crossing", "x".repeat(48_000));
+    let band_prompt = format!("seed turn {} crossing", "x".repeat(260_000));
     let usages = probe_usages(&["seed turn".to_string(), band_prompt.clone()]);
     let (engine, _dir, registration) = faux_engine_with_registration(
         &json!({"responses": [
@@ -2039,7 +2041,7 @@ fn an_in_run_background_crossing_starts_a_flight_without_yielding_the_tool_run()
     let _faux = FAUX_TEST_LOCK
         .lock()
         .unwrap_or_else(std::sync::PoisonError::into_inner);
-    let crossing_prompt = format!("crossing {}", "x".repeat(48_000));
+    let crossing_prompt = format!("crossing {}", "x".repeat(260_000));
     let usages = probe_usages(&["seed turn".to_string(), crossing_prompt.clone()]);
     let (engine, _engine_dir, registration) = faux_engine_with_registration(
         &serde_json::json!({ "responses": [] }),
