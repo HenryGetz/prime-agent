@@ -1,7 +1,7 @@
 //! The roster's seeding and hydration arms: the boot ledger seed that
-//! keeps passivated RLM children in the live roster, the registration
-//! seed's edge-only family walk, and the bounded background hydration
-//! that fills their durable display rows.
+//! keeps passivated RLM children in the live roster, the create path's
+//! edge-only family seed, and the bounded background hydration that
+//! fills their durable display rows.
 
 use std::collections::{HashMap, HashSet};
 use std::path::{Path, PathBuf};
@@ -211,10 +211,9 @@ impl Supervisor {
             .cloned()
     }
 
-    /// The registration seed's family walk: a newly resident root renders
-    /// its passive descendants from the ledger edges alone, while the root
-    /// is still resident. Edge-only rows carry the dirname cwd and the
-    /// `seededCwd` marker.
+    /// The create path's family seed: a newly resident root renders its
+    /// passive descendants from the ledger edges alone, while the root is
+    /// still resident. Edge-only rows carry the dirname cwd and the `seededCwd` marker.
     pub(crate) async fn seed_roster_family_edges(
         self: &Arc<Self>,
         root: &Path,
