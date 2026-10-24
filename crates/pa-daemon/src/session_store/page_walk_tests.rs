@@ -160,8 +160,8 @@ type PageView = (Vec<Value>, Option<String>, Option<String>, bool);
 fn page_view(rows: TranscriptPageRows) -> PageView {
     (
         rows.messages,
-        rows.entry_ids.first().cloned(),
-        rows.entry_ids.last().cloned(),
+        rows.first_entry_id,
+        rows.last_entry_id,
         rows.more,
     )
 }
@@ -384,4 +384,140 @@ fn a_page_walks_only_its_window() {
     let (contains, steps) = steps_for(|| store.branch_contains(&deep));
     assert!(contains);
     assert!(steps <= 128, "historyLeafId check took {steps} steps");
+}
+
+/// A slice's rows (index, entry id, message) and its matching total.
+type Slice = (Vec<(usize, String, Value)>, usize);
+
+/// The reference slice: Python's `rows[start:][:limit]` over the full-branch display
+/// rows the role filter keeps, each with its index among them.
+fn reference_messages(
+    store: &SessionFile,
+    start: i64,
+    limit: usize,
+    keep_role: impl Fn(&str) -> bool,
+) -> Slice {
+    let rows: Vec<(String, Value)> = reference_branch(store)
+        .into_iter()
+        .filter_map(|entry| {
+            let message = if entry.type_ == "compaction" {
+                compaction_summary_message(entry, None)
+            } else {
+                entry_message(entry)?.into_owned()
+            };
+            keep_role(message_role(&message)?).then(|| (entry.id.clone(), message))
+        })
+        .collect();
+    let total = i64::try_from(rows.len()).unwrap();
+    let begin = if start < 0 {
+        (total + start).max(0)
+    } else {
+        start.min(total)
+    };
+    let slice = rows
+        .into_iter()
+        .enumerate()
+        .skip(usize::try_from(begin).unwrap())
+        .take(limit)
+        .map(|(index, (id, message))| (index, id, message))
+        .collect();
+    (slice, usize::try_from(total).unwrap())
+}
+
+fn messages_of(store: &SessionFile, start: i64, limit: usize, roles: &[&str]) -> Option<Slice> {
+    store
+        .session_messages(
+            start,
+            limit,
+            |role| roles.contains(&"*") || roles.contains(&role),
+            &std::collections::HashSet::new(),
+        )
+        .map(|slice| (slice.rows, slice.total))
+}
+
+/// `rlm.session.messages` slices the filtered display transcript with Python slice
+/// semantics: ranges from either end, past the end, and every role filter.
+#[test]
+fn session_messages_slice_the_filtered_branch() {
+    let store = mixed_store();
+    for roles in [
+        &["*"][..],
+        &["user"],
+        &["toolResult", "custom"],
+        &["compactionSummary"],
+        &["nothing"],
+    ] {
+        for (start, limit) in [
+            (-10, 10),
+            (0, 5),
+            (7, 3),
+            (-1000, 3),
+            (-3, 10),
+            (10_000, 5),
+            (4, 0),
+        ] {
+            assert_eq!(
+                messages_of(&store, start, limit, roles),
+                Some(reference_messages(&store, start, limit, |role| {
+                    roles.contains(&"*") || roles.contains(&role)
+                })),
+                "{roles:?} [{start}:][:{limit}]"
+            );
+        }
+    }
+    // Paging back from a tail read by its first index continues it.
+    let (tail, _) = messages_of(&store, -10, 10, &["user"]).unwrap();
+    let first = i64::try_from(tail[0].0).unwrap();
+    let (before, _) = messages_of(&store, first - 10, 10, &["user"]).unwrap();
+    let (both, _) = messages_of(&store, -20, 20, &["user"]).unwrap();
+    assert_eq!([before, tail].concat(), both);
+}
+
+/// The assistant row whose tool call is still running is the step in flight: it is
+/// neither returned nor counted until its call settles.
+#[test]
+fn the_in_flight_assistant_row_is_left_out() {
+    let mut store = SessionFile::create("/tmp", None, 0);
+    store.append_message(&user("read the transcript"));
+    store.append_message(&call("cell"));
+    let roles = |running: &[&str]| {
+        let running = running.iter().map(ToString::to_string).collect();
+        let slice = store.session_messages(-10, 10, |_| true, &running).unwrap();
+        let roles: Vec<String> = slice
+            .rows
+            .iter()
+            .map(|(_, _, message)| message_role(message).unwrap().to_string())
+            .collect();
+        (roles, slice.total)
+    };
+    assert_eq!(roles(&["cell"]), (vec!["user".to_string()], 1));
+    assert_eq!(
+        roles(&[]),
+        (vec!["user".to_string(), "assistant".to_string()], 2)
+    );
+}
+
+/// A windowed store counts its unloaded prefix: totals and indexes match the hydrated
+/// store, a slice inside the window reads without the prefix, and a slice reaching
+/// into it asks for hydration.
+#[test]
+fn a_windowed_store_counts_its_prefix_and_reads_its_window() {
+    let dir = tempfile::tempdir().unwrap();
+    let windowed = windowed_store(dir.path());
+    let mut full = windowed.clone();
+    full.ensure_full_history().unwrap();
+    assert!(full.window.is_none());
+    for roles in [&["*"][..], &["user"], &["toolResult", "custom"]] {
+        let (_, total) = messages_of(&full, 0, 0, roles).unwrap();
+        assert_eq!(
+            messages_of(&windowed, 0, 0, roles),
+            Some((Vec::new(), total))
+        );
+        assert_eq!(
+            messages_of(&windowed, -5, 5, roles),
+            messages_of(&full, -5, 5, roles),
+            "{roles:?}"
+        );
+        assert_eq!(messages_of(&windowed, 0, 5, roles), None, "{roles:?}");
+    }
 }

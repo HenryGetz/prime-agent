@@ -4,7 +4,6 @@ from __future__ import annotations
 
 import sys
 import types
-from collections.abc import AsyncIterator
 from dataclasses import dataclass
 from datetime import datetime
 from pathlib import Path
@@ -90,10 +89,11 @@ class RLMProgressNoteResult:
 class RLMMessage:
     """One message of this session's transcript, from `rlm.session.messages()`.
 
-    `id` is the message's entry id, the cursor for the next page. `raw` is the
-    stored message (tool calls, thinking, tool-result details).
+    `index` is the message's position among the messages the same `role` filter
+    keeps. `raw` is the stored message (tool calls, thinking, tool-result details).
     """
 
+    index: int
     id: str
     role: str
     text: str
@@ -645,10 +645,8 @@ class _RLMFactoryNamespace:
         return FACTORY_HELP
 
 
-# Display MIME the host sums into the cell card's transcript row: one per page.
+# Display MIME the host collects into the cell card's transcript row: one per read.
 _TRANSCRIPT_READ_MIME = "application/vnd.prime-agent.transcript-read+json"
-# Messages per transcript page fetched from the host.
-_PAGE_SIZE = 50
 
 
 def _message_text(message: dict[str, Any]) -> str:
@@ -671,72 +669,48 @@ def _message_timestamp(message: dict[str, Any]) -> int | None:
     return None if value is None else int(value)
 
 
+def _roles(role: str | tuple[str, ...]) -> list[str]:
+    return [role] if isinstance(role, str) else list(role)
+
+
 class _RLMSessionNamespace:
     """This session's own transcript as data: ``await rlm.session.messages()``."""
 
     async def messages(
-        self,
-        limit: int = 50,
-        before: str | None = None,
-        after: str | None = None,
-        role: str | None = None,
+        self, start: int = -10, limit: int = 10, *, role: str | tuple[str, ...] = "*"
     ) -> list[RLMMessage]:
-        """Return up to ``limit`` messages of this session's transcript.
+        """Return ``rows[start:][:limit]`` of this session's transcript on the active branch.
 
-        The first ``limit`` messages of ``iter_messages(before=, after=, role=)``:
-        newest first without ``after``, oldest first with it. The next page is
-        the same call with ``msgs[-1].id`` as the same cursor.
+        ``rows`` are the messages whose role matches ``role`` (an fnmatch glob or a
+        tuple of globs), oldest first, including the messages compaction summarized
+        away (each compaction appears in place as a ``compactionSummary`` message).
+        ``start`` counts from the end when negative. Each message's ``index`` is its
+        position in ``rows``.
         """
-        if limit < 1:
-            raise ValueError("limit must be at least 1")
-        messages: list[RLMMessage] = []
-        async for message in self.iter_messages(before=before, after=after, role=role):
-            messages.append(message)
-            if len(messages) == limit:
-                break
+        if limit < 0:
+            raise ValueError("limit must not be negative")
+        roles = _roles(role)
+        reply = await host_request("rlm.session.messages", {"start": start, "limit": limit, "roles": roles})
+        messages = [
+            RLMMessage(
+                index=row["index"],
+                id=row["id"],
+                role=row["message"]["role"],
+                text=_message_text(row["message"]),
+                timestamp=_message_timestamp(row["message"]),
+                raw=row["message"],
+            )
+            for row in reply["messages"]
+        ]
+        first = messages[0].index if messages else None
+        read = {"returned": len(messages), "first": first, "total": reply["total"], "roles": roles}
+        emit({_TRANSCRIPT_READ_MIME: read})
         return messages
 
-    async def iter_messages(
-        self,
-        before: str | None = None,
-        after: str | None = None,
-        role: str | None = None,
-    ) -> AsyncIterator[RLMMessage]:
-        """Iterate this session's transcript on the active branch, a page at a time.
-
-        It includes the messages a compaction summarized away; each compaction
-        appears in place as one ``compactionSummary`` message. Without a cursor
-        it walks back from the newest message; ``before=<id>`` walks back from
-        just before that message; ``after=<id>`` walks forward from just after
-        it (stopping before ``before`` when both are given). ``role`` keeps only
-        messages of that role (``"user"``, ``"assistant"``, ``"toolResult"``,
-        ``"custom"``, ...).
-        """
-        forward = after is not None
-        cursor = after if forward else before
-        while True:
-            if forward:
-                page = {"from": "start", "after": cursor, "until": before, "limit": _PAGE_SIZE}
-            else:
-                page = {"from": "end", "before": cursor, "limit": _PAGE_SIZE}
-            reply = await host_request("rlm.session.messages", {"page": page})
-            rows = list(zip(reply["entryIds"], reply["messages"]))
-            emit({_TRANSCRIPT_READ_MIME: {"messages": len(rows)}})
-            if not forward:
-                rows.reverse()
-            for entry_id, row in rows:
-                if role is None or row["role"] == role:
-                    yield RLMMessage(
-                        id=entry_id,
-                        role=row["role"],
-                        text=_message_text(row),
-                        timestamp=_message_timestamp(row),
-                        raw=row,
-                    )
-            if not reply["more"] or not rows:
-                return
-            # The page's far end, not the last match: a page with no match still advances.
-            cursor = rows[-1][0]
+    async def count(self, role: str | tuple[str, ...] = "*") -> int:
+        """Return how many messages of this session's transcript match ``role``."""
+        reply = await host_request("rlm.session.messages", {"start": 0, "limit": 0, "roles": _roles(role)})
+        return reply["total"]
 
 
 class _RLMNamespace:

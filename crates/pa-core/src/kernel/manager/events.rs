@@ -4,7 +4,7 @@
 use super::{
     append_truncated, lock, parse_attachment_display, parse_diff_display, parse_sent_agent_message,
     Arc, Event, ExecBuffers, ExecuteStatus, Guarded, Inner, KernelBashCommands, KernelError,
-    KernelTranscriptReads, StreamName, Value, AGENT_MESSAGE_DISPLAY_MIME, ATTACHMENT_DISPLAY_MIME,
+    StreamName, Value, AGENT_MESSAGE_DISPLAY_MIME, ATTACHMENT_DISPLAY_MIME,
     BASH_ACTIVITY_DISPLAY_MIME, BASH_COMMAND_DISPLAY_MIME, DIFF_DISPLAY_MIME,
     MAX_ATTACHMENT_DATA_CHARS, MAX_BACKGROUND_OUTPUT_CHARS, TRANSCRIPT_READ_DISPLAY_MIME,
 };
@@ -216,17 +216,8 @@ impl Inner {
                 buffers.sent_agent_messages.push(message);
             }
         }
-        if let Some(messages) = data
-            .get(TRANSCRIPT_READ_DISPLAY_MIME)
-            .and_then(|payload| payload.get("messages"))
-            .and_then(Value::as_u64)
-            .and_then(|messages| usize::try_from(messages).ok())
-        {
-            let reads = buffers
-                .transcript_reads
-                .get_or_insert(KernelTranscriptReads::default());
-            reads.pages += 1;
-            reads.messages += messages;
+        if let Some(read) = data.get(TRANSCRIPT_READ_DISPLAY_MIME) {
+            buffers.transcript_reads.push(read.clone());
         }
         if let Some(payload) = data.get(BASH_COMMAND_DISPLAY_MIME) {
             if let (Some(command), Some(lines)) = (

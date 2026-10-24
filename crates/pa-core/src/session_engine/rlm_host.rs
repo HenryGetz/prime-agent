@@ -14,7 +14,6 @@ use std::future::Future;
 use std::sync::Arc;
 use std::time::Instant;
 
-use pa_types::daemon::TranscriptPage;
 use serde_json::{json, Map, Value};
 
 use crate::kernel::rlm_runtime::{
@@ -179,11 +178,16 @@ pub trait RlmSubagentHost: Send + Sync {
     /// Rename the current session (`session_id` absent) or one direct
     /// child (TS `rlm.rename`); answers the applied name.
     fn rename(&self, name: String, session_id: Option<String>) -> RlmHostFuture<String>;
-    /// One page of the current session's display transcript (the branch in
-    /// order, each compaction in place as its summary message): the
-    /// `get_messages` page reply with `messages`, `entryIds`, and `more`.
+    /// One slice of the current session's display transcript
+    /// (`rlm.session.messages`): `rows[start:][:limit]` over the rows whose role
+    /// matches a `roles` glob, as `{messages: [{index, id, message}], total}`.
     /// Only the daemon keeps that transcript.
-    fn session_messages(&self, _page: TranscriptPage) -> RlmHostFuture<Value> {
+    fn session_messages(
+        &self,
+        _start: i64,
+        _limit: u64,
+        _roles: Vec<String>,
+    ) -> RlmHostFuture<Value> {
         Box::pin(async { anyhow::bail!("rlm.session.messages requires a daemon-backed session") })
     }
 }
@@ -853,17 +857,22 @@ fn register_rename(handlers: &mut HostRequestHandlers, bridge: &Arc<RlmHostBridg
 }
 
 fn register_session_messages(handlers: &mut HostRequestHandlers, bridge: &Arc<RlmHostBridge>) {
+    #[derive(serde::Deserialize)]
+    struct Request {
+        start: i64,
+        limit: u64,
+        roles: Vec<String>,
+    }
     let host = Arc::clone(&bridge.host);
     handlers.register(
         "rlm.session.messages",
         host_handler(move |payload| {
             let host = Arc::clone(&host);
             Box::pin(async move {
-                let page =
-                    serde_json::from_value(payload.data["page"].clone()).map_err(|error| {
-                        anyhow::anyhow!("rlm.session.messages page is invalid: {error}")
-                    })?;
-                host.session_messages(page).await
+                let request: Request = serde_json::from_value(payload.data.clone())
+                    .map_err(|error| anyhow::anyhow!("rlm.session.messages is invalid: {error}"))?;
+                host.session_messages(request.start, request.limit, request.roles)
+                    .await
             })
         }),
     );
