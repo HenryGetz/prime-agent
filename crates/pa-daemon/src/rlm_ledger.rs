@@ -519,6 +519,14 @@ impl RlmSpawnLedger {
         Ok(usage)
     }
 
+    /// Seed and replay the ledger ahead of its first reader; a failed
+    /// replay is left to that reader, which reports it.
+    pub(crate) fn warm(&self) {
+        if self.seed_once().is_ok() {
+            drop(self.replay_cached());
+        }
+    }
+
     /// The live family below `roots`, walked through the replay's parent
     /// index: the cost follows the families' size, not the ledger's. Each
     /// call re-resolves the endpoints it visits (restore, relocation,

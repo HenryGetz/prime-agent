@@ -346,6 +346,16 @@ impl Supervisor {
                 supervisor.note_catalog_refresh(count);
             });
         }
+        // The first open's family walk reads the spawn ledger: replay it
+        // while that open's worker launches, not on its reply path.
+        {
+            let supervisor = Arc::clone(&self);
+            tokio::spawn(async move {
+                if let Ok(ledger) = supervisor.rlm_spawn_ledger_for(None).await {
+                    drop(tokio::task::spawn_blocking(move || ledger.warm()).await);
+                }
+            });
+        }
         socket::prepare_socket_path(&self.options.socket_path).await?;
         let listener = bind_transport(&self.options.socket_path)
             .await
