@@ -8,6 +8,7 @@ use pa_core::session::discovery::{
     find_most_recent_session_for_cwd, resolve_session_path, ResolvedSession, SessionSelectorError,
 };
 use pa_types::ai::Model;
+use tokio::sync::Notify;
 
 use crate::headless_autonomous::{autonomous_runtime_config, HeadlessAutonomous};
 use crate::mode::{AppMode, MissingSubsystem, RunOptions};
@@ -201,6 +202,14 @@ fn daemon_acp_create(
         create_config["childScript"] =
             serde_json::Value::String(child_script.to_string_lossy().to_string());
     }
+    // TS main.ts `launchEnv` (:1092 via the daemon-client create): the
+    // client's own environment travels on the create so the session's
+    // worker runs in the environment of the terminal that invoked it,
+    // not the daemon's boot environment.
+    let launch_env = {
+        let env = pa_types::daemon::launch_env::collect_process_launch_env();
+        (!env.is_empty()).then_some(env)
+    };
     let create = pa_types::daemon::DaemonCommand::Create {
         id: None,
         session_path: session_path.map(|path| path.display().to_string()),
@@ -212,7 +221,7 @@ fn daemon_acp_create(
         runtime_metadata: None,
         lifecycle: Some(lifecycle),
         env: None,
-        launch_env: None,
+        launch_env,
         rest: serde_json::Map::default(),
     };
     Ok((cwd, create))
@@ -355,6 +364,9 @@ impl From<HeadlessEngine> for pa_daemon::rpc::session::RpcEngineHandle {
             model: parts.model,
             api_key: parts.api_key,
             provider_target: parts.provider_target,
+            bash_wake: parts
+                .rpc_bash_wake
+                .expect("the RPC embedding builds its background-bash wake handle"),
             session_lease: None,
         }
     }
@@ -504,6 +516,74 @@ pub(crate) enum ChildLane {
     Faux(FauxChildQueue),
 }
 
+/// The per-embedding fields both headless builders (the real provider
+/// and the faux script) share: the inline host + agent-message handlers
+/// with the RLM depth, the background-bash wake both engine seams fire
+/// (the completion row's admission wake and the kernel's
+/// background-settle callback), and the late agent-message receipt sink
+/// print sessions record through.
+pub(crate) struct HeadlessEmbeddingFields {
+    pub(crate) rlm_subagent_host:
+        Option<Arc<dyn pa_core::session_engine::rlm_host::RlmSubagentHost>>,
+    pub(crate) extra_host_handlers: Option<pa_core::kernel::shared::HostRequestHandlers>,
+    pub(crate) rlm_depth: Option<u32>,
+    pub(crate) bash_wake: pa_core::session_engine::bash_notices::BashNoticeWake,
+    /// The RPC mode's wake handle, carried onto the engine handle so the
+    /// queue-pump listener parks on it; `None` outside the RPC embedding.
+    pub(crate) rpc_bash_wake: Option<Arc<Notify>>,
+    /// The late fire-and-forget `agent_message.send` receipt sink
+    /// (#10-print); `None` for the RPC embedding (no print node).
+    pub(crate) on_late_sent_agent_message: Option<pa_core::LateSentAgentMessageHandler>,
+}
+
+/// The embedding-owned fields for one headless engine build: print
+/// sessions wake on the inline node's activity (every quiescence park
+/// listens on it), the RPC mode on the built handle's notify.
+pub(crate) fn headless_embedding_fields(embedding: &HeadlessEmbedding) -> HeadlessEmbeddingFields {
+    let node = match embedding {
+        HeadlessEmbedding::Root { node } => Some(Arc::clone(node)),
+        HeadlessEmbedding::Child(overrides) => Some(Arc::clone(&overrides.node)),
+        HeadlessEmbedding::Rpc => None,
+    };
+    let (rlm_subagent_host, extra_host_handlers) = match &node {
+        Some(node) => {
+            let (host, handlers) = crate::print_rlm::inline_subagent_wiring(node);
+            (Some(host), Some(handlers))
+        }
+        None => (None, None),
+    };
+    let (bash_wake, rpc_bash_wake) = if let Some(node) = &node {
+        let node = Arc::clone(node);
+        (
+            Arc::new(move || node.activity.notify_waiters())
+                as pa_core::session_engine::bash_notices::BashNoticeWake,
+            None,
+        )
+    } else {
+        let notify = Arc::new(Notify::new());
+        let wake = {
+            let notify = Arc::clone(&notify);
+            Arc::new(move || notify.notify_waiters())
+                as pa_core::session_engine::bash_notices::BashNoticeWake
+        };
+        (wake, Some(notify))
+    };
+    let on_late_sent_agent_message = node
+        .as_ref()
+        .map(crate::print_rlm::late_sent_agent_message_sink);
+    HeadlessEmbeddingFields {
+        rlm_subagent_host,
+        extra_host_handlers,
+        rlm_depth: match embedding {
+            HeadlessEmbedding::Child(overrides) => Some(overrides.node.depth),
+            HeadlessEmbedding::Root { .. } | HeadlessEmbedding::Rpc => None,
+        },
+        bash_wake,
+        rpc_bash_wake,
+        on_late_sent_agent_message,
+    }
+}
+
 /// The assembled headless engine, so host transports can drive session-command
 /// executors (compact/refine) with the session's own model.
 pub(crate) struct HeadlessEngine {
@@ -515,6 +595,9 @@ pub(crate) struct HeadlessEngine {
     /// re-registration; `set_model` swaps it without rebuilding the
     /// session).
     provider_target: ProviderTargetSlot,
+    /// The RPC mode's background-bash wake handle; `None` for the print
+    /// embeddings (their wake is the node's activity notify).
+    pub(crate) rpc_bash_wake: Option<Arc<Notify>>,
 }
 
 /// Transfer the opened lease to its mode before fallible engine assembly.
@@ -680,18 +763,15 @@ pub(crate) async fn build_headless_engine_with(
     // ledger-less but the request ids still go on the wire.
     let session_manager = session_manager
         .unwrap_or_else(|| pa_core::session::manager::SessionManager::in_memory(&config.cwd));
-    let (rlm_subagent_host, extra_host_handlers) = match embedding {
-        HeadlessEmbedding::Rpc => (None, None),
-        HeadlessEmbedding::Root { node } => {
-            let (host, handlers) = crate::print_rlm::inline_subagent_wiring(node);
-            (Some(host), Some(handlers))
-        }
-        HeadlessEmbedding::Child(overrides) => {
-            let (host, handlers) = crate::print_rlm::inline_subagent_wiring(&overrides.node);
-            (Some(host), Some(handlers))
-        }
-    };
-    let (semantic_edges, rlm_depth, thinking_level) = match embedding {
+    let HeadlessEmbeddingFields {
+        rlm_subagent_host,
+        extra_host_handlers,
+        rlm_depth,
+        bash_wake,
+        rpc_bash_wake,
+        on_late_sent_agent_message,
+    } = headless_embedding_fields(embedding);
+    let (semantic_edges, thinking_level) = match embedding {
         HeadlessEmbedding::Child(overrides) => (
             Some(
                 pa_core::session_engine::semantic_edges::SemanticEdgeIdentity {
@@ -705,7 +785,6 @@ pub(crate) async fn build_headless_engine_with(
                     spawned_by_request_id: overrides.spawned_by_request_id.clone(),
                 },
             ),
-            Some(overrides.node.depth),
             Some(pa_core::session_engine::provider_adapter::map_thinking_level(overrides.thinking)),
         ),
         HeadlessEmbedding::Root { .. } | HeadlessEmbedding::Rpc => (
@@ -720,13 +799,12 @@ pub(crate) async fn build_headless_engine_with(
                     spawned_by_request_id: None,
                 },
             ),
-            None,
             Some(resolve_thinking_level(config, &model)),
         ),
     };
     let engine = pa_core::session_engine::engine::create_session(
         pa_core::session_engine::engine::SessionEngineConfig {
-            on_late_sent_agent_message: None,
+            on_late_sent_agent_message,
             cron_store: None,
             semantic_edges,
             telemetry,
@@ -767,7 +845,11 @@ pub(crate) async fn build_headless_engine_with(
             // child boots lazily on first use.
             prewarm_ipython_kernel: (!matches!(embedding, HeadlessEmbedding::Child(_)))
                 .then_some(true),
-            on_background_work_settled: None,
+            // The background-bash wake pair: the completion row's
+            // admission fires it, and the kernel's background settle does
+            // too, so the embedding's parked drive or pump re-checks.
+            bash_notice_wake: Some(Arc::clone(&bash_wake)),
+            on_background_work_settled: Some(bash_wake),
             queued_goal_context_purge: None,
             queued_steering_probe: None,
             should_stop_after_turn: None,
@@ -781,6 +863,7 @@ pub(crate) async fn build_headless_engine_with(
         model,
         api_key: resolved.api_key,
         provider_target,
+        rpc_bash_wake,
     })
 }
 
@@ -1482,6 +1565,7 @@ async fn run_prompts_and_emit(
                 global_harness_dir.clone(),
                 &autonomous_state,
                 &command,
+                &images,
             )
             .await;
             if let Some(error) = execution.error {
@@ -1897,17 +1981,22 @@ mod tests {
         )
         .unwrap();
         let built_manager = crate::mcp_login::cli_mcp_manager(&cwd, &agent_dir);
-        assert_eq!(
-            built_manager.get_enabled_persistent_generic_servers(),
-            vec!["fixture-echo".to_string()]
-        );
         let manager = std::sync::Arc::new(std::sync::Mutex::new(built_manager));
+        let gating_manager = std::sync::Arc::clone(&manager);
+        let enabled = tokio::task::spawn_blocking(move || {
+            gating_manager
+                .lock()
+                .unwrap()
+                .get_enabled_persistent_generic_servers()
+        })
+        .await
+        .unwrap();
+        assert_eq!(enabled, vec!["fixture-echo".to_string()]);
         let mut handlers = pa_core::kernel::shared::HostRequestHandlers::default();
         pa_core::mcp::McpManager::register_host_handlers(&manager, &mut handlers);
         let config = handlers.get("mcp.config").unwrap().clone();
         let result = config(pa_core::kernel::shared::HostRequestPayload {
             data: serde_json::json!({ "server": "fixture-echo" }),
-            cell_source_code: None,
         })
         .await
         .unwrap();
@@ -1928,17 +2017,19 @@ mod tests {
             .to_string(),
         )
         .unwrap();
-        {
-            let mut manager = manager.lock().unwrap();
+        let gating_manager = std::sync::Arc::clone(&manager);
+        tokio::task::spawn_blocking(move || {
+            let mut manager = gating_manager.lock().unwrap();
             manager.refresh();
             assert_eq!(
                 manager.get_enabled_persistent_generic_servers(),
                 vec!["second-echo".to_string()]
             );
-        }
+        })
+        .await
+        .unwrap();
         let result = config(pa_core::kernel::shared::HostRequestPayload {
             data: serde_json::json!({ "server": "second-echo" }),
-            cell_source_code: None,
         })
         .await
         .unwrap();
@@ -1948,7 +2039,6 @@ mod tests {
         );
         let withdrawn = config(pa_core::kernel::shared::HostRequestPayload {
             data: serde_json::json!({ "server": "fixture-echo" }),
-            cell_source_code: None,
         })
         .await
         .unwrap();

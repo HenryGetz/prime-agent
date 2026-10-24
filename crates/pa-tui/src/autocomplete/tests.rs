@@ -256,21 +256,15 @@ fn at_prefix_lists_nested_fuzzy_matches() {
     std::fs::write(base.join("other.md"), "x").expect("write");
     let provider = provider(base.to_str().unwrap());
     let values = |text: &str| -> Vec<String> {
-        match provider.get_suggestions(&[text.to_string()], 0, text.chars().count(), false) {
-            Some(SuggestionLookup::Searching(search)) => search
-                .results
-                .recv()
-                .expect("the search finishes")
-                .expect("suggestions")
-                .items
-                .into_iter()
-                .map(|item| item.value)
-                .collect(),
-            other => panic!("expected a searching lookup, got {other:?}"),
-        }
+        at_suggestions(&provider, text)
+            .expect("suggestions")
+            .items
+            .into_iter()
+            .map(|item| item.value)
+            .collect()
     };
-    // The exact `.hidden/partial` name (score 100) sorts ahead of
-    // the `partial_match.rs` prefix match (80); `.git` never lists.
+    // The exact `.hidden/partial` name sorts ahead of the
+    // `partial_match.rs` prefix match; `.git` never lists.
     assert_eq!(
         values("see @partial"),
         ["@.hidden/partial", "@src/deep/partial_match.rs"]
@@ -601,16 +595,100 @@ fn render_shows_the_source_tag_as_a_trailing_segment() {
     );
 }
 
-/// The `@` suggestion items of one provider query, waiting for the background search.
-fn at_values(provider: &CombinedAutocompleteProvider, text: &str) -> Vec<CompletionItem> {
+/// One `@` provider query's answer: the built index's inline one, or the background
+/// walk's once it finishes.
+fn at_suggestions(provider: &CombinedAutocompleteProvider, text: &str) -> Option<Suggestions> {
     match provider.get_suggestions(&[text.to_string()], 0, text.chars().count(), false) {
-        Some(SuggestionLookup::Searching(search)) => search
-            .results
-            .recv()
-            .expect("the search finishes")
-            .map(|suggestions| suggestions.items)
-            .unwrap_or_default(),
-        other => panic!("expected a searching lookup, got {other:?}"),
+        Some(SuggestionLookup::Searching(search)) => {
+            search.results.recv().expect("the search finishes")
+        }
+        Some(SuggestionLookup::Ready(suggestions)) => Some(suggestions),
+        None => None,
+    }
+}
+
+/// The `@` suggestion items of one provider query.
+fn at_values(provider: &CombinedAutocompleteProvider, text: &str) -> Vec<CompletionItem> {
+    at_suggestions(provider, text)
+        .map(|suggestions| suggestions.items)
+        .unwrap_or_default()
+}
+
+/// The `@` item values of one provider query.
+fn at_item_values(provider: &CombinedAutocompleteProvider, text: &str) -> Vec<String> {
+    at_values(provider, text)
+        .into_iter()
+        .map(|item| item.value)
+        .collect()
+}
+
+/// A typed directory scope with an empty query lists the directory's children.
+#[test]
+fn at_directory_scope_lists_its_children() {
+    let base = tempfile::TempDir::new().expect("temp dir");
+    std::fs::create_dir_all(base.path().join("prime-agent/src")).expect("mkdir");
+    for file in [
+        "prime-agent/src/lib.rs",
+        "prime-agent/README.md",
+        "prime-agent/Cargo.toml",
+        "prime-agent/.env",
+        "other.md",
+    ] {
+        std::fs::write(base.path().join(file), "x").expect("write");
+    }
+    let provider = provider(base.path().to_str().expect("utf8"));
+    assert_eq!(
+        at_item_values(&provider, "@prime-agent/"),
+        [
+            "@prime-agent/src/",
+            "@prime-agent/README.md",
+            "@prime-agent/Cargo.toml",
+            "@prime-agent/src/lib.rs",
+            "@prime-agent/.env",
+        ]
+    );
+}
+
+/// The `@` ranking: match class, hidden entries below unless the query is dotted, fewer
+/// segments, fewer chars, directories before files, then byte order.
+#[test]
+fn at_ranking_orders_by_class_hidden_and_length() {
+    let base = tempfile::TempDir::new().expect("temp dir");
+    for dir in ["main/", "main.d/", "src/", ".github/", "deploy/k8s/"] {
+        std::fs::create_dir_all(base.path().join(dir)).expect("mkdir");
+    }
+    for file in [
+        "main.c",
+        "main.rs",
+        "main.json",
+        "src/main.rs",
+        "src/domain.rs",
+        ".mainrc",
+        ".github/main.yml",
+        "deploy/k8s/app.yml",
+    ] {
+        std::fs::write(base.path().join(file), "x").expect("write");
+    }
+    let provider = provider(base.path().to_str().expect("utf8"));
+    for (query, expected) in [
+        (
+            "@main",
+            vec![
+                "@main/",
+                "@main.d/",
+                "@main.c",
+                "@main.rs",
+                "@main.json",
+                "@src/main.rs",
+                "@.github/main.yml",
+                "@src/domain.rs",
+                "@.mainrc",
+            ],
+        ),
+        ("@yml", vec!["@deploy/k8s/app.yml", "@.github/main.yml"]),
+        ("@.yml", vec!["@.github/main.yml", "@deploy/k8s/app.yml"]),
+    ] {
+        assert_eq!(at_item_values(&provider, query), expected, "query {query}");
     }
 }
 
@@ -667,6 +745,21 @@ fn at_index_matches_the_walk_suggestions() {
             "query @{query}"
         );
     }
+}
+
+#[test]
+fn at_lookup_answers_inline_from_a_built_index() {
+    let outer = parity_fixture();
+    let base = outer.path().join("base");
+    let provider = provider(base.to_str().expect("utf8"));
+    assert!(provider
+        .file_index
+        .build(&base, file_index::MAX_INDEX_ENTRIES));
+    let text = "@par";
+    assert!(matches!(
+        provider.get_suggestions(&[text.to_string()], 0, text.len(), false),
+        Some(SuggestionLookup::Ready(_))
+    ));
 }
 
 /// A xorshift generator: the random trees need no dependency.
