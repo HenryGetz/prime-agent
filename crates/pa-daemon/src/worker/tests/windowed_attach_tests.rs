@@ -386,6 +386,71 @@ async fn pages_continue_into_pre_compaction_history_with_one_summary() {
     );
 }
 
+/// `rlm.session.messages` reads from the tail without hydrating a windowed
+/// store; each row carries its entry id, the cursor for the next older page.
+#[tokio::test]
+async fn a_tail_page_reads_a_windowed_store_without_hydrating_it() {
+    let dir = session_dir();
+    let path = dir.join("tail-read.jsonl");
+    let mut store = crate::session_store::SessionFile::create("/tmp", None, 0);
+    store.set_path(path.clone());
+    let ids: Vec<String> = (0..6)
+        .map(|index| {
+            store.append_message(
+                &json!({ "role": "user", "content": format!("m{index}"), "timestamp": 1000 }),
+            )
+        })
+        .collect();
+    store.rewrite().unwrap();
+
+    let worker = worker_over(&dir, &path).await;
+    let windowed = || {
+        worker
+            .core
+            .lock()
+            .unwrap()
+            .store
+            .as_ref()
+            .is_some_and(|store| store.window.is_some())
+    };
+    assert!(windowed(), "the session opens windowed");
+    let page_rows = |data: &Value| -> Vec<(String, String)> {
+        let ids = data["entryIds"].as_array().expect("entry ids");
+        let messages = data["messages"].as_array().expect("messages");
+        assert_eq!(ids.len(), messages.len(), "one entry id per message");
+        ids.iter()
+            .zip(messages)
+            .map(|(id, message)| {
+                (
+                    id.as_str().unwrap().to_string(),
+                    message["content"].as_str().unwrap().to_string(),
+                )
+            })
+            .collect()
+    };
+    let expected = |range: std::ops::Range<usize>| -> Vec<(String, String)> {
+        range
+            .map(|index| (ids[index].clone(), format!("m{index}")))
+            .collect()
+    };
+
+    let tail = page(&worker, json!({ "from": "end", "limit": 2 }), None).await;
+    let tail = tail.data.expect("tail data");
+    assert_eq!(page_rows(&tail), expected(4..6));
+    assert_eq!(tail["more"], true);
+    assert!(windowed(), "a tail page leaves the window in place");
+
+    let older = page(
+        &worker,
+        json!({ "from": "end", "before": ids[4], "limit": 10 }),
+        None,
+    )
+    .await;
+    let older = older.data.expect("older data");
+    assert_eq!(page_rows(&older), expected(0..4));
+    assert_eq!(older["more"], false);
+}
+
 #[tokio::test]
 async fn a_windowed_attach_preserves_iso_and_fractional_prompt_times() {
     for timestamp in [

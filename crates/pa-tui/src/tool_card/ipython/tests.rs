@@ -382,6 +382,33 @@ fn bash_dominated_cell_renders_as_bash() {
 }
 
 #[test]
+fn transcript_reads_render_one_summary_row_below_the_summary() {
+    let card = cell_card(
+        "users = [m async for m in rlm.session.iter_messages(role='user')]",
+        json!({
+            "status": "ok",
+            "durationMs": 40,
+            "transcriptReads": { "pages": 3, "messages": 150 },
+        }),
+        false,
+        false,
+    );
+    let lines = render(&card, 0, Detail::Overview, &theme(), 100, true);
+    let rows: Vec<String> = lines.iter().map(text_of).collect();
+    assert_eq!(
+        rows[1..],
+        [" \u{2261} transcript \u{b7} read 150 messages in 3 pages"]
+    );
+    for detail in [Detail::Overview, Detail::All] {
+        assert_eq!(
+            count(&card, 0, detail, &theme(), 100, true),
+            render(&card, 0, detail, &theme(), 100, true).len(),
+            "the row count matches the painted rows"
+        );
+    }
+}
+
+#[test]
 fn bash_minority_cell_stays_python() {
     let code = "async def sh(cmd):\n    return await bash(cmd)\nr = await sh(\"ls\")\nprint(r.pid)";
     let card = cell_card(

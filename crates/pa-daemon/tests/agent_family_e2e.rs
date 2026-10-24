@@ -1292,3 +1292,165 @@ async fn parent_renames_a_child_end_to_end() {
         .expect("the child's ledger edge");
     assert_eq!(edge.name, "bench-runner", "the ledger rename landed");
 }
+
+/// The cell that pages through its own transcript (the whole branch newest
+/// first, cursor reads in both directions, the user rows) and records what
+/// `rlm.session.messages` returned.
+fn transcript_cell(receipts_dir: &Path) -> String {
+    let receipt_path = receipts_dir.join("transcript.json").display().to_string();
+    let error_path = receipts_dir.join("transcript.error").display().to_string();
+    format!(
+        "import json, traceback\ntry:\n    newest = [m async for m in rlm.session.iter_messages()]\n    older = await rlm.session.messages(limit=2, before=\"m5\")\n    newer = await rlm.session.messages(limit=2, after=older[-1].id)\n    users = await rlm.session.messages(limit=10, role=\"user\")\n    open({receipt_path:?}, \"w\").write(json.dumps({{\"newest\": [[m.id, m.role, m.text] for m in newest], \"older\": [m.id for m in older], \"newer\": [m.id for m in newer], \"users\": [m.text for m in users]}}))\nexcept Exception:\n    open({error_path:?}, \"w\").write(traceback.format_exc())\n    raise",
+    )
+}
+
+/// `rlm.session.messages` end to end: a kernel cell in a windowed daemon
+/// session pages through its own transcript via the real host handler and
+/// supervisor route, past the window into the rows its compaction summarized
+/// away (the summary in place), and the cell's tool result sums the pages.
+#[tokio::test]
+async fn session_messages_pages_through_the_transcript_end_to_end() {
+    let Some(kernel_python) = kernel_python() else {
+        return;
+    };
+    let dir = tempfile::TempDir::new().expect("temp dir");
+    let socket = dir.path().join("daemon.sock");
+    let agent_dir = dir.path().join("agent");
+    let sessions_dir = agent_dir.join("sessions");
+    std::fs::create_dir_all(&sessions_dir).expect("sessions dir");
+    let receipts_dir = dir.path().join("receipts");
+    std::fs::create_dir_all(&receipts_dir).expect("receipts dir");
+
+    let time = "2026-01-01T00:00:00.000Z";
+    let user = |id: &str, parent: Option<&str>, text: &str| {
+        json!({
+            "type": "message",
+            "id": id,
+            "parentId": parent,
+            "timestamp": time,
+            "message": { "role": "user", "content": text, "timestamp": 1000 },
+        })
+    };
+    let rows = [
+        json!({ "type": "session", "version": 3, "id": "transcript-e2e", "timestamp": time, "cwd": dir.path().to_string_lossy() }),
+        user("m1", None, "the first prompt"),
+        user("m2", Some("m1"), "compacted away"),
+        user("m3", Some("m2"), "kept"),
+        json!({
+            "type": "compaction",
+            "id": "m4",
+            "parentId": "m3",
+            "timestamp": time,
+            "summary": "the story",
+            "firstKeptEntryId": "m3",
+            "tokensBefore": 4000,
+        }),
+        user("m5", Some("m4"), "after compaction"),
+    ];
+    let session_path = sessions_dir.join("transcript-e2e.jsonl");
+    std::fs::write(
+        &session_path,
+        format!(
+            "{}\n",
+            rows.iter()
+                .map(Value::to_string)
+                .collect::<Vec<_>>()
+                .join("\n")
+        ),
+    )
+    .expect("write session");
+    let script = write_faux_script(
+        dir.path(),
+        "reader",
+        &cell_turn(&transcript_cell(&receipts_dir)),
+    );
+
+    let _daemon = spawn_supervisor(&socket, &agent_dir, &kernel_python);
+    wait_socket_ready(&socket);
+    let (mut client, hello) = Client::connect(&socket);
+    assert_eq!(hello["type"], "daemon_hello");
+    client.send_command(
+        "create-reader",
+        &json!({
+            "type": "create",
+            "sessionPath": session_path.to_string_lossy(),
+            "config": {
+                "cwd": dir.path().to_string_lossy(),
+                "sessionDir": sessions_dir.to_string_lossy(),
+                "script": script.to_string_lossy(),
+            },
+        }),
+    );
+    let created = client.read_response("create-reader");
+    assert_eq!(created["success"], true, "create failed: {created}");
+    let active_session_id = created["data"]["activeSessionId"]
+        .as_str()
+        .or_else(|| created["data"]["id"].as_str())
+        .expect("active session id")
+        .to_string();
+
+    client.send_command(
+        "prompt-reader",
+        &json!({
+            "type": "prompt_and_wait",
+            "activeSessionId": active_session_id,
+            "message": "read the transcript",
+        }),
+    );
+    let turn = client.read_response("prompt-reader");
+    assert_eq!(turn["success"], true, "turn failed: {turn}");
+    if let Ok(error) = std::fs::read_to_string(receipts_dir.join("transcript.error")) {
+        panic!("transcript cell failed: {error}");
+    }
+    let read = read_recorded(&receipts_dir, "transcript.json");
+    let mut oldest_first = read["newest"].as_array().expect("newest rows").clone();
+    oldest_first.reverse();
+    assert_eq!(
+        oldest_first[..5],
+        [
+            json!(["m1", "user", "the first prompt"]),
+            json!(["m2", "user", "compacted away"]),
+            json!(["m3", "user", "kept"]),
+            json!(["m4", "compactionSummary", "the story"]),
+            json!(["m5", "user", "after compaction"]),
+        ],
+        "the whole branch, the compacted rows included: {read}"
+    );
+    assert_eq!(
+        oldest_first[5].as_array().expect("the prompt row")[1..],
+        [json!("user"), json!("read the transcript")]
+    );
+    assert_eq!(read["older"], json!(["m4", "m3"]));
+    assert_eq!(read["newer"], json!(["m4", "m5"]));
+    assert_eq!(
+        read["users"],
+        json!([
+            "read the transcript",
+            "after compaction",
+            "kept",
+            "compacted away",
+            "the first prompt",
+        ])
+    );
+
+    client.send_command(
+        "messages-reader",
+        &json!({ "type": "get_messages", "activeSessionId": active_session_id }),
+    );
+    let messages = client.read_response("messages-reader");
+    let cell_result = messages["data"]["messages"]
+        .as_array()
+        .expect("messages")
+        .iter()
+        .find(|message| message["role"] == "toolResult")
+        .expect("the cell's tool result")
+        .clone();
+    // The windowed tail page, the page past the window, then one page per
+    // later read: `older` (four rows), `newer` (all after m3), `users` (all).
+    let total = oldest_first.len();
+    assert_eq!(
+        cell_result["details"]["transcriptReads"],
+        json!({ "pages": 5, "messages": 3 * total + 1 }),
+        "the cell's page reads ride the tool result: {cell_result}"
+    );
+}

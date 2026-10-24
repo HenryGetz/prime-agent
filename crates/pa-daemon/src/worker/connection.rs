@@ -851,7 +851,7 @@ impl Worker {
                         page.more.then(|| store.last_user_prompt_ms()).flatten();
                     (
                         page.messages,
-                        page.first_entry_id.filter(|_| page.more),
+                        page.entry_ids.into_iter().next().filter(|_| page.more),
                         last_user_prompt_ms,
                     )
                 }),

@@ -4,7 +4,9 @@ from __future__ import annotations
 
 import sys
 import types
+from collections.abc import AsyncIterator
 from dataclasses import dataclass
+from datetime import datetime
 from pathlib import Path
 from typing import Any
 
@@ -82,6 +84,21 @@ class RLMSubagent:
 class RLMProgressNoteResult:
     accepted: bool
     retry_after_ms: int | None = None
+
+
+@dataclass(frozen=True)
+class RLMMessage:
+    """One message of this session's transcript, from `rlm.session.messages()`.
+
+    `id` is the message's entry id, the cursor for the next page. `raw` is the
+    stored message (tool calls, thinking, tool-result details).
+    """
+
+    id: str
+    role: str
+    text: str
+    timestamp: int | None
+    raw: dict[str, Any]
 
 
 @dataclass(frozen=True)
@@ -628,8 +645,103 @@ class _RLMFactoryNamespace:
         return FACTORY_HELP
 
 
+# Display MIME the host sums into the cell card's transcript row: one per page.
+_TRANSCRIPT_READ_MIME = "application/vnd.prime-agent.transcript-read+json"
+# Messages per transcript page fetched from the host.
+_PAGE_SIZE = 50
+
+
+def _message_text(message: dict[str, Any]) -> str:
+    role = message["role"]
+    if role in ("compactionSummary", "branchSummary"):
+        return message.get("summary", "")
+    if role == "bashExecution":
+        return "\n".join(part for part in (message.get("command"), message.get("output")) if part)
+    content = message.get("content")
+    if isinstance(content, str):
+        return content
+    return "\n".join(block["text"] for block in content or [] if block.get("type") == "text")
+
+
+def _message_timestamp(message: dict[str, Any]) -> int | None:
+    value = message.get("timestamp")
+    if isinstance(value, str):
+        # Custom rows carry their row's ISO time; every other row carries epoch ms.
+        return int(datetime.fromisoformat(value).timestamp() * 1000)
+    return None if value is None else int(value)
+
+
+class _RLMSessionNamespace:
+    """This session's own transcript as data: ``await rlm.session.messages()``."""
+
+    async def messages(
+        self,
+        limit: int = 50,
+        before: str | None = None,
+        after: str | None = None,
+        role: str | None = None,
+    ) -> list[RLMMessage]:
+        """Return up to ``limit`` messages of this session's transcript.
+
+        The first ``limit`` messages of ``iter_messages(before=, after=, role=)``:
+        newest first without ``after``, oldest first with it. The next page is
+        the same call with ``msgs[-1].id`` as the same cursor.
+        """
+        if limit < 1:
+            raise ValueError("limit must be at least 1")
+        messages: list[RLMMessage] = []
+        async for message in self.iter_messages(before=before, after=after, role=role):
+            messages.append(message)
+            if len(messages) == limit:
+                break
+        return messages
+
+    async def iter_messages(
+        self,
+        before: str | None = None,
+        after: str | None = None,
+        role: str | None = None,
+    ) -> AsyncIterator[RLMMessage]:
+        """Iterate this session's transcript on the active branch, a page at a time.
+
+        It includes the messages a compaction summarized away; each compaction
+        appears in place as one ``compactionSummary`` message. Without a cursor
+        it walks back from the newest message; ``before=<id>`` walks back from
+        just before that message; ``after=<id>`` walks forward from just after
+        it (stopping before ``before`` when both are given). ``role`` keeps only
+        messages of that role (``"user"``, ``"assistant"``, ``"toolResult"``,
+        ``"custom"``, ...).
+        """
+        forward = after is not None
+        cursor = after if forward else before
+        while True:
+            if forward:
+                page = {"from": "start", "after": cursor, "until": before, "limit": _PAGE_SIZE}
+            else:
+                page = {"from": "end", "before": cursor, "limit": _PAGE_SIZE}
+            reply = await host_request("rlm.session.messages", {"page": page})
+            rows = list(zip(reply["entryIds"], reply["messages"]))
+            emit({_TRANSCRIPT_READ_MIME: {"messages": len(rows)}})
+            if not forward:
+                rows.reverse()
+            for entry_id, row in rows:
+                if role is None or row["role"] == role:
+                    yield RLMMessage(
+                        id=entry_id,
+                        role=row["role"],
+                        text=_message_text(row),
+                        timestamp=_message_timestamp(row),
+                        raw=row,
+                    )
+            if not reply["more"] or not rows:
+                return
+            # The page's far end, not the last match: a page with no match still advances.
+            cursor = rows[-1][0]
+
+
 class _RLMNamespace:
     harness = _harness_state
+    session = _RLMSessionNamespace()
     get_harness_state = staticmethod(get_harness_state)
 
     async def spawn(
@@ -708,6 +820,7 @@ __all__ = [
     "McpToolError",
     "NotEnabled",
     "RLMCreateSessionHandle",
+    "RLMMessage",
     "RLMModel",
     "RLMProgressNoteResult",
     "RLMSpawnHandle",

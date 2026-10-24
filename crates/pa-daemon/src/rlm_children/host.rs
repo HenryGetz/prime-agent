@@ -10,7 +10,7 @@ use super::{
     RlmCreateSessionRequest, RlmDeleteSubagentResult, RlmHostFuture, RlmSpawnHandle,
     RlmSpawnRequest, RlmSubagentEntry, RlmSubagentHost, SpawnNameReservationGuard,
     SupervisorChildSessions, SupervisorChildSessionsInner, Value, KILL_TIMEOUT_MS,
-    RENAME_TIMEOUT_MS,
+    RENAME_TIMEOUT_MS, STATE_TIMEOUT_MS,
 };
 
 /// Resolve the child model with the daemon `allowedModels` allowlist enforced, refusing loudly with
@@ -739,6 +739,22 @@ impl RlmSubagentHost for SupervisorChildSessions {
                 record.lock().await.session_name = name.clone();
             }
             Ok(name)
+        })
+    }
+
+    /// The same `get_messages` page the TUI scrolls with, image payloads
+    /// left out.
+    fn session_messages(&self, page: pa_types::daemon::TranscriptPage) -> RlmHostFuture<Value> {
+        let this = Arc::clone(&self.inner);
+        Box::pin(async move {
+            let command = DaemonCommand::GetMessages {
+                id: None,
+                active_session_id: this.parent_active_session_id.clone(),
+                page: Some(page),
+                capabilities: Some(vec!["elide_snapshot_images".to_string()]),
+                rest: serde_json::Map::default(),
+            };
+            this.command(&command, STATE_TIMEOUT_MS).await
         })
     }
 }

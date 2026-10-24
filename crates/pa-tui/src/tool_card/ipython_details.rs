@@ -1,7 +1,7 @@
 //! Parsing of ipython execution `details` for the cell card: the
 //! details record, the background-shell handle repr, literal shell
-//! launches, and the edit-confirmation and agent-message-receipt
-//! suppressions.
+//! launches, the transcript reads, and the edit-confirmation and
+//! agent-message-receipt suppressions.
 
 use serde_json::Value;
 
@@ -18,6 +18,7 @@ pub(crate) struct IpythonDetails {
     pub(crate) diffs: Vec<Value>,
     pub(crate) sent_agent_messages: Vec<Value>,
     pub(crate) bash_commands: Option<BashCommands>,
+    pub(crate) transcript_reads: Option<TranscriptReads>,
 }
 
 pub(crate) struct IpythonError {
@@ -47,6 +48,34 @@ fn read_bash_commands(value: &Value) -> Option<BashCommands> {
             .as_u64()
             .and_then(|lines| usize::try_from(lines).ok())?,
     })
+}
+
+/// `transcriptReads`: the transcript pages the cell's `rlm.session.messages`
+/// reads fetched.
+pub(crate) struct TranscriptReads {
+    pages: u64,
+    messages: u64,
+}
+
+impl TranscriptReads {
+    fn parse(value: &Value) -> Option<TranscriptReads> {
+        let count = |key: &str| value.get(key).and_then(Value::as_u64);
+        Some(TranscriptReads {
+            pages: count("pages")?,
+            messages: count("messages")?,
+        })
+    }
+
+    /// `read 150 messages in 3 pages`.
+    pub(crate) fn summary(&self) -> String {
+        let plural =
+            |count: u64, noun: &str| format!("{count} {noun}{}", if count == 1 { "" } else { "s" });
+        format!(
+            "read {} in {}",
+            plural(self.messages, "message"),
+            plural(self.pages, "page")
+        )
+    }
 }
 
 pub(crate) fn read_error_details(value: &Value) -> Option<IpythonError> {
@@ -86,6 +115,7 @@ impl IpythonDetails {
             diffs: Vec::new(),
             sent_agent_messages: Vec::new(),
             bash_commands: None,
+            transcript_reads: None,
         };
         let Some(record) = details.as_object() else {
             return empty;
@@ -131,6 +161,9 @@ impl IpythonDetails {
                 .cloned()
                 .unwrap_or_default(),
             bash_commands: record.get("bashCommands").and_then(read_bash_commands),
+            transcript_reads: record
+                .get("transcriptReads")
+                .and_then(TranscriptReads::parse),
         }
     }
 }
