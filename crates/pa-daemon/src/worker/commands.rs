@@ -470,7 +470,7 @@ impl Worker {
             Some(_) => {
                 return response_failure(None, "get_messages", "History branch changed", None);
             }
-            None => store.leaf_id.clone().unwrap_or_default(),
+            None => store.leaf_id().unwrap_or_default().to_string(),
         };
         let Some(mut rows) = store.transcript_page(&page) else {
             return response_failure(None, "get_messages", "History branch changed", None);
@@ -524,8 +524,9 @@ impl Worker {
             Err(error) => return response_failure(None, NAME, &error.to_string(), None),
         };
         let read = || {
-            let core = self.core.lock().unwrap();
-            let slice = core.store.as_ref().and_then(|store| {
+            let mut core = self.core.lock().unwrap();
+            let core = &mut *core;
+            let slice = core.store.as_mut().and_then(|store| {
                 store.session_messages(
                     start,
                     limit,
