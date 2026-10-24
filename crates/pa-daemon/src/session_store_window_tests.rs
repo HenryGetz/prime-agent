@@ -2,8 +2,7 @@ use super::*;
 
 /// The attribution fold survives the windowed fast open on both sides of the
 /// compaction boundary: the windowed store's `session_stats` equals the full
-/// open's — the ACTIVE totals (TS cuts `state.messages` at the compaction) —
-/// never losing or double-counting the attributed child spend.
+/// open's, never losing or double-counting the attributed child spend.
 #[test]
 fn windowed_open_folds_attributions_on_both_sides_of_the_boundary() {
     let dir = tempfile::tempdir().unwrap();
@@ -73,18 +72,17 @@ fn windowed_open_folds_attributions_on_both_sides_of_the_boundary() {
         json!(150)
     );
     assert!(windowed.entry(&old).is_none());
-    // Windowed and full opens agree on the ACTIVE stats: the pre-cut ancestry
-    // is spend the active stats must not report (the pre-cut fold survives on
-    // the whole-file surfaces).
+    // Windowed and full opens agree on the stats: the branch spend counts both
+    // attributed aggregates, the pre-cut one through the window's older path.
     assert_eq!(
         crate::session_stats::session_stats(&windowed, None),
         crate::session_stats::session_stats(&full, None)
     );
     let stats = crate::session_stats::session_stats(&full, None);
-    assert_eq!(stats["tokens"]["input"], json!(10));
-    assert_eq!(stats["tokens"]["output"], json!(3));
-    assert_eq!(stats["tokens"]["cacheRead"], json!(0));
-    assert_eq!(stats["cost"].as_f64(), Some(0.03));
+    assert_eq!(stats["tokens"]["input"], json!(150 + 10));
+    assert_eq!(stats["tokens"]["output"], json!(15 + 3));
+    assert_eq!(stats["tokens"]["cacheRead"], json!(5));
+    assert!((stats["cost"].as_f64().unwrap() - (0.165 + 0.03)).abs() < 1e-12);
 }
 
 #[test]
