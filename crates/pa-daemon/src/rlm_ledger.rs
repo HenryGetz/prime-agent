@@ -109,38 +109,6 @@ pub struct RlmSpawnInput {
     pub name: String,
 }
 
-#[derive(Debug, Default)]
-pub(crate) struct FamilyTopology {
-    pub(crate) edges: Vec<RlmLedgerEdge>,
-    pub(crate) canonical_children: Vec<PathBuf>,
-    pub(crate) parent_by_child: HashMap<PathBuf, PathBuf>,
-    pub(crate) children_by_parent: HashMap<PathBuf, Vec<usize>>,
-}
-
-impl FamilyTopology {
-    pub(crate) fn descendants(&self, root: &Path) -> Vec<usize> {
-        let mut visited = HashSet::from([root.to_path_buf()]);
-        let mut queue = vec![root.to_path_buf()];
-        let mut descendants = Vec::new();
-        while let Some(parent) = queue.pop() {
-            for at in self
-                .children_by_parent
-                .get(&parent)
-                .map(Vec::as_slice)
-                .unwrap_or_default()
-            {
-                let child = &self.canonical_children[*at];
-                if !visited.insert(child.clone()) {
-                    continue;
-                }
-                descendants.push(*at);
-                queue.push(child.clone());
-            }
-        }
-        descendants
-    }
-}
-
 /// The per-sessions-dir spawn ledger. Reads are guarded by a file stat snapshot; a missing ledger
 /// is seeded from the legacy registries (seed failure degrades to empty, never fail-closed).
 pub struct RlmSpawnLedger {
@@ -259,6 +227,18 @@ fn fold_records(records: Vec<LedgerRecord>, keep: impl Fn(&str) -> bool) -> Repl
                 }
             }
             _ => {}
+        }
+    }
+    for (at, edge) in state.edges.iter().enumerate() {
+        if edge.deleted.is_some() {
+            continue;
+        }
+        if let Some(id) = Path::new(&edge.parent).file_stem() {
+            state
+                .children_by_parent_id
+                .entry(id.to_string_lossy().into_owned())
+                .or_default()
+                .push(at);
         }
     }
     state
@@ -539,7 +519,23 @@ impl RlmSpawnLedger {
         Ok(usage)
     }
 
-    pub(crate) fn family_topology(&self) -> Result<Arc<FamilyTopology>> {
+    /// The live family below `roots`, walked through the replay's parent
+    /// index: the cost follows the families' size, not the ledger's. Each
+    /// call re-resolves the endpoints it visits (restore, relocation,
+    /// deletion, and symlink retargets append no ledger row). A node's
+    /// children are the live edges recorded under its durable session id -
+    /// that of its canonical path or of the path it was reached by - whose
+    /// resolved parent is the node itself. Edges carry canonical endpoints,
+    /// in walk order; each descendant appears once.
+    ///
+    /// # Errors
+    ///
+    /// Returns an error when the ledger replay fails (an oversized ledger)
+    /// or a prior panic poisoned the artifact index lock.
+    pub(crate) fn family_edges(
+        &self,
+        roots: impl IntoIterator<Item = PathBuf>,
+    ) -> Result<Vec<RlmLedgerEdge>> {
         self.seed_once()?;
         let state = self.replay_cached()?;
         let mut resolver = LivePathResolver::new(
@@ -547,39 +543,52 @@ impl RlmSpawnLedger {
             self.canonical_sessions_dir.clone(),
             &state.artifact_index,
         );
-        // Endpoint liveness and relocation are filesystem state, not ledger
-        // state: restore and top-level artifact sweeps do not append a row.
-        let mut edges = resolve_live_edges(&state, &mut resolver)?;
-        for edge in &mut edges {
-            edge.child = canonical_session_path(Path::new(&edge.child))
-                .to_string_lossy()
-                .into_owned();
-            edge.parent = canonical_session_path(Path::new(&edge.parent))
-                .to_string_lossy()
-                .into_owned();
+        let mut visited = HashSet::new();
+        let mut queue = Vec::new();
+        for root in roots {
+            let node = canonical_session_path(&root);
+            if visited.insert(node.clone()) {
+                queue.push((node, root));
+            }
         }
-        let mut cached = state.family_topology.lock().expect("family topology lock");
-        if let Some(topology) = cached.as_ref().filter(|topology| topology.edges == edges) {
-            return Ok(Arc::clone(topology));
+        let mut edges = Vec::new();
+        while let Some((node, reached_by)) = queue.pop() {
+            let mut ids = vec![node.file_stem()];
+            if reached_by.file_stem() != node.file_stem() {
+                ids.push(reached_by.file_stem());
+            }
+            for id in ids.into_iter().flatten() {
+                let Some(indices) = state
+                    .children_by_parent_id
+                    .get(id.to_string_lossy().as_ref())
+                else {
+                    continue;
+                };
+                for &at in indices {
+                    let edge = &state.edges[at];
+                    let Some(parent) = resolver.resolve(&edge.parent)? else {
+                        continue;
+                    };
+                    if canonical_session_path(&parent) != node {
+                        continue;
+                    }
+                    let Some(child) = resolver.resolve(&edge.child)? else {
+                        continue;
+                    };
+                    let child = canonical_session_path(&child);
+                    if !visited.insert(child.clone()) {
+                        continue;
+                    }
+                    edges.push(RlmLedgerEdge {
+                        parent: node.to_string_lossy().into_owned(),
+                        child: child.to_string_lossy().into_owned(),
+                        ..edge.clone()
+                    });
+                    queue.push((child, PathBuf::from(&edge.child)));
+                }
+            }
         }
-        let mut topology = FamilyTopology {
-            edges,
-            ..Default::default()
-        };
-        for edge in &topology.edges {
-            let child = PathBuf::from(&edge.child);
-            let parent = PathBuf::from(&edge.parent);
-            topology
-                .children_by_parent
-                .entry(parent.clone())
-                .or_default()
-                .push(topology.canonical_children.len());
-            topology.canonical_children.push(child.clone());
-            topology.parent_by_child.insert(child, parent);
-        }
-        let topology = Arc::new(topology);
-        *cached = Some(Arc::clone(&topology));
-        Ok(topology)
+        Ok(edges)
     }
 
     fn fold_deleted_descendant_usage(

@@ -24,13 +24,13 @@ impl Supervisor {
         if roots.is_empty() {
             return;
         }
-        // The same ledger instance the topology snapshot read, so its
-        // replay cache carries deletions that land during this seed.
+        // The same ledger instance the family walk read, so its replay
+        // cache carries deletions that land during this seed.
         let Ok(ledger) = self.rlm_spawn_ledger_for(None).await else {
             return;
         };
-        let topology = match ledger.family_topology() {
-            Ok(topology) => topology,
+        let edges = match ledger.family_edges(roots) {
+            Ok(edges) => edges,
             Err(error) => {
                 self.log_line(&format!(
                     "Could not seed the agent roster from the spawn ledger: {error:#}"
@@ -38,50 +38,49 @@ impl Supervisor {
                 return;
             }
         };
+        let parent_by_child: HashMap<PathBuf, PathBuf> = edges
+            .iter()
+            .map(|edge| (PathBuf::from(&edge.child), PathBuf::from(&edge.parent)))
+            .collect();
         // Roots re-snapshot after the ledger awaits: a root that
         // stopped mid-read must not receive seeded rows.
         let roots = self.roster_seed_roots().await;
         let mut changed = Vec::new();
         let mut retry = Vec::new();
-        for (parent, indices) in &topology.children_by_parent {
-            if !family_descends_from(&topology.parent_by_child, parent, &roots) {
+        for edge in &edges {
+            let parent = Path::new(&edge.parent);
+            if !family_descends_from(&parent_by_child, parent, &roots) {
                 continue;
             }
-            for edge in indices.iter().map(|at| &topology.edges[*at]) {
-                let candidate = SeededRosterEntry::edge_only(edge);
-                // The collision guards run BEFORE the hydration read: a
-                // rostered row never re-reads its transcript, except an
-                // unhydrated seeded row.
-                if let Some(existing) = self.roster_row_for_candidate(&candidate) {
-                    if existing.seeded_cwd == Some(true) {
-                        retry.push(existing);
-                    }
-                    continue;
+            let candidate = SeededRosterEntry::edge_only(edge);
+            // The collision guards run BEFORE the hydration read: a
+            // rostered row never re-reads its transcript, except an
+            // unhydrated seeded row.
+            if let Some(existing) = self.roster_row_for_candidate(&candidate) {
+                if existing.seeded_cwd == Some(true) {
+                    retry.push(existing);
                 }
-                // Hydration reads one child at a time, outside the roster
-                // lock (a large ledger must not fan out).
-                let candidate = candidate.hydrate().await;
-                // The hydrate awaited, so both sides of the edge are
-                // revalidated: a stopped root or a tombstoned edge must
-                // not receive rows.
-                if !ledger.edge_is_live(&edge.child_id, &edge.child)
-                    || !family_descends_from(
-                        &topology.parent_by_child,
-                        parent,
-                        &self.roster_seed_roots().await,
-                    )
-                {
-                    continue;
-                }
-                let mut roster = self.roster.lock().unwrap();
-                // Re-check under the lock: never clobber a row that landed during the read.
-                if roster.get(&candidate.agent_id).is_some()
-                    || roster.has_session_file(&candidate.child_file)
-                {
-                    continue;
-                }
-                changed.push(roster.write_seeded(candidate.summary, candidate.seeded_cwd));
+                continue;
             }
+            // Hydration reads one child at a time, outside the roster
+            // lock (a large ledger must not fan out).
+            let candidate = candidate.hydrate().await;
+            // The hydrate awaited, so both sides of the edge are
+            // revalidated: a stopped root or a tombstoned edge must
+            // not receive rows.
+            if !ledger.edge_is_live(&edge.child_id, &edge.child)
+                || !family_descends_from(&parent_by_child, parent, &self.roster_seed_roots().await)
+            {
+                continue;
+            }
+            let mut roster = self.roster.lock().unwrap();
+            // Re-check under the lock: never clobber a row that landed during the read.
+            if roster.get(&candidate.agent_id).is_some()
+                || roster.has_session_file(&candidate.child_file)
+            {
+                continue;
+            }
+            changed.push(roster.write_seeded(candidate.summary, candidate.seeded_cwd));
         }
         self.push_seeded_rows(changed);
         // Unhydrated seeded rows the guards found already rostered retry here.
@@ -220,12 +219,11 @@ impl Supervisor {
         self: &Arc<Self>,
         root: &Path,
     ) -> Vec<AgentRosterEntry> {
-        let root = canonical_session_path(root);
         let Ok(ledger) = self.rlm_spawn_ledger_for(None).await else {
             return Vec::new();
         };
-        let topology = match ledger.family_topology() {
-            Ok(topology) => topology,
+        let edges = match ledger.family_edges([root.to_path_buf()]) {
+            Ok(edges) => edges,
             Err(error) => {
                 self.log_line(&format!(
                     "Could not seed the agent roster from the spawn ledger: {error:#}"
@@ -236,15 +234,15 @@ impl Supervisor {
         // The root's residency is revalidated after the awaits: a dead
         // root must not receive ghost family rows (the walk holds no
         // further await).
-        if !self.roster_seed_roots().await.contains(&root) {
+        if !self
+            .roster_seed_roots()
+            .await
+            .contains(&canonical_session_path(root))
+        {
             return Vec::new();
         }
-        // The family walk outside the roster lock: neither the descent
-        // check nor the ledger read may block every roster operation.
-        let candidates: Vec<&RlmLedgerEdge> = topology
-            .descendants(&root)
+        let candidates: Vec<&RlmLedgerEdge> = edges
             .iter()
-            .map(|at| &topology.edges[*at])
             // The edge snapshot predates this pass: a child deleted in
             // that window never seeds.
             .filter(|edge| ledger.edge_is_live(&edge.child_id, &edge.child))

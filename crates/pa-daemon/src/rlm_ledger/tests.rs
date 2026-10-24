@@ -1522,8 +1522,8 @@ fn artifact_misses_stay_cached_until_a_directory_changes() {
 }
 
 #[test]
-fn family_topology_tracks_restore_and_relocation_without_a_ledger_append() {
-    let dir = temp_dir("topology-disk-change");
+fn family_edges_track_restore_and_relocation_without_a_ledger_append() {
+    let dir = temp_dir("family-disk-change");
     let sessions = dir.join("sessions");
     fs::create_dir_all(&sessions).unwrap();
     let parent = sessions.join("parent.jsonl");
@@ -1541,75 +1541,76 @@ fn family_topology_tracks_restore_and_relocation_without_a_ledger_append() {
             name: "child".into(),
         })
         .unwrap();
-    let archive = crate::session_archive::archive_dir(&dir);
-    fs::create_dir_all(&archive).unwrap();
-    fs::rename(
-        &child,
-        archive.join(crate::session_store::session_file_name("child")),
-    )
-    .unwrap();
-    assert!(ledger
-        .family_topology()
-        .unwrap()
-        .descendants(&parent)
-        .is_empty());
-    crate::session_archive::restore_session(&archive, &sessions, "child").unwrap();
-    let restored = ledger.family_topology().unwrap();
-    assert_eq!(restored.descendants(&parent), vec![0]);
-    assert_eq!(
-        restored.canonical_children,
-        vec![canonical_session_path(&child)]
-    );
-    assert!(
-        Arc::ptr_eq(&restored, &ledger.family_topology().unwrap()),
-        "unchanged endpoints reuse the topology"
-    );
+    let family_children = || -> Vec<PathBuf> {
+        ledger
+            .family_edges([parent.clone()])
+            .unwrap()
+            .into_iter()
+            .map(|edge| PathBuf::from(edge.child))
+            .collect()
+    };
+    let archived = dir.join("sessions-archive").join("child.jsonl");
+    fs::create_dir_all(archived.parent().unwrap()).unwrap();
+    fs::rename(&child, &archived).unwrap();
+    assert!(family_children().is_empty());
+    fs::rename(&archived, &child).unwrap();
+    assert_eq!(family_children(), vec![canonical_session_path(&child)]);
     let relocated = dir.join("session-artifacts/parent/sub/child.jsonl");
     fs::create_dir_all(relocated.parent().unwrap()).unwrap();
     fs::rename(&child, &relocated).unwrap();
-    let moved = ledger.family_topology().unwrap();
-    assert_eq!(moved.descendants(&parent), vec![0]);
-    assert_eq!(
-        moved.canonical_children,
-        vec![canonical_session_path(&relocated)]
-    );
+    assert_eq!(family_children(), vec![canonical_session_path(&relocated)]);
     fs::remove_file(&relocated).unwrap();
-    assert!(ledger
-        .family_topology()
-        .unwrap()
-        .descendants(&parent)
-        .is_empty());
+    assert!(family_children().is_empty());
 }
 
 #[cfg(unix)]
 #[test]
-fn family_topology_rechecks_symlink_targets_without_a_ledger_append() {
+fn family_edges_recheck_symlink_targets_without_a_ledger_append() {
     use std::os::unix::fs::symlink;
-    let dir = temp_dir("topology-symlink");
+    let dir = temp_dir("family-symlink");
     let parent = dir.join("parent.jsonl");
     let first = dir.join("first.jsonl");
     let second = dir.join("second.jsonl");
-    for file in [&parent, &first, &second] {
+    let grandchild = dir.join("grandchild.jsonl");
+    for file in [&parent, &first, &second, &grandchild] {
         fs::write(file, "{}").unwrap();
     }
     let ledger = ledger_for(&dir);
-    ledger
-        .append_spawn(&RlmSpawnInput {
-            child_id: "sub".into(),
-            parent: parent.to_string_lossy().into(),
-            child: first.to_string_lossy().into(),
-            depth: 1,
-            name: "child".into(),
-        })
-        .unwrap();
+    for (child_id, parent, child) in [("sub", &parent, &first), ("grand", &first, &grandchild)] {
+        ledger
+            .append_spawn(&RlmSpawnInput {
+                child_id: child_id.into(),
+                parent: parent.to_string_lossy().into(),
+                child: child.to_string_lossy().into(),
+                depth: 1,
+                name: child_id.into(),
+            })
+            .unwrap();
+    }
+    let family_children = || -> Vec<PathBuf> {
+        ledger
+            .family_edges([parent.clone()])
+            .unwrap()
+            .into_iter()
+            .map(|edge| PathBuf::from(edge.child))
+            .collect()
+    };
     assert_eq!(
-        ledger.family_topology().unwrap().canonical_children,
-        vec![canonical_session_path(&first)]
+        family_children(),
+        vec![
+            canonical_session_path(&first),
+            canonical_session_path(&grandchild)
+        ]
     );
     fs::remove_file(&first).unwrap();
     symlink(&second, &first).unwrap();
+    // The retargeted child resolves to its new file; its own children,
+    // recorded under the old path's id, stay in the family.
     assert_eq!(
-        ledger.family_topology().unwrap().canonical_children,
-        vec![canonical_session_path(&second)]
+        family_children(),
+        vec![
+            canonical_session_path(&second),
+            canonical_session_path(&grandchild)
+        ]
     );
 }

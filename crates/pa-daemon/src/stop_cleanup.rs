@@ -42,19 +42,19 @@ fn session_tree(ledger: &RlmSpawnLedger, root_session_file: &Path) -> Vec<TreeMe
     }
     members.push(TreeMember {
         session_id: root_id,
-        session_file: root.clone(),
+        session_file: root,
     });
-    let Ok(topology) = ledger.family_topology() else {
+    let Ok(family) = ledger.family_edges([root_session_file.to_path_buf()]) else {
         return members;
     };
-    for at in topology.descendants(&root) {
-        let child = &topology.canonical_children[at];
-        let Some(info) = read_session_info(child) else {
+    for edge in family {
+        let child = PathBuf::from(edge.child);
+        let Some(info) = read_session_info(&child) else {
             continue;
         };
         members.push(TreeMember {
             session_id: info.id,
-            session_file: child.clone(),
+            session_file: child,
         });
     }
     members
