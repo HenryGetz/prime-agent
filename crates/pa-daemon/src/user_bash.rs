@@ -532,8 +532,8 @@ impl OutputStream {
         self.clone()
     }
 
-    fn push(&mut self, data: &[u8]) {
-        let text = sanitize_output(&String::from_utf8_lossy(data));
+    fn push(&mut self, data: &str) {
+        let text = sanitize_output(data);
         if text.is_empty() {
             return;
         }
@@ -632,36 +632,20 @@ async fn run_bash(run: RunBash<'_>) -> BashEnd {
         let stream = Arc::clone(&stream);
         async move {
             let mut buffer = [0u8; 8192];
-            // A read can end inside a multi-byte character: its leading bytes wait here for
-            // the rest, so no character is decoded in halves (TS `TextDecoder`, `stream: true`).
-            let mut pending: Vec<u8> = Vec::new();
+            // A read can end inside a multi-byte character; the decoder holds its leading
+            // bytes for the next read (TS `TextDecoder`, `stream: true`).
+            let mut decoder = pa_core::StreamingUtf8::default();
             loop {
                 match reader.read(&mut buffer).await {
                     Ok(0) | Err(_) => break,
                     Ok(read) => {
-                        pending.extend_from_slice(&buffer[..read]);
-                        // Everything up to a character the read cut off (`error_len() == None`);
-                        // invalid bytes before it still decode lossily in `push`.
-                        let mut start = 0;
-                        let complete = loop {
-                            match std::str::from_utf8(&pending[start..]) {
-                                Ok(_) => break pending.len(),
-                                Err(error) => match error.error_len() {
-                                    Some(invalid) => start += error.valid_up_to() + invalid,
-                                    None => break start + error.valid_up_to(),
-                                },
-                            }
-                        };
-                        if complete > 0 {
-                            stream.lock().unwrap().push(&pending[..complete]);
-                            pending.drain(..complete);
-                        }
+                        let text = decoder.decode_chunk(&buffer[..read]);
+                        stream.lock().unwrap().push(&text);
                     }
                 }
             }
-            if !pending.is_empty() {
-                stream.lock().unwrap().push(&pending);
-            }
+            let rest = decoder.flush();
+            stream.lock().unwrap().push(&rest);
         }
     };
     let stdout_pump = stdout.map(|pipe| pump(Box::new(pipe)));
@@ -1074,8 +1058,10 @@ mod tests {
         assert!(response.success, "failed: {response:?}");
         let data = response.data.expect("data");
         let output = data["output"].as_str().expect("output");
-        let spill = std::fs::read_to_string(data["fullOutputPath"].as_str().expect("spill path"))
-            .expect("read the spill");
+        let spill_path = data["fullOutputPath"].as_str().expect("spill path");
+        let spill = std::fs::read_to_string(spill_path).expect("read the spill");
+        // Spills land in the shared temp dir; this test owns this one.
+        std::fs::remove_file(spill_path).expect("remove the spill");
         assert_eq!(
             (
                 output.matches('\u{fffd}').count(),
