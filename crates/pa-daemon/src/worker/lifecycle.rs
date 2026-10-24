@@ -382,9 +382,9 @@ impl Worker {
             let has_queued_work = !core.steering.is_empty() || !core.follow_up.is_empty();
             // Persist only the idle parked transition. Active turns have already
             // picked their inputs out of these lanes; rewriting that snapshot
-            // could erase their original recovery evidence.
-            let checkpoint_idle_resume =
-                core.queued_input_suspended && !core.busy && !core.compacting;
+            // could erase their original recovery evidence. An idle compaction
+            // picks nothing, so it checkpoints like any idle resume.
+            let checkpoint_idle_resume = core.queued_input_suspended && !core.busy;
             if let (true, Some(journal)) = (checkpoint_idle_resume, recovery.as_mut()) {
                 let lanes = crate::worker::queue_lanes(&core);
                 let store = core.store.as_ref();
@@ -410,7 +410,7 @@ impl Worker {
                     );
                 }
             }
-            // Busy, compacting and already-resumed calls retain legacy behavior
+            // Busy and already-resumed calls retain legacy behavior
             // without replacing the saved admission snapshot.
             core.queued_input_suspended = false;
             has_queued_work

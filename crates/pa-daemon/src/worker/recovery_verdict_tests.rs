@@ -1008,6 +1008,70 @@ async fn failed_resume_checkpoint_keeps_live_suspension_and_exact_queued_input()
     );
 }
 
+/// An idle compaction holds no picked input, so a resume during it persists
+/// the cleared suspension like any idle resume: a restart before pickup must
+/// not park the acknowledged work again.
+#[tokio::test]
+async fn resume_during_idle_compaction_durably_clears_the_suspension() {
+    let fixture = tempfile::tempdir().unwrap();
+    let worker = worker_with_journal_in(fixture.path());
+    let created = worker
+        .dispatch(
+            "create",
+            &json!({ "noSession": true, "cwd": fixture.path() }),
+        )
+        .await;
+    assert!(created.success, "create isolated worker: {created:?}");
+    let paused = worker
+        .dispatch(
+            "acquire_session_input_pause",
+            &json!({ "leaseKey": "compacting-resume-gate", "clientId": "synthetic-client" }),
+        )
+        .await;
+    assert!(paused.success, "acquire actual input pause: {paused:?}");
+    let admitted = worker
+        .dispatch(
+            "follow_up",
+            &json!({ "message": "synthetic input resumed mid-compaction" }),
+        )
+        .await;
+    assert!(admitted.success, "admit isolated queue input: {admitted:?}");
+    assert!(worker.dispatch("abort", &json!({})).await.success);
+    assert!(worker.dispatch("update_snapshot", &json!({})).await.success);
+    let parked = WorkerRecoveryJournal::read_queue_snapshot(
+        &worker.config.recovery_journal_path,
+        "target-session",
+    )
+    .unwrap()
+    .expect("actual snapshot durably parks this input");
+    assert!(parked.2, "the fixture starts durably suspended");
+    {
+        let mut core = worker.core.lock().unwrap();
+        assert!(!core.busy);
+        core.compacting = true;
+    }
+    let resumed = worker.dispatch("resume_queue", &json!({})).await;
+    assert!(
+        resumed.success,
+        "resume acknowledges queued work: {resumed:?}"
+    );
+    let durable = WorkerRecoveryJournal::read_queue_snapshot(
+        &worker.config.recovery_journal_path,
+        "target-session",
+    )
+    .unwrap()
+    .expect("the resume checkpoint keeps the queue snapshot");
+    assert!(
+        !durable.2,
+        "an acknowledged resume during an idle compaction must durably clear the suspension"
+    );
+    assert_eq!(
+        serde_json::to_value(&durable.1).unwrap(),
+        serde_json::to_value(&parked.1).unwrap(),
+        "the resume checkpoint keeps the exact queued input"
+    );
+}
+
 fn gated_turn_runner(worker: &Worker, engine: Arc<dyn SessionEngine>) -> TurnRunner {
     TurnRunner {
         core: Arc::clone(&worker.core),
