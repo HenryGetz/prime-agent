@@ -9,6 +9,7 @@ use super::{
 use serde_json::Value;
 
 use crate::protocol::DaemonResponse;
+use crate::session_store::SessionMessagesQuery;
 
 impl Worker {
     pub(crate) async fn dispatch(&self, command_type: &str, payload: &Value) -> DaemonResponse {
@@ -499,41 +500,29 @@ impl Worker {
         if let Err(response) = self.require_created(NAME) {
             return response;
         }
-        let start = payload.get("start").and_then(Value::as_i64).unwrap_or(0);
-        let limit = payload
-            .get("limit")
-            .and_then(Value::as_u64)
-            .map_or(0, |limit| usize::try_from(limit).unwrap_or(usize::MAX));
-        let mut globs = globset::GlobSetBuilder::new();
-        for role in payload
+        let roles: Vec<String> = payload
             .get("roles")
             .and_then(Value::as_array)
             .into_iter()
             .flatten()
             .filter_map(Value::as_str)
-        {
-            match globset::Glob::new(role) {
-                Ok(glob) => {
-                    globs.add(glob);
-                }
-                Err(error) => return response_failure(None, NAME, &error.to_string(), None),
-            }
-        }
-        let globs = match globs.build() {
-            Ok(globs) => globs,
+            .map(str::to_string)
+            .collect();
+        let query = match SessionMessagesQuery::new(
+            payload.get("start").and_then(Value::as_i64).unwrap_or(0),
+            payload.get("limit").and_then(Value::as_u64).unwrap_or(0),
+            &roles,
+        ) {
+            Ok(query) => query,
             Err(error) => return response_failure(None, NAME, &error.to_string(), None),
         };
         let read = || {
             let mut core = self.core.lock().unwrap();
             let core = &mut *core;
-            let slice = core.store.as_mut().and_then(|store| {
-                store.session_messages(
-                    start,
-                    limit,
-                    |role| globs.is_match(role),
-                    &core.running_tool_calls,
-                )
-            });
+            let slice = core
+                .store
+                .as_mut()
+                .and_then(|store| query.read(store, &core.running_tool_calls));
             slice
         };
         let mut slice = read();
@@ -546,21 +535,7 @@ impl Worker {
         let Some(slice) = slice else {
             return response_failure(None, NAME, "Session history is unavailable", None);
         };
-        let messages: Vec<Value> = slice
-            .rows
-            .into_iter()
-            .map(|(index, id, mut message)| {
-                crate::snapshot_stream::elide_snapshot_image_payloads(std::slice::from_mut(
-                    &mut message,
-                ));
-                json!({ "index": index, "id": id, "message": message })
-            })
-            .collect();
-        response_success(
-            None,
-            NAME,
-            Some(json!({ "messages": messages, "total": slice.total })),
-        )
+        response_success(None, NAME, Some(slice.into_reply()))
     }
 
     /// Load a windowed store's full history in place; a full store stays as it is.

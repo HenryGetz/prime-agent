@@ -675,6 +675,10 @@ pub enum DaemonCommand {
         start: i64,
         limit: u64,
         roles: Vec<String>,
+        /// The session's file, which the supervisor reads when no worker holds the
+        /// session (a family member's read).
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        session_file: Option<String>,
         #[serde(flatten)]
         rest: JsonMap,
     },
