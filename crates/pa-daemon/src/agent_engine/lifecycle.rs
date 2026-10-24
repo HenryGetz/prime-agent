@@ -1231,10 +1231,18 @@ impl AgentSessionEngine {
                         // Background band starts (or keeps) the background
                         // summarize without yielding; a ready-to-commit
                         // summary or a Reserve crossing yields for the model
-                        // turn's boundary arm to commit.
+                        // turn's boundary arm to commit. The run's own signal
+                        // is the consult's abort: Stop aborts the run before
+                        // it resets the background epoch.
+                        let run_signal = engine.session.agent().signal();
                         let due = engine
                             .session
-                            .auto_compaction_now_with_abort(&run_model, &model, api_key, None)
+                            .auto_compaction_now_with_abort(
+                                &run_model,
+                                &model,
+                                api_key,
+                                run_signal.as_ref(),
+                            )
                             .await;
                         if due {
                             yielded.store(true, Ordering::SeqCst);

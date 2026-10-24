@@ -1108,6 +1108,20 @@ fn faux_engine_with_registration(
     tempfile::TempDir,
     pa_ai::faux::FauxProviderRegistration,
 ) {
+    faux_engine_with_steering_probe(script, reserve_tokens, None)
+}
+
+/// [`faux_engine_with_registration`] with the queued-steering probe the
+/// agent loop consults right before each in-run threshold hook.
+fn faux_engine_with_steering_probe(
+    script: &serde_json::Value,
+    reserve_tokens: u64,
+    queued_steering_probe: Option<std::sync::Arc<dyn Fn() -> bool + Send + Sync>>,
+) -> (
+    AgentSessionEngine,
+    tempfile::TempDir,
+    pa_ai::faux::FauxProviderRegistration,
+) {
     let parsed = pa_ai::faux::script::parse_faux_script(script).expect("faux script parses");
     let registration = pa_ai::faux::script::register_faux_provider_from_script(&parsed);
     let dir = tempfile::TempDir::new().unwrap();
@@ -1152,7 +1166,7 @@ fn faux_engine_with_registration(
         supervisor_link: None,
         telemetry_disabled: None,
         cron_store: None,
-        queued_steering_probe: None,
+        queued_steering_probe,
     })
     .unwrap();
     (engine, dir, registration)
@@ -2173,6 +2187,105 @@ fn an_in_run_background_crossing_starts_a_flight_without_yielding_the_tool_run()
     assert!(
         summarize_issued.load(std::sync::atomic::Ordering::SeqCst),
         "the summarize issued before the run's next model turn answered"
+    );
+    registration.unregister();
+}
+
+/// Stop landing right before the in-run threshold hook (the queued-steering
+/// probe the loop consults first) must not let the hook start a background
+/// summarize in the epoch Stop just opened.
+#[test]
+fn stop_before_the_in_run_hook_starts_no_background_summarize() {
+    let _faux = FAUX_TEST_LOCK
+        .lock()
+        .unwrap_or_else(std::sync::PoisonError::into_inner);
+    let crossing_prompt = format!("crossing {}", "x".repeat(260_000));
+    let usages = probe_usages(&["seed turn".to_string(), crossing_prompt.clone()]);
+    let turn_calls = std::sync::Arc::new(std::sync::atomic::AtomicU64::new(0));
+    let engine_slot =
+        std::sync::Arc::new(std::sync::OnceLock::<std::sync::Weak<AgentSessionEngine>>::new());
+    let stopped = std::sync::Arc::new(std::sync::atomic::AtomicBool::new(false));
+    let probe: std::sync::Arc<dyn Fn() -> bool + Send + Sync> = {
+        let turn_calls = std::sync::Arc::clone(&turn_calls);
+        let engine_slot = std::sync::Arc::clone(&engine_slot);
+        let stopped = std::sync::Arc::clone(&stopped);
+        std::sync::Arc::new(move || {
+            // After the crossing run's tool turn: Stop arrives here.
+            if turn_calls.load(std::sync::atomic::Ordering::SeqCst) == 2
+                && !stopped.swap(true, std::sync::atomic::Ordering::SeqCst)
+            {
+                if let Some(engine) = engine_slot.get().and_then(std::sync::Weak::upgrade) {
+                    engine.abort_in_flight_turn();
+                }
+            }
+            false
+        })
+    };
+    let (engine, _engine_dir, registration) = faux_engine_with_steering_probe(
+        &serde_json::json!({ "responses": [] }),
+        background_band_reserve(usages[0], usages[1]),
+        Some(probe),
+    );
+    let engine = std::sync::Arc::new(engine);
+    engine_slot.set(std::sync::Arc::downgrade(&engine)).unwrap();
+    let (summarize_tx, summarize_rx) = std::sync::mpsc::channel::<()>();
+    let summarize_tx = std::sync::Mutex::new(summarize_tx);
+    let turn_messages = std::sync::Mutex::new(std::collections::VecDeque::from([
+        pa_ai::faux::faux_assistant_text_message(
+            "seed reply",
+            pa_ai::faux::FauxAssistantMessageOptions::default(),
+        ),
+        pa_ai::faux::faux_assistant_message(
+            vec![
+                pa_ai::faux::faux_text("tool turn reply"),
+                pa_ai::faux::faux_tool_call(
+                    "synthetic_missing_tool",
+                    &serde_json::json!({}),
+                    Some("synthetic-call"),
+                ),
+            ],
+            pa_ai::faux::FauxAssistantMessageOptions {
+                stop_reason: Some(pa_ai::types::StopReason::ToolUse),
+                ..Default::default()
+            },
+        ),
+    ]));
+    let route = {
+        let turn_calls = std::sync::Arc::clone(&turn_calls);
+        move |context: &pa_types::ai::Context,
+              _: Option<&pa_ai::types::StreamOptions>,
+              _: u64,
+              _: &pa_types::ai::Model| {
+            // The background summarize carries no tools.
+            if context.tools.is_none() {
+                let _ = summarize_tx.lock().unwrap().send(());
+                return Ok(pa_ai::faux::faux_assistant_text_message(
+                    "the background summary",
+                    pa_ai::faux::FauxAssistantMessageOptions::default(),
+                ));
+            }
+            turn_calls.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+            let reply = turn_messages.lock().unwrap().pop_front();
+            Ok(reply.expect("a scripted turn response"))
+        }
+    };
+    registration.set_responses(vec![
+        pa_ai::faux::FauxResponseStep::Factory(
+            std::sync::Arc::new(route)
+        );
+        10
+    ]);
+    let mut events: Vec<EngineEvent> = Vec::new();
+    admit(&engine, "seed turn".to_string(), &mut events);
+    admit(&engine, crossing_prompt, &mut events);
+    assert!(
+        stopped.load(std::sync::atomic::Ordering::SeqCst),
+        "Stop landed before the tool turn's hook"
+    );
+    assert_eq!(
+        summarize_rx.recv_timeout(std::time::Duration::from_secs(2)),
+        Err(std::sync::mpsc::RecvTimeoutError::Timeout),
+        "a stopped run's hook started a background summarize"
     );
     registration.unregister();
 }

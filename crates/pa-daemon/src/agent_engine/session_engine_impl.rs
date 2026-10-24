@@ -1473,12 +1473,15 @@ impl SessionEngine for AgentSessionEngine {
     }
 
     fn abort_in_flight_turn(&self) {
-        self.abort_auto_compaction();
         // The active run aborts and the in-flight fetch cancels; none in flight: nothing.
         let agent = self.turn_agent.lock().expect("turn agent lock").clone();
         if let Some(agent) = agent {
             agent.abort();
         }
+        // After the run abort: the in-run threshold hook consults with the
+        // run's signal, so a hook entering after this epoch reset sees the
+        // aborted run, and one that captured the old epoch is cancelled here.
+        self.abort_auto_compaction();
     }
 
     /// `set_steering_mode` / `set_follow_up_mode`: the queue delivery modes
