@@ -161,7 +161,7 @@ pub(super) struct ReplayState {
     pub(super) family_topology: Mutex<Option<Arc<super::FamilyTopology>>>,
 }
 
-/// Ledger rows are immutable within a replay, but restore/archive and transcript
+/// Ledger rows are immutable within a replay, but file moves and transcript
 /// edits can change the inputs of the deleted-spend fold without any append.
 #[derive(Debug)]
 pub(super) struct DeletedBucket {
@@ -228,12 +228,6 @@ impl<'a> LivePathResolver<'a> {
         let sessions_candidate = self.sessions_dir.join(format!("{id}.jsonl"));
         if is_file(&sessions_candidate) {
             return Ok(Some(sessions_candidate));
-        }
-        if is_file(
-            &crate::session_archive::archive_dir(&self.agent_dir)
-                .join(crate::session_store::session_file_name(&id)),
-        ) {
-            return Ok(None);
         }
         let mut index = self
             .artifact_index

@@ -92,12 +92,6 @@ records (`parentSession`/`child` are canonical paths).
   the warm scan via the daemon's in-process cache instead.
 - `pa-perf run` generates BOTH corpora (cold for the cold scenarios, warm
   for warm-start/warm-ready) — every scenario runs on the state it needs.
-- The corpus settings disable BOTH archive rules (`sessionArchiveMaxAgeDays`
-  / `sessionArchiveMaxSessions` "off"): the product's defaults sweep the
-  live store down to 200 unarchived sessions (the operator's real store:
-  196 live + 211 archived), so large/xl with archiving off are scaling
-  stress profiles, not typical stores, and the boot sweep itself is not
-  measured.
 
 ## The bench harness
 
@@ -120,11 +114,45 @@ the liveness deadline only fails broken runs):
 | `cold-ready` | cold | the same launch, exec -> the tray's session-usage pill, the first attach-only content (daemon spawn + session create + attach included) |
 | `warm-start` | warm | exec -> first paint, daemon pre-started |
 | `warm-ready` | warm | the same launch, exec -> the attach pill |
-| `agents-view` | cold | left-arrow -> the completed `Inactive (N)` roster heading in the screen model |
+| `agents-view` | cold | left-arrow -> the settled first catalog page (`Inactive (N)` plus the `M older sessions not loaded` footer account for every session) in the screen model |
 | `agents-view-warm` | cold | the same daemon's second populate (its in-process scan cache warm) |
-| `open-session` | cold | `--resume <huge session>` -> the huge session's tail marker |
-| `session-switch` | cold | enter on the uniquely-filtered switch-b row -> B's transcript marker |
+| `open-session` | cold | `--resume <huge session>` -> the huge session's tail marker (the final user row; its reply is one line) |
+| `session-switch` | cold | enter on the uniquely-filtered switch-b row -> B's transcript marker (the final user row; its reply is one line) |
 | `at-completion` | cold | the `@` keystroke -> the first completion menu row |
+| `transcript-paging` | cold | `--resume <huge session>`, then 20 PageUps: each keystroke -> the first frame whose topmost block ordinal is above the previous frame's (one sample per page) |
+| `transcript-top` | cold | `--resume <huge session>`, then the `tui.viewport.top` key -> the first frame showing the session's first block (ordinal 0); the head is never in the attach tail, so this is a daemon page fetch |
+| `idle-cost` | cold | owned daemon + TUI, ready, then a 30 s idle window: CPU ms (utime+stime) of the daemon, its descendants, and the TUI, plus their context switches (medium only, Linux only) |
+
+First paint: `agents-view` and `agents-view-warm` also record the first
+usable paint of the same run (`first_paint`: the first frame whose roster
+lists a loaded row); the median stays the settled mark the baseline keys
+mean. `cold-start`/`cold-ready` (and `warm-*`) are already a
+first-paint/ready pair from one launch. `open-session` and `session-switch`
+have no separate first paint: their marker is the first usable frame.
+
+Block ordinals: the corpus prefixes every generated text block of the huge
+session with `ord<n>`, `n` counting up from 0 in transcript order. The 20
+PageUps stay inside the attach tail (the daemon serves the last 512
+messages), so `transcript-paging` measures the TUI's own scroll and render;
+`transcript-top` measures the daemon's head-page fetch (`get_messages`).
+
+Stall gauge (`worst_gap`): each run's longest no-output stretch inside its
+measured windows (trigger -> mark). The report prints its p95 and max; it
+never gates.
+
+idle-cost walks `/proc` from the owned pids down
+(`/proc/<pid>/task/*/children`, never by name) and sums CPU ticks (`stat`)
+and context switches (`task/*/status`) over the processes alive at the
+window's end; a process that exits inside the window is not counted, and
+the run fails if the daemon or the TUI exits. It runs once per suite on the
+medium leg: `pa-perf run` skips it elsewhere and on non-Linux, and
+`bench --scenario idle-cost` errors on non-Linux. CPU resolution is one
+clock tick (10 ms at 100 Hz).
+
+Screen needles see only completed frames: the chat surface brackets its
+paints in synchronized output (mode 2026), and the terminal the bench
+presents as (ghostty) shows such a frame only at its end. The agents view
+paints unbracketed, so its needles see bytes as they arrive.
 
 Mechanics (the repo's pty-e2e discipline): the TUI child runs in its own
 session with NO controlling tty (`setsid` pre-exec; vendored crossterm
@@ -145,9 +173,12 @@ pid/name-based kill.
 pa-perf report --baseline crates/pa-perf/baseline.json --results results/*.json [--markdown OUT]
 ```
 
-Prints the aggregate table (scenario/profile, median, p95, baseline, delta)
-and exits nonzero ONLY when a non-report-only median exceeds twice the
-baseline. Noisy scenarios (>20% spread across 3 CI runs) are marked
+Prints the aggregate table (scenario/profile, median, p95, first-paint
+median, worst gap p95 / max, baseline, delta), then one line per idle-cost
+result (CPU ms and context switches), and exits nonzero ONLY when a
+non-report-only median exceeds twice the baseline. The first-paint and
+worst-gap columns never gate; scenarios without a baseline entry print as
+`(no baseline)`. Noisy scenarios (>20% spread across 3 CI runs) are marked
 `report_only` in the baseline: their deltas always print, the gate never
 fails. `baseline.json` is committed from CI numbers, not laptop/sandbox
 ones.

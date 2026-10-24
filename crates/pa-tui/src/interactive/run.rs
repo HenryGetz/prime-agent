@@ -5,9 +5,9 @@ use super::{
     apply_startup_chrome, arm_shutdown_recovery, check_tmux_keyboard_setup, mpsc,
     run_onboarding_phase, spawn_session_reader, AgentView, DaemonClient, Duration, ExitGuard,
     HeadlessSettle, Instant, InteractiveOptions, InteractiveOutcome, PaneDrive, ReconnectConnect,
-    ReconnectLoop, RecoveryKind, Renderer, Result, SessionReconnect, SessionSelection, SessionUi,
-    TerminalHandoff, UiInput, UiMode, VecDeque, SESSION_RECONNECT_ATTEMPT_TIMEOUT_S,
-    TELEMETRY_EXIT_TIMEOUT_MS,
+    ReconnectLoop, RecoveryKind, Renderer, Result, SessionPanel, SessionReconnect,
+    SessionSelection, SessionUi, TerminalHandoff, UiInput, UiMode, VecDeque,
+    ACTIVITY_POLL_INTERVAL, SESSION_RECONNECT_ATTEMPT_TIMEOUT_S, TELEMETRY_EXIT_TIMEOUT_MS,
 };
 use crate::suspend::SuspendTerminal;
 use anyhow::Context;
@@ -51,12 +51,13 @@ fn next_spinner_deadline(started: Instant, now: Instant) -> Instant {
 /// The open route for one interactive run (TS `runAgentsViewLoop`'s
 /// open versus the CLI's own open): the agents-view open waits through a
 /// daemon update restart (TS #2391) instead of failing the open hard.
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+#[derive(Debug, Clone, PartialEq, Eq)]
 pub(crate) enum SessionOpenRoute {
     /// The CLI's open (`prime-agent`, `--resume`, `--attach`): a single attempt.
     Cli,
-    /// The agents view's open: waits through the update-restart window and retries.
-    AgentsView,
+    /// The agents view's open: waits through the update-restart window and retries; `panel`
+    /// mounts on open and its close returns to the agents view.
+    AgentsView { panel: Option<SessionPanel> },
 }
 
 /// Run one interactive session (the CLI open route).
@@ -82,8 +83,9 @@ pub async fn run_interactive(
 pub async fn run_interactive_agents_view_open(
     options: InteractiveOptions,
     ui: UiMode,
+    panel: Option<SessionPanel>,
 ) -> Result<InteractiveOutcome> {
-    run_interactive_route(options, ui, SessionOpenRoute::AgentsView).await
+    run_interactive_route(options, ui, SessionOpenRoute::AgentsView { panel }).await
 }
 
 async fn run_interactive_route(
@@ -208,8 +210,7 @@ async fn run_interactive_surface(
     // autocomplete provider.
     let (commands_tx, mut commands_rx) =
         mpsc::unbounded_channel::<crate::session_ui::CommandCatalogUpdate>();
-    let (backfill_tx, mut backfill_rx) =
-        mpsc::unbounded_channel::<crate::session_ui::TranscriptBackfillNote>();
+    let (page_tx, mut page_rx) = mpsc::unbounded_channel::<crate::session_ui::TranscriptPageNote>();
     // The double-Ctrl+C force-quit guard: the terminal reader observes the pair while this loop is
     // wedged in a daemon request; a std-thread watchdog enforces the exit deadline without the
     // runtime.
@@ -222,9 +223,10 @@ async fn run_interactive_surface(
     view.code_block_indent = options.code_block_indent.clone();
     // The file-completion provider browses the SESSION cwd, not the process cwd: the completion
     // menu must browse the directory the user sees.
-    view.editor.set_autocomplete_provider(Box::new(
-        crate::autocomplete::CombinedAutocompleteProvider::from_registry(options.cwd.clone()),
-    ));
+    let provider =
+        crate::autocomplete::CombinedAutocompleteProvider::from_registry(options.cwd.clone());
+    provider.start_file_index();
+    view.editor.set_autocomplete_provider(Box::new(provider));
     view.editor.set_keybindings(options.keybindings.clone());
     view.show_images = options.show_images;
     if let Some(settings) = &options.client_settings {
@@ -310,8 +312,8 @@ async fn run_interactive_surface(
         let bash_tx = bash_tx.clone();
         let factory_tx = factory_tx.clone();
         let commands_tx = commands_tx.clone();
-        let backfill_tx = backfill_tx.clone();
-        let waits_through_update_restart = route == SessionOpenRoute::AgentsView;
+        let page_tx = page_tx.clone();
+        let waits_through_update_restart = matches!(route, SessionOpenRoute::AgentsView { .. });
         tokio::spawn(async move {
             crate::update_restart_wait::wait_through_update_restart(
                 waits_through_update_restart,
@@ -338,7 +340,7 @@ async fn run_interactive_surface(
                     let bash_tx = bash_tx.clone();
                     let factory_tx = factory_tx.clone();
                     let commands_tx = commands_tx.clone();
-                    let backfill_tx = backfill_tx.clone();
+                    let page_tx = page_tx.clone();
                     async move {
                         let (client, events) = match first {
                             Some(first) => first,
@@ -366,7 +368,7 @@ async fn run_interactive_surface(
                                 factory: factory_tx,
                                 commands: commands_tx,
                             },
-                            backfill_tx,
+                            page_tx,
                         )
                         .await?;
                         Ok((events, session))
@@ -533,6 +535,9 @@ async fn run_interactive_surface(
                             }
                             opening_dirty = true;
                         }
+                        // A write boundary carries no input: the echo continues, and queued
+                        // typed-ahead materializes on the run loop's tick after the open.
+                        UiInput::InputChunkEnd => {}
                         other => {
                             echoing = false;
                             pending.push_back(other);
@@ -709,6 +714,9 @@ async fn run_interactive_surface(
     // previous chat view of this session left via the agents view or a
     // switch) returns to the editor when its chat reopens.
     session.restore_prompt_stash_on_open(&mut view);
+    if let SessionOpenRoute::AgentsView { panel: Some(panel) } = route {
+        session.open_agents_view_panel(panel, &mut view);
+    }
     // Declared above the onboarding phase: the pane's drive marks it.
     let mut headless_done = false;
     // The settle bound's deadline (see [`HEADLESS_SETTLE_TIMEOUT_MS`]).
@@ -829,7 +837,7 @@ async fn run_interactive_surface(
 
     'run: while running {
         if !session.dirty {
-            session.spawn_pending_backfill();
+            session.spawn_transcript_page(&mut view);
         }
         if enhanced_keys_pending {
             if let Some((kitty, modify_other_keys)) = crate::enhanced_keys::settle_state() {
@@ -988,7 +996,10 @@ async fn run_interactive_surface(
                     sender.send((Instant::now(), renderer.headless_renders()))?;
                     continue;
                 }
-                session.dirty = true;
+                let chunk_end = matches!(input, UiInput::InputChunkEnd);
+                if !chunk_end {
+                    session.dirty = true;
+                }
                 match input {
                     UiInput::Key(key) => {
                         session.stop_selection_auto_scroll();
@@ -1112,10 +1123,10 @@ async fn run_interactive_surface(
                     UiInput::Mouse(event) => {
                         session.handle_mouse(event, &mut view);
                     }
-                    // The headless plan's pause step: the queued keystroke batch ahead of this
-                    // barrier is fully handled, so the parked suggestions materialize now — the
-                    // same state the terminal loop's 50 ms idle tick produces.
-                    UiInput::SettleIdle => {
+                    // The headless plan's pause step or the end of a terminal write: the queued
+                    // keystroke batch ahead of this barrier is fully handled, so the parked
+                    // suggestions materialize now (into this input's inline paint on a terminal).
+                    UiInput::SettleIdle | UiInput::InputChunkEnd => {
                         session.materialize_editor_autocomplete(&mut view);
                     }
                     UiInput::Submit(text) => {
@@ -1146,6 +1157,7 @@ async fn run_interactive_surface(
                     UiInput::ScrollTop => {
                         session.stop_selection_auto_scroll();
                         view.scroll_to_top();
+                        session.window.request_head();
                     }
                     UiInput::Resize => {
                         session.stop_selection_auto_scroll();
@@ -1160,7 +1172,10 @@ async fn run_interactive_surface(
                 // Paint the handled input in this iteration: the select below can otherwise wait
                 // out its 50ms tick before the next draw, felt as keystroke-to-render lag. A
                 // handoff paints nothing: the next surface owns the pane.
-                if let Some(renderer) = renderer.is_terminal_mut() {
+                if let Some(renderer) = renderer
+                    .is_terminal_mut()
+                    .filter(|_| !chunk_end || session.dirty)
+                {
                     if !session.open_agents_view && session.pending_selection.is_none() {
                         // The inline paint must reflect tray state the handled key just armed (the
                         // Ctrl+C exit hint): the refresh below the select only reaches the frame
@@ -1250,7 +1265,7 @@ async fn run_interactive_surface(
         // paint; a keystroke's toast or hint) must not park behind a select that has no other wake.
         // The headless barriers' deadlines and the hint/toast expiry arm HERE, not after the frame
         // gate.
-        if session.dirty && render_deadline.is_none() {
+        if (session.dirty || session.wants_transcript_page(&view)) && render_deadline.is_none() {
             render_deadline = Some(Instant::now());
         }
         for deadline in [
@@ -1328,15 +1343,9 @@ async fn run_interactive_surface(
                     while let Ok(event) = events.try_recv() {
                         session.apply_client_event(event, &mut view);
                     }
-                    // A succeeded compaction rebuilt the durable transcript: replace the view's
-                    // chat with it, and refresh the tray usage the same way a settled turn does.
-                    if session.transcript_stale {
-                        session.rebuild_transcript(&mut view).await;
-                        session.refresh_stats().await;
-                        session.rebuild_tray(&mut view);
-                    }
-                    // A settled turn refreshes the tray's context usage.
-                    if was_active && !session.turn_active {
+                    // A settled turn or compaction refreshes the tray's context usage.
+                    let compaction_settled = std::mem::take(&mut session.compaction_settled);
+                    if compaction_settled || (was_active && !session.turn_active) {
                         session.refresh_stats().await;
                         session.rebuild_tray(&mut view);
                     }
@@ -1533,9 +1542,9 @@ async fn run_interactive_surface(
                     session.apply_background_note(&note, &mut view);
                 }
             }
-            maybe_backfill = backfill_rx.recv() => {
-                if let Some(note) = maybe_backfill {
-                    session.apply_transcript_backfill(note, &mut view);
+            maybe_page = page_rx.recv() => {
+                if let Some(note) = maybe_page {
+                    session.apply_transcript_page(note, &mut view);
                 }
             }
             maybe_compaction_abort = compaction_abort_rx.recv() => {
@@ -1809,6 +1818,7 @@ async fn run_interactive_surface(
                 // The reconnect attempt's budget covers the attach alone: the surface is already
                 // up and its dock holds, so the first-frame fold's bounded fetches cannot eat the
                 // 10s attempt budget on a slow daemon.
+                let anchor = session.reader_anchor(&view);
                 let attempt = tokio::time::timeout(
                     Duration::from_secs(SESSION_RECONNECT_ATTEMPT_TIMEOUT_S),
                     session.attach_session(
@@ -1821,10 +1831,7 @@ async fn run_interactive_surface(
                     Ok(Ok(())) => {
                         // The resynced transcript replaces the chat, then the reconnected status
                         // lands on the rebuilt chat.
-                        session.rebuild_view(
-                            &mut view,
-                            &crate::session_ui::RebuildKind::Resync,
-                        );
+                        session.resync_view(anchor, &mut view).await;
                         session.note_as(
                             "Daemon reconnected",
                             crate::chat::StatusKind::Info,
@@ -1892,12 +1899,13 @@ async fn run_interactive_surface(
                     std::future::pending::<()>().await;
                 }
                 tokio::time::sleep_until(
-                    tokio::time::Instant::from_std(last_bash_refresh + Duration::from_secs(2)),
+                    tokio::time::Instant::from_std(last_bash_refresh + ACTIVITY_POLL_INTERVAL),
                 )
                 .await;
             } => {
                 last_bash_refresh = Instant::now();
                 session.spawn_bash_activity_refresh();
+                session.refresh_expanded_dock(&mut view);
             }
             () = async {
                 // The factory lane's 2s poll: the bash poll's cadence
@@ -1910,7 +1918,7 @@ async fn run_interactive_surface(
                     std::future::pending::<()>().await;
                 }
                 tokio::time::sleep_until(
-                    tokio::time::Instant::from_std(last_factory_refresh + Duration::from_secs(2)),
+                    tokio::time::Instant::from_std(last_factory_refresh + ACTIVITY_POLL_INTERVAL),
                 )
                 .await;
             } => {
@@ -2030,13 +2038,15 @@ async fn run_interactive_surface(
     // so the deadline covers only the leaves that end this process.
     let handing_off = session.open_agents_view || session.pending_selection.is_some();
     if renderer.is_terminal() && !session.open_agents_view {
-        // Leaving the run flushes only the history already loaded: an unfinished
-        // older-history page is abandoned (dropping the task aborts its request),
-        // while a page that already arrived applies before the view goes away.
-        session.transcript_backfill = None;
-        while let Ok(note) = backfill_rx.try_recv() {
-            session.apply_transcript_backfill(note, &mut view);
+        // Leaving the run flushes only the history already loaded and contiguous with
+        // the tail: an unfinished page is abandoned (dropping the task aborts its
+        // request), a page that already arrived applies, and a resident run cut off
+        // from the tail drops before the flush.
+        session.window.retire_fetch();
+        while let Ok(note) = page_rx.try_recv() {
+            session.apply_transcript_page(note, &mut view);
         }
+        session.collapse_transcript_window(&mut view);
     }
     if renderer.is_terminal() && !handing_off {
         exit_guard.arm_for_exit();
