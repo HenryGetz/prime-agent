@@ -1,5 +1,6 @@
 #!/usr/bin/env python3
-"""Hosted actual factory Left/Right navigation with raw PTY evidence.
+"""Hosted actual factory page navigation with raw PTY evidence: Right and
+Enter on a run header are inert, the stop key only arms, Left closes.
 
 A protocol fixture supplies one real-shaped run; actual input parsing, view
 rendering and fallback keys execute unchanged.
@@ -85,11 +86,15 @@ def observe(binary, root, observed):
         snap('dock', lambda text: server.attaches > 0 and 'factory' in text
              and any(c.get('type') == 'factory_activity' for c in server.commands))
         terminal.send(factory_click(terminal.screen))
-        snap('page', lambda text: RUN in text and 'actions:' not in text)
+        snap('page', lambda text: RUN in text and '\u2190 back' in text and 'Ctrl+X stop' in text)
+        # Right and Enter on the selected run header are inert; the stop
+        # key's armed prompt is the barrier proving they were handled.
+        terminal.send('\x1b[C\x1b[C\r\r')
+        terminal.send('\x18')
+        snap('right_enter_inert_then_stop_armed', lambda text: RUN in text
+             and 'again to confirm' in text)
         terminal.send('\x1b[C')
-        snap('right_opens_actions', lambda text: 'actions: ' + RUN in text)
-        terminal.send('\x1b[D')
-        snap('left_backs_out', lambda text: RUN in text and 'actions:' not in text)
+        snap('other_key_disarms', lambda text: RUN in text and 'again to confirm' not in text)
         terminal.send('\x1b[D')
         terminal.send('FACTORY_CLOSED_INPUT_BARRIER')
         snap('left_closes_page', lambda text: 'FACTORY_CLOSED_INPUT_BARRIER' in text and RUN not in text)
@@ -130,7 +135,8 @@ def main():
     args = parser.parse_args()
     receipt = {'verified': False, 'scope': __doc__, 'not_verified': [
         'real factory execution',
-        'rebound keybindings (unit regression)', 'action execution after Right confirmation']}
+        'rebound keybindings (unit regression)', 'stop execution after the second press',
+        'opening a child session (the fixture state has no child)']}
     try:
         assert sys.platform == 'linux', 'hosted Linux only'
         with tempfile.TemporaryDirectory(prefix='pa-fnav-', dir='/tmp') as folder:

@@ -5256,10 +5256,12 @@ watched = await rlm.factory.watch(result["run_id"], 30)
   derive from their shapes.
 - The TUI factory page: the activity dock's `⚙ N factory` group (Enter or
   click) opens one live diagram per run, newest run first. The up/down
-  arrows move the run selection, Enter opens the selected run's action
-  rows (stop, or resume first while the run is paused — the arrows walk
-  the rows, Enter runs the tracked action), and Esc backs out of the rows
-  before it closes the page.
+  arrows walk the run headers and the states that spawned a child;
+  Enter or Right opens the selected state's latest child session, and
+  Left or Esc closes the page. Ctrl+X (the agents view's stop key) twice
+  stops the selected row: the whole run on its header, or the state's
+  running child (that attempt fails under the state's `retries` and
+  `failure_policy`). `r` resumes a paused run.
 
 ## Safety
 

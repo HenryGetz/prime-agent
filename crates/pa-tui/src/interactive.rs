@@ -78,6 +78,23 @@ pub enum SessionSelection {
     Resume(PathBuf),
 }
 
+impl SessionSelection {
+    /// How a roster summary opens: attach its live runtime
+    /// (`activeSessionId`), else resume its saved file (`sessionFile`);
+    /// `None` when it has neither.
+    pub(crate) fn open_summary(summary: &Value) -> Option<Self> {
+        let field = |name: &str| {
+            summary
+                .get(name)
+                .and_then(Value::as_str)
+                .filter(|text| !text.is_empty())
+        };
+        field("activeSessionId")
+            .map(|active| Self::Attach(active.to_string()))
+            .or_else(|| field("sessionFile").map(|file| Self::Resume(PathBuf::from(file))))
+    }
+}
+
 /// The session panel an agents-view activity line mounts when its session opens; the panel's close
 /// returns to the agents view.
 #[derive(Debug, Clone, PartialEq, Eq)]
