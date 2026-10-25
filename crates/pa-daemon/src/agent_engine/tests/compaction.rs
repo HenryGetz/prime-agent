@@ -1040,7 +1040,9 @@ fn compact_session_command_emits_the_result_on_success() {
     // Two big turns (~12k tokens each) push the history past the
     // keep-recent budget. The crossing rides the second turn's USER
     // message — a cut inside a turn would make TWO summarizer wire
-    // calls (TS parity), which this single-summary script does not serve.
+    // calls (TS parity) and merge them, not the one summary asserted.
+    // The background band may start a summarize at the post-turn boundary that
+    // consumes a scripted response before `/compact` aborts it: serve the summary twice.
     let filler = "history ".repeat(6_000); // ~48k chars = ~12k tokens each
     let big_second = format!("second {}", "padded ".repeat(6_000)); // ~10.5k tokens
     let (_engine, events) = run_prompts(
@@ -1048,6 +1050,7 @@ fn compact_session_command_emits_the_result_on_success() {
             "responses": [
                 { "text": filler },
                 { "text": filler },
+                { "text": "## Summary\nthe session story" },
                 { "text": "## Summary\nthe session story" },
             ]
         }),
