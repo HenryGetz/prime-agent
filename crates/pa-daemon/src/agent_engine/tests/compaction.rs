@@ -1172,11 +1172,14 @@ fn faux_engine_with_steering_probe(
     (engine, dir, registration)
 }
 
-/// The reserve landing the measured crossing usage inside the background band.
-/// The band starts no lower than the retention floor (`keep + 2 * reserve`),
-/// so the crossing must be large (~65k tokens) to land above it.
-fn background_band_reserve(seed_usage: u64, crossing_usage: u64) -> u64 {
-    (2 * (128_000 - FAUX_REQUEST_BUDGET) - seed_usage - crossing_usage) / 6
+/// The reserve whose background band (`threshold - 2 * reserve`, `threshold`]
+/// centers on the crossing turn's and the next turn's measured usages. The
+/// session-scoped faux cache (#3751) counts a turn's new prompt twice (input
+/// plus cache write), so the crossing turn measures one prompt more than the
+/// turns after it. A ~39k-token crossing prompt keeps both inside the band and
+/// above the retention floor (`keep + 2 * reserve`).
+fn background_band_reserve(crossing_usage: u64, next_usage: u64) -> u64 {
+    (2 * (128_000 - FAUX_REQUEST_BUDGET) - crossing_usage - next_usage) / 4
 }
 
 /// One probe engine over the prompts, returning each turn's measured usage.
@@ -1241,8 +1244,12 @@ fn background_watermark_summarizes_without_blocking_the_next_turn() {
     let _faux = FAUX_TEST_LOCK
         .lock()
         .unwrap_or_else(std::sync::PoisonError::into_inner);
-    let band_prompt = format!("seed turn {} crossing", "x".repeat(260_000));
-    let usages = probe_usages(&["seed turn".to_string(), band_prompt.clone()]);
+    let band_prompt = format!("seed turn {} crossing", "x".repeat(156_000));
+    let usages = probe_usages(&[
+        "seed turn".to_string(),
+        band_prompt.clone(),
+        "a small next turn".to_string(),
+    ]);
     let (engine, _engine_dir, registration) = faux_engine_with_registration(
         &serde_json::json!({
             "responses": [
@@ -1252,7 +1259,7 @@ fn background_watermark_summarizes_without_blocking_the_next_turn() {
                 {"text": "next reply"},
             ]
         }),
-        background_band_reserve(usages[0], usages[1]),
+        background_band_reserve(usages[1], usages[2]),
     );
     let mut events: Vec<EngineEvent> = Vec::new();
     admit(&engine, "seed turn".to_string(), &mut events);
@@ -1288,9 +1295,13 @@ fn reserve_crossing_commits_the_in_flight_background_summary() {
     let _faux = FAUX_TEST_LOCK
         .lock()
         .unwrap_or_else(std::sync::PoisonError::into_inner);
-    let filler = format!("history {}", "x".repeat(320_000));
-    let crossing = format!("crossing {}", "y".repeat(48_000));
-    let reserve_prompt = format!("reserve {}", "z".repeat(180_000));
+    // The session-scoped faux cache counts each turn's new prompt twice, so
+    // each turn measures the context plus its own prompt: the filler stays
+    // below the band, the crossing lands in it, the reserve turn passes the
+    // threshold, and the joined context (crossing + reserve kept) stays under it.
+    let filler = format!("history {}", "x".repeat(160_000));
+    let crossing = format!("crossing {}", "y".repeat(104_000));
+    let reserve_prompt = format!("reserve {}", "z".repeat(72_000));
     let usages = probe_usages(&["seed turn".to_string(), filler.clone()]);
     let (engine, _engine_dir, registration) = faux_engine_with_registration(
         &serde_json::json!({ "responses": [] }),
@@ -1401,8 +1412,12 @@ fn a_finished_background_summary_commits_at_the_next_boundary() {
     let _faux = FAUX_TEST_LOCK
         .lock()
         .unwrap_or_else(std::sync::PoisonError::into_inner);
-    let band_prompt = format!("seed turn {} crossing", "x".repeat(260_000));
-    let usages = probe_usages(&["seed turn".to_string(), band_prompt.clone()]);
+    let band_prompt = format!("seed turn {} crossing", "x".repeat(156_000));
+    let usages = probe_usages(&[
+        "seed turn".to_string(),
+        band_prompt.clone(),
+        "a small next turn".to_string(),
+    ]);
     let (engine, _engine_dir, registration) = faux_engine_with_registration(
         &serde_json::json!({
             "responses": [
@@ -1412,7 +1427,7 @@ fn a_finished_background_summary_commits_at_the_next_boundary() {
                 {"text": "follow-up reply"},
             ]
         }),
-        background_band_reserve(usages[0], usages[1]),
+        background_band_reserve(usages[1], usages[2]),
     );
     let mut events: Vec<EngineEvent> = Vec::new();
     admit(&engine, "seed turn".to_string(), &mut events);
@@ -1464,11 +1479,15 @@ fn a_failed_background_summarize_never_blocks_the_watermark_band() {
     let _faux = FAUX_TEST_LOCK
         .lock()
         .unwrap_or_else(std::sync::PoisonError::into_inner);
-    let band_prompt = format!("seed turn {} crossing", "x".repeat(260_000));
-    let usages = probe_usages(&["seed turn".to_string(), band_prompt.clone()]);
+    let band_prompt = format!("seed turn {} crossing", "x".repeat(156_000));
+    let usages = probe_usages(&[
+        "seed turn".to_string(),
+        band_prompt.clone(),
+        "a small next turn".to_string(),
+    ]);
     let (engine, _engine_dir, registration) = faux_engine_with_registration(
         &serde_json::json!({ "responses": [] }),
-        background_band_reserve(usages[0], usages[1]),
+        background_band_reserve(usages[1], usages[2]),
     );
     // Every turn answers; every summarize request errors: the summarize
     // context carries no tools, the session turns do.
@@ -1563,8 +1582,9 @@ fn a_routed_window_rejects_a_join_that_only_relieves_the_session_window() {
     // background flight starts there — while the 64k routed window's
     // threshold sits at 27_616: the same context is Reserve on the routed
     // model, and its kept tail alone already passes the session window's
-    // relief check.
-    let band_prompt = format!("band turn {}", "x".repeat(260_000));
+    // relief check. The band turn measures ~73k: the session-scoped faux
+    // cache counts its ~33k-token prompt twice.
+    let band_prompt = format!("band turn {}", "x".repeat(130_000));
     let (engine, _engine_dir, registration) = faux_engine_with_registration(
         &serde_json::json!({
             "responses": [
@@ -1630,11 +1650,15 @@ fn an_unrelieving_finished_background_summary_never_blocks_the_watermark_band() 
     let _faux = FAUX_TEST_LOCK
         .lock()
         .unwrap_or_else(std::sync::PoisonError::into_inner);
-    let band_prompt = format!("seed turn {} crossing", "x".repeat(260_000));
-    let usages = probe_usages(&["seed turn".to_string(), band_prompt.clone()]);
+    let band_prompt = format!("seed turn {} crossing", "x".repeat(156_000));
+    let usages = probe_usages(&[
+        "seed turn".to_string(),
+        band_prompt.clone(),
+        "a small next turn".to_string(),
+    ]);
     let (engine, _engine_dir, _replaced) = faux_engine_with_registration(
         &serde_json::json!({ "responses": [] }),
-        background_band_reserve(usages[0], usages[1]),
+        background_band_reserve(usages[1], usages[2]),
     );
     // The script registration above is replaced by one serving both lanes,
     // with response chunks large enough that even the oversized summary
@@ -1733,14 +1757,18 @@ fn stop_discards_a_finished_background_summary_before_the_next_boundary() {
     let _faux = FAUX_TEST_LOCK
         .lock()
         .unwrap_or_else(std::sync::PoisonError::into_inner);
-    let band_prompt = format!("seed turn {} crossing", "x".repeat(260_000));
-    let usages = probe_usages(&["seed turn".to_string(), band_prompt.clone()]);
+    let band_prompt = format!("seed turn {} crossing", "x".repeat(156_000));
+    let usages = probe_usages(&[
+        "seed turn".to_string(),
+        band_prompt.clone(),
+        "a small next turn".to_string(),
+    ]);
     let (engine, _dir, registration) = faux_engine_with_registration(
         &json!({"responses": [
             {"text": "seed reply"}, {"text": "crossing reply"},
             {"text": "cancelled summary"}, {"text": "fresh summary", "delayMs": 30_000}
         ]}),
-        background_band_reserve(usages[0], usages[1]),
+        background_band_reserve(usages[1], usages[2]),
     );
     let mut events = Vec::new();
     admit(&engine, "seed turn".to_string(), &mut events);
@@ -1779,15 +1807,19 @@ fn stop_cancels_a_held_background_summary_and_allows_a_fresh_flight() {
     let _faux = FAUX_TEST_LOCK
         .lock()
         .unwrap_or_else(std::sync::PoisonError::into_inner);
-    let band_prompt = format!("seed turn {} crossing", "x".repeat(260_000));
-    let usages = probe_usages(&["seed turn".to_string(), band_prompt.clone()]);
+    let band_prompt = format!("seed turn {} crossing", "x".repeat(156_000));
+    let usages = probe_usages(&[
+        "seed turn".to_string(),
+        band_prompt.clone(),
+        "a small next turn".to_string(),
+    ]);
     let (engine, _dir, registration) = faux_engine_with_registration(
         &json!({"responses": [
             {"text": "seed reply"}, {"text": "crossing reply"},
             {"text": "cancelled summary", "delayMs": 30_000},
             {"text": "fresh summary", "delayMs": 30_000}
         ]}),
-        background_band_reserve(usages[0], usages[1]),
+        background_band_reserve(usages[1], usages[2]),
     );
     let mut events = Vec::new();
     admit(&engine, "seed turn".to_string(), &mut events);
@@ -1821,14 +1853,18 @@ fn stop_at_compaction_start_never_restarts_a_cancelled_background_join() {
     let _faux = FAUX_TEST_LOCK
         .lock()
         .unwrap_or_else(std::sync::PoisonError::into_inner);
-    let band_prompt = format!("seed turn {} crossing", "x".repeat(260_000));
-    let usages = probe_usages(&["seed turn".to_string(), band_prompt.clone()]);
+    let band_prompt = format!("seed turn {} crossing", "x".repeat(156_000));
+    let usages = probe_usages(&[
+        "seed turn".to_string(),
+        band_prompt.clone(),
+        "a small next turn".to_string(),
+    ]);
     let (engine, _dir, registration) = faux_engine_with_registration(
         &json!({"responses": [
             {"text": "seed reply"}, {"text": "crossing reply"},
             {"text": "cancelled summary"}, {"text": "must not request a replacement"}
         ]}),
-        background_band_reserve(usages[0], usages[1]),
+        background_band_reserve(usages[1], usages[2]),
     );
     let mut events = Vec::new();
     admit(&engine, "seed turn".to_string(), &mut events);
@@ -1882,14 +1918,18 @@ fn stop_before_the_core_consult_does_not_start_a_replacement_flight() {
     let _faux = FAUX_TEST_LOCK
         .lock()
         .unwrap_or_else(std::sync::PoisonError::into_inner);
-    let band_prompt = format!("seed turn {} crossing", "x".repeat(260_000));
-    let usages = probe_usages(&["seed turn".to_string(), band_prompt.clone()]);
+    let band_prompt = format!("seed turn {} crossing", "x".repeat(156_000));
+    let usages = probe_usages(&[
+        "seed turn".to_string(),
+        band_prompt.clone(),
+        "a small next turn".to_string(),
+    ]);
     let (engine, _dir, registration) = faux_engine_with_registration(
         &json!({"responses": [
             {"text": "seed reply"}, {"text": "crossing reply"},
             {"text": "cancelled summary"}, {"text": "must not request a replacement"}
         ]}),
-        background_band_reserve(usages[0], usages[1]),
+        background_band_reserve(usages[1], usages[2]),
     );
     let engine = std::sync::Arc::new(engine);
     let mut events = Vec::new();
@@ -2055,11 +2095,15 @@ fn an_in_run_background_crossing_starts_a_flight_without_yielding_the_tool_run()
     let _faux = FAUX_TEST_LOCK
         .lock()
         .unwrap_or_else(std::sync::PoisonError::into_inner);
-    let crossing_prompt = format!("crossing {}", "x".repeat(260_000));
-    let usages = probe_usages(&["seed turn".to_string(), crossing_prompt.clone()]);
+    let crossing_prompt = format!("crossing {}", "x".repeat(156_000));
+    let usages = probe_usages(&[
+        "seed turn".to_string(),
+        crossing_prompt.clone(),
+        "a small next turn".to_string(),
+    ]);
     let (engine, _engine_dir, registration) = faux_engine_with_registration(
         &serde_json::json!({ "responses": [] }),
-        background_band_reserve(usages[0], usages[1]),
+        background_band_reserve(usages[1], usages[2]),
     );
     // One factory serves both lanes: session turns (tools in the context)
     // pop scripted turn messages; the background summarize (no tools in the
@@ -2199,8 +2243,12 @@ fn stop_before_the_in_run_hook_starts_no_background_summarize() {
     let _faux = FAUX_TEST_LOCK
         .lock()
         .unwrap_or_else(std::sync::PoisonError::into_inner);
-    let crossing_prompt = format!("crossing {}", "x".repeat(260_000));
-    let usages = probe_usages(&["seed turn".to_string(), crossing_prompt.clone()]);
+    let crossing_prompt = format!("crossing {}", "x".repeat(156_000));
+    let usages = probe_usages(&[
+        "seed turn".to_string(),
+        crossing_prompt.clone(),
+        "a small next turn".to_string(),
+    ]);
     let turn_calls = std::sync::Arc::new(std::sync::atomic::AtomicU64::new(0));
     let engine_slot =
         std::sync::Arc::new(std::sync::OnceLock::<std::sync::Weak<AgentSessionEngine>>::new());
@@ -2223,7 +2271,7 @@ fn stop_before_the_in_run_hook_starts_no_background_summarize() {
     };
     let (engine, _engine_dir, registration) = faux_engine_with_steering_probe(
         &serde_json::json!({ "responses": [] }),
-        background_band_reserve(usages[0], usages[1]),
+        background_band_reserve(usages[1], usages[2]),
         Some(probe),
     );
     let engine = std::sync::Arc::new(engine);
