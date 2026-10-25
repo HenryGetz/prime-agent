@@ -37,10 +37,12 @@ fn default_temp_file_path(prefix: &str) -> PathBuf {
     std::env::temp_dir().join(format!("{prefix}-{id:032x}.log"))
 }
 
-/// Streaming UTF-8 decoder matching `TextDecoder` `{ stream: true }`: incomplete
-/// sequences are buffered; invalid bytes become one U+FFFD per maximal subpart.
-/// One decoder per byte stream: feed each read to [`Self::decode_chunk`], then
-/// [`Self::flush`] once at end of stream.
+/// Streaming UTF-8 decoder matching `TextDecoder` `{ stream: true }`: an
+/// incomplete trailing sequence is buffered for the next chunk, and invalid
+/// bytes become one U+FFFD per maximal subpart (the `String::from_utf8_lossy`
+/// rule), so an overlong, surrogate or out-of-range sequence such as
+/// `ED A0 80` yields one U+FFFD per byte. One decoder per byte stream: feed each
+/// read to [`Self::decode_chunk`], then [`Self::flush`] once at end of stream.
 #[derive(Default)]
 pub struct StreamingUtf8 {
     buffer: Vec<u8>,
@@ -51,106 +53,49 @@ impl StreamingUtf8 {
     /// incomplete sequence waits for the next chunk.
     pub fn decode_chunk(&mut self, data: &[u8]) -> String {
         self.buffer.extend_from_slice(data);
-        let mut text = String::new();
-        let mut start = 0usize;
-        let buf = &self.buffer;
-        while start < buf.len() {
-            match decode_utf8_char(&buf[start..]) {
-                Decoded::Char(len) => {
-                    // Safety-free push: re-encode the validated sequence.
-                    text.push_str(
-                        std::str::from_utf8(&buf[start..start + len]).unwrap_or("\u{FFFD}"),
-                    );
-                    start += len;
-                }
-                Decoded::Invalid(len) => {
-                    text.push('\u{FFFD}');
-                    start += len;
-                }
-                Decoded::Incomplete => break,
-            }
-        }
-        self.buffer.drain(..start);
+        let (text, consumed) = decode_lossy_prefix(&self.buffer);
+        self.buffer.drain(..consumed);
         text
     }
 
     /// End of stream: decode whatever is left, a truncated trailing sequence
     /// as one U+FFFD.
     pub fn flush(&mut self) -> String {
-        if self.buffer.is_empty() {
-            return String::new();
-        }
-        let mut text = String::new();
-        let mut start = 0usize;
-        let buf = std::mem::take(&mut self.buffer);
-        while start < buf.len() {
-            match decode_utf8_char(&buf[start..]) {
-                Decoded::Char(len) => {
-                    text.push_str(
-                        std::str::from_utf8(&buf[start..start + len]).unwrap_or("\u{FFFD}"),
-                    );
-                    start += len;
-                }
-                Decoded::Invalid(len) => {
-                    text.push('\u{FFFD}');
-                    start += len;
-                }
-                Decoded::Incomplete => {
-                    // Truncated trailing sequence at end of stream: one replacement char.
-                    text.push('\u{FFFD}');
-                    break;
-                }
-            }
+        let buffer = std::mem::take(&mut self.buffer);
+        let (mut text, consumed) = decode_lossy_prefix(&buffer);
+        if consumed < buffer.len() {
+            text.push('\u{FFFD}');
         }
         text
     }
 }
 
-enum Decoded {
-    Char(usize),
-    Invalid(usize),
-    Incomplete,
-}
-
-/// Decode one UTF-8 sequence at the start of `buf`, mirroring the WHATWG
-/// decoder's maximal-subpart behavior.
-fn decode_utf8_char(buf: &[u8]) -> Decoded {
-    if buf.is_empty() {
-        return Decoded::Incomplete;
-    }
-    let b0 = buf[0];
-    if b0 < 0x80 {
-        return Decoded::Char(1);
-    }
-    let (len, min, mut cp) = if b0 & 0xE0 == 0xC0 {
-        (2usize, 0x80u32, u32::from(b0 & 0x1F))
-    } else if b0 & 0xF0 == 0xE0 {
-        (3, 0x800, u32::from(b0 & 0x0F))
-    } else if b0 & 0xF8 == 0xF0 {
-        (4, 0x10000, u32::from(b0 & 0x07))
-    } else {
-        return Decoded::Invalid(1);
-    };
-    if buf.len() < len {
-        // Check for an invalid leading byte early: a shorter buffer that can
-        // never become valid must fail now, not wait for more bytes.
-        for (i, b) in buf.iter().enumerate().take(len).skip(1) {
-            if b & 0xC0 != 0x80 {
-                return Decoded::Invalid(i);
+/// Lossily decode `bytes` up to a trailing incomplete sequence, returning the
+/// text and how many bytes it consumed; the unconsumed tail is a valid prefix
+/// of a character that more bytes may complete.
+fn decode_lossy_prefix(bytes: &[u8]) -> (String, usize) {
+    let mut text = String::with_capacity(bytes.len());
+    let mut rest = bytes;
+    loop {
+        match std::str::from_utf8(rest) {
+            Ok(valid) => {
+                text.push_str(valid);
+                return (text, bytes.len());
+            }
+            Err(error) => {
+                let (valid, after) = rest.split_at(error.valid_up_to());
+                // `valid_up_to` marks the longest valid prefix, so this never fails.
+                text.push_str(std::str::from_utf8(valid).unwrap_or_default());
+                match error.error_len() {
+                    Some(invalid) => {
+                        text.push('\u{FFFD}');
+                        rest = &after[invalid..];
+                    }
+                    None => return (text, bytes.len() - after.len()),
+                }
             }
         }
-        return Decoded::Incomplete;
     }
-    for (i, b) in buf.iter().enumerate().take(len).skip(1) {
-        if b & 0xC0 != 0x80 {
-            return Decoded::Invalid(i);
-        }
-        cp = (cp << 6) | u32::from(b & 0x3F);
-    }
-    if cp < min || (0xD800..=0xDFFF).contains(&cp) || cp > 0x0010_FFFF {
-        return Decoded::Invalid(len);
-    }
-    Decoded::Char(len)
 }
 
 /// One spill lifecycle with exactly two terminal states: a COMPLETE file whose path `finalize()`
@@ -446,3 +391,56 @@ impl OutputAccumulator {
 
 #[allow(dead_code)]
 fn _unused(_: &Path) {}
+
+#[cfg(test)]
+mod tests {
+    use super::StreamingUtf8;
+
+    /// Feeding `bytes` one byte at a time and flushing decodes exactly what
+    /// `String::from_utf8_lossy` (TextDecoder's maximal-subpart rule) does for
+    /// the whole input.
+    fn assert_matches_lossy(bytes: &[u8]) {
+        let expected = String::from_utf8_lossy(bytes).into_owned();
+        let mut whole = StreamingUtf8::default();
+        let mut whole_text = whole.decode_chunk(bytes);
+        whole_text.push_str(&whole.flush());
+        assert_eq!(whole_text, expected, "one chunk: {bytes:02X?}");
+        let mut split = StreamingUtf8::default();
+        let mut split_text: String = bytes
+            .iter()
+            .map(|byte| split.decode_chunk(std::slice::from_ref(byte)))
+            .collect();
+        split_text.push_str(&split.flush());
+        assert_eq!(split_text, expected, "byte by byte: {bytes:02X?}");
+    }
+
+    #[test]
+    fn a_surrogate_sequence_gives_one_replacement_per_byte() {
+        assert_matches_lossy(b"a\xED\xA0\x80b");
+        assert_eq!(
+            String::from_utf8_lossy(b"\xED\xA0\x80").matches('\u{FFFD}').count(),
+            3
+        );
+    }
+
+    #[test]
+    fn an_overlong_sequence_gives_one_replacement_per_byte() {
+        assert_matches_lossy(b"a\xE0\x80\xAFb");
+        assert_matches_lossy(b"\xC0\xAF");
+    }
+
+    #[test]
+    fn an_out_of_range_sequence_gives_one_replacement_per_byte() {
+        assert_matches_lossy(b"a\xF4\x90\x80\x80b");
+        assert_matches_lossy(b"\xF5\x80\x80\x80");
+    }
+
+    #[test]
+    fn a_split_character_decodes_intact_and_a_truncated_tail_flushes_once() {
+        assert_matches_lossy("\u{20ac}\u{1F600}".as_bytes());
+        let mut decoder = StreamingUtf8::default();
+        assert_eq!(decoder.decode_chunk(b"x\xE2\x82"), "x");
+        assert_eq!(decoder.flush(), "\u{FFFD}");
+        assert_matches_lossy(b"x\xE2\x82");
+    }
+}
