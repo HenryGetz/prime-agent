@@ -186,6 +186,11 @@ fn build_headers(
             headers.push((name.clone(), value.clone()));
         }
     }
+    crate::providers::opencode_headers::apply(
+        &mut headers,
+        &model.provider,
+        options.base.session_id.as_deref(),
+    );
     headers
 }
 
