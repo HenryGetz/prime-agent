@@ -10,6 +10,7 @@ use serde_json::{json, Value};
 
 mod auth;
 mod convert;
+mod credential_process;
 mod events;
 mod eventstream;
 mod goaway;
@@ -496,12 +497,12 @@ async fn run_stream(
     }
 
     let (endpoint, region) = resolve_endpoint(model, &options);
-    let path_and_query = format!("/model/{}/converse-stream", encode_model_id(&model.id));
+    let path = format!("/model/{}/converse-stream", encode_model_id(&model.id));
     let host = url::Url::parse(&endpoint)
         .ok()
         .and_then(|url| url.host_str().map(str::to_string))
         .ok_or_else(|| ProviderError::Message(format!("Invalid Bedrock endpoint: {endpoint}")))?;
-    let url = format!("{endpoint}{path_and_query}");
+    let url = format!("{endpoint}{path}");
 
     let mut headers: Vec<(String, String)> = vec![
         ("content-type".into(), "application/json".into()),
@@ -538,13 +539,25 @@ async fn run_stream(
             headers.push((name.clone(), value.clone()));
         }
     } else {
-        let credentials = resolve_credentials(options.profile.as_deref()).ok_or_else(|| {
+        // Resolution may run the profile's credential_process, so it honours the request's signal;
+        // leaving the select drops the resolution, which kills a stalled process.
+        let cancelled = async {
+            match &options.base.signal {
+                Some(signal) => signal.cancelled().await,
+                None => std::future::pending().await,
+            }
+        };
+        let credentials = tokio::select! {
+            () = cancelled => return Err(ProviderError::Aborted),
+            credentials = resolve_credentials(options.profile.as_deref()) => credentials,
+        }
+        .ok_or_else(|| {
             ProviderError::Message("No AWS credentials available for Bedrock".to_string())
         })?;
         let (amz_date, authorization, security_token) = sigv4_headers(
             &crate::providers::bedrock::auth::SigV4Params {
                 method: "POST",
-                path_and_query: &path_and_query,
+                path: &path,
                 host: &host,
                 region: &region,
                 service: "bedrock",
