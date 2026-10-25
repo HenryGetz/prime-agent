@@ -284,12 +284,20 @@ impl AgentSession {
                 store: std::sync::Arc::clone(&self.usage_store),
                 bill: crate::session_engine::compact_session::SummaryBill::default(),
             };
-            let mut prepared = crate::session_engine::compact_session::summarize_attempt(
+            let summarized = crate::session_engine::compact_session::summarize_attempt(
                 &attempt,
                 &attempt_options,
                 &summaries.bill,
             )
-            .await?;
+            .await;
+            let mut prepared = match summarized {
+                Ok(prepared) => prepared,
+                Err(error) => {
+                    // A failed or aborted attempt's resolved calls land before the error returns.
+                    self.record_model_usage(summaries.bill.take()).await;
+                    return Err(error);
+                }
+            };
             // A toggle during the summarizer request must not re-inject the captured digest.
             if !self.harness_refinements_enabled() {
                 prepared.entry.harness_digest = None;
@@ -302,7 +310,14 @@ impl AgentSession {
                     &mut attempt,
                     &prepared,
                     options.abort,
-                )?
+                )
+            };
+            let committed = match committed {
+                Ok(committed) => committed,
+                Err(error) => {
+                    self.record_model_usage(summaries.bill.take()).await;
+                    return Err(error);
+                }
             };
             if committed {
                 // The committed row carries the attempt's calls.
@@ -489,11 +504,11 @@ impl AgentSession {
     }
 }
 
-/// One compaction attempt's summarizer spend until it commits. An attempt
-/// that fails, aborts, or whose compaction future is dropped mid-flight
-/// records its resolved calls as a `compaction_discarded` `model_usage` row
-/// when this drops. A commit takes the bill first, since the compaction row
-/// carries those calls; a structural conflict records it before the retry.
+/// One compaction attempt's summarizer spend until it commits. A commit takes
+/// the bill (the compaction row carries those calls); a conflict, failure, or
+/// abort records it as a `compaction_discarded` `model_usage` row before
+/// `compaction_attempts` moves on. What is left when this drops belongs to a
+/// compaction future the caller dropped mid-flight, recorded from here.
 struct UncommittedSummaries {
     store: std::sync::Arc<dyn super::rlm_usage::RlmChildUsageStore>,
     bill: crate::session_engine::compact_session::SummaryBill,

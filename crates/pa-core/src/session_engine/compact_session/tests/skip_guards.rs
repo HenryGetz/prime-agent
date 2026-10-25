@@ -140,27 +140,19 @@ async fn a_late_abort_records_the_discarded_summary_call() {
         .unwrap_err();
     aborter.await.unwrap();
     assert!(pa_agent::abort::is_abort_error(&error), "{error:#}");
-    // The discarded attempt records its call as it drops, off the caller's task.
-    let mut billed = Vec::new();
-    for _ in 0..100 {
-        tokio::task::yield_now().await;
-        billed = session
-            .shared_persistence()
-            .lock()
-            .await
-            .get_entries()
-            .into_iter()
-            .filter_map(|entry| match entry {
-                FileEntry::Custom { payload, .. } if payload.custom_type == "model_usage" => {
-                    payload.data
-                }
-                _ => None,
-            })
-            .collect::<Vec<_>>();
-        if !billed.is_empty() {
-            break;
-        }
-    }
+    let billed = session
+        .shared_persistence()
+        .lock()
+        .await
+        .get_entries()
+        .into_iter()
+        .filter_map(|entry| match entry {
+            FileEntry::Custom { payload, .. } if payload.custom_type == "model_usage" => {
+                payload.data
+            }
+            _ => None,
+        })
+        .collect::<Vec<_>>();
     let [row] = billed.as_slice() else {
         panic!("one billed row: {billed:?}");
     };
