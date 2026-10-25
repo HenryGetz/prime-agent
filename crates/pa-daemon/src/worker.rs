@@ -41,8 +41,9 @@ use create::{active_session_id_of, worker_server_capabilities};
 // session_summary/SummaryInputs serve the in-crate test modules only, so allow the unused import.
 #[allow(unused_imports)]
 pub(crate) use summary::{
-    compact_action_label, emit_worker_event_with, persist_custom_row, push_roster_delta,
-    session_snapshot, session_summary, RosterPushContext, SummaryInputs,
+    broadcast_custom_row_locked, compact_action_label, emit_worker_event_locked,
+    emit_worker_event_with, persist_custom_row, push_roster_delta, session_snapshot,
+    session_summary, RosterPushContext, SummaryInputs,
 };
 use turn::TurnRunner;
 
@@ -991,23 +992,7 @@ pub(crate) fn emit_refinement_row_for_generation(
     });
     // Persistence and both frames belong to the same session generation. A
     // navigation cannot replace the store between the check and either send.
-    for kind in ["message_start", "message_end"] {
-        core.last_event_sequence += 1;
-        let meta = crate::protocol::create_daemon_event_meta(
-            &core.active_session_id,
-            core.last_event_sequence,
-            None,
-            Some(&core.generation),
-        );
-        let outbound = crate::protocol::DaemonOutbound::SessionEvent {
-            active_session_id: core.active_session_id.clone(),
-            event: json!({ "type": kind, "message": message }),
-            meta: Some(meta),
-            rest: Map::default(),
-        };
-        let payload = serde_json::to_vec(&outbound).unwrap_or_default();
-        events.send(OutboundFrame::session_event(payload));
-    }
+    broadcast_custom_row_locked(&mut core, events, message);
     true
 }
 
