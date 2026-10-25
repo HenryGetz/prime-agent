@@ -613,6 +613,14 @@ fn a_click_toggles_only_the_clicked_component() {
         "the agent message stays collapsed: {last}"
     );
     assert!(
+        last.contains("Agent message \u{b7} \u{2191}"),
+        "the card's sent-message row renders: {last}"
+    );
+    assert!(
+        !last.contains("\u{2570}\u{2500} a queued receipt"),
+        "the card's sent message stays collapsed: {last}"
+    );
+    assert!(
         !last.contains("before the message"),
         "the thinking blocks stay hidden - the level never moved: {last}"
     );
