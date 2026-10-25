@@ -46,7 +46,7 @@ class SessionMessagesTest(unittest.TestCase):
             "customType": "agent_message",
             "content": "[task from parent]",
             "display": True,
-            "timestamp": "1970-01-01T00:00:01.004Z",
+            "timestamp": "2004-07-21T00:47:44.465Z",
         }
         host = FakeHost(
             {
@@ -70,7 +70,7 @@ class SessionMessagesTest(unittest.TestCase):
             [
                 (7, "e7", "assistant", "answer", 1001),
                 (8, "e8", "compactionSummary", "the story so far", 1003),
-                (9, "e9", "custom", "[task from parent]", 1004),
+                (9, "e9", "custom", "[task from parent]", 1090370864465),
             ],
         )
         self.assertEqual(messages[0].raw["content"][2]["name"], "python_repl")

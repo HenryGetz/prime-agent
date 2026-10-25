@@ -665,7 +665,7 @@ def _message_timestamp(message: dict[str, Any]) -> int | None:
     value = message.get("timestamp")
     if isinstance(value, str):
         # Custom rows carry their row's ISO time; every other row carries epoch ms.
-        return int(datetime.fromisoformat(value).timestamp() * 1000)
+        return round(datetime.fromisoformat(value).timestamp() * 1000)
     return None if value is None else int(value)
 
 
