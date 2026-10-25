@@ -351,7 +351,7 @@ pub(crate) fn build_headers(
         }
     }
 
-    let _ = conversation_id;
+    crate::providers::opencode_headers::apply(&mut headers, &model.provider, conversation_id);
     headers
 }
 

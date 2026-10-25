@@ -1312,3 +1312,50 @@ async fn branch_change_discards_prepared_plan_but_allows_new_refinements() {
         crate::refinement::load_harness_state(&global_dir, crate::refinement::HarnessScope::Global);
     assert_eq!(state.refinements.len(), 1);
 }
+
+#[tokio::test]
+async fn refinement_and_auto_review_preserve_conversation_identity() {
+    let (session, tmp) = refine_test_session().await;
+    let expected = session.session_id().await;
+    let registration =
+        pa_ai::faux::register_faux_provider(pa_ai::faux::RegisterFauxProviderOptions::default());
+    let observed = Arc::new(std::sync::Mutex::new(Vec::new()));
+    let step = |text: &'static str| {
+        let observed = Arc::clone(&observed);
+        pa_ai::faux::FauxResponseStep::Factory(Arc::new(move |_, options, _, _| {
+            observed.lock().unwrap().push((
+                options.and_then(|o| o.session_id.clone()),
+                options.and_then(|o| o.transport),
+            ));
+            Ok(pa_ai::faux::faux_assistant_text_message(
+                text,
+                pa_ai::faux::FauxAssistantMessageOptions::default(),
+            ))
+        }))
+    };
+    registration.set_responses(vec![
+        step(EMPTY_PLAN),
+        step(r#"{"shouldRefine":false,"rationale":"fixture"}"#),
+    ]);
+    let model = registration.get_model();
+    let global = tmp.path().join("harness");
+    session
+        .start_refinement(
+            refine::RefineOptions::default(),
+            refine::RefinementSource::User,
+            model.clone(),
+            None,
+            global.clone(),
+        )
+        .await
+        .expect("the refinement task joined")
+        .unwrap();
+    session
+        .review_compact_auto_refine(&model, None, &global, 5, 0)
+        .await
+        .unwrap();
+    assert_eq!(
+        *observed.lock().unwrap(),
+        vec![(Some(expected), Some(pa_ai::types::Transport::Sse)); 2]
+    );
+}

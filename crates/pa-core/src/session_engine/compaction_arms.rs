@@ -400,19 +400,29 @@ impl AgentSession {
         api_key: Option<String>,
         global_harness_dir: std::path::PathBuf,
     ) -> tokio::task::JoinHandle<anyhow::Result<refine::CommittedRefinement>> {
-        tokio::spawn(refine::run_refinement(
-            self.session.clone(),
-            self.agent.clone(),
-            self.compaction_flight.clone(),
-            self.refinements_in_flight.clone(),
-            self.refinement_signal(),
-            self.agent_dir.clone(),
-            options,
-            source,
-            model,
-            refine::default_refiner_call(api_key),
-            global_harness_dir,
-        ))
+        let session = self.session.clone();
+        let agent = self.agent.clone();
+        let flight = self.compaction_flight.clone();
+        let in_flight = self.refinements_in_flight.clone();
+        let cancel = self.refinement_signal();
+        let agent_dir = self.agent_dir.clone();
+        tokio::spawn(async move {
+            let session_id = session.lock().await.get_session_id().to_string();
+            refine::run_refinement(
+                session,
+                agent,
+                flight,
+                in_flight,
+                cancel,
+                agent_dir,
+                options,
+                source,
+                model,
+                refine::default_refiner_call(api_key, session_id),
+                global_harness_dir,
+            )
+            .await
+        })
     }
 
     /// One awaited refinement run with an injected refiner call: the seam the

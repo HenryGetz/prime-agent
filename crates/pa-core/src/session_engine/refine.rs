@@ -724,7 +724,7 @@ async fn review_compact_refinement(
 ) -> anyhow::Result<Option<AutoRefineReview>> {
     // The review reads the same planning inputs the run plans
     // against, extracted under this lock from the retained rows.
-    let (parts, merged_state, history) = {
+    let (parts, merged_state, history, session_id) = {
         let session = session.lock().await;
         let local_state =
             load_harness_state(&local_harness_state_dir(&session), HarnessScope::Local);
@@ -733,6 +733,7 @@ async fn review_compact_refinement(
             session.refine_transcript_parts(),
             merge_harness_states(&global_state, Some(&local_state)),
             load_global_refinement_history(global_harness_dir),
+            session.get_session_id().to_string(),
         )
     };
     // Refinement deliberately reviews historical messages; await the
@@ -751,7 +752,7 @@ async fn review_compact_refinement(
             reason: AUTO_REFINE_COMPACT_REASON.to_string(),
             turns_since_last_review,
         },
-        default_refiner_call(api_key.clone()),
+        default_refiner_call(api_key.clone(), session_id),
     )
     .await?;
     if !review.should_refine {
@@ -849,6 +850,7 @@ impl AgentSession {
                 )),
                 rollback_id: None,
             };
+            let session_id = session.lock().await.get_session_id().to_string();
             run_refinement(
                 session,
                 agent,
@@ -859,7 +861,7 @@ impl AgentSession {
                 options,
                 RefinementSource::Auto,
                 model,
-                default_refiner_call(api_key),
+                default_refiner_call(api_key, session_id),
                 global_harness_dir,
             )
             .await
@@ -892,7 +894,7 @@ impl AgentSession {
             options,
             RefinementSource::Auto,
             model.clone(),
-            default_refiner_call(api_key),
+            default_refiner_call(api_key, self.session_id().await),
             global_harness_dir,
         )
         .await
@@ -902,7 +904,10 @@ impl AgentSession {
 
 /// The default model seam over pa-ai completion.
 #[must_use]
-pub fn default_refiner_call(api_key: Option<String>) -> crate::refinement::executor::RefinerFn {
+pub fn default_refiner_call(
+    api_key: Option<String>,
+    session_id: String,
+) -> crate::refinement::executor::RefinerFn {
     Box::new(move |model, system_prompt, prompt| {
         let api_key = api_key;
         Box::pin(async move {
@@ -918,6 +923,11 @@ pub fn default_refiner_call(api_key: Option<String>) -> crate::refinement::execu
             let mut stream_options =
                 pa_ai::types::SimpleStreamOptions::from_base(pa_ai::types::StreamOptions {
                     api_key,
+                    session_id: Some(session_id),
+                    // One-off prompts ride SSE: they keep the conversation id (cache key,
+                    // opencode routing) but never take or replace the session's Codex
+                    // WebSocket and its continuation.
+                    transport: Some(pa_ai::types::Transport::Sse),
                     ..Default::default()
                 });
             stream_options.reasoning = pa_types::ai::minimum_reasoning(&model);
