@@ -397,7 +397,7 @@ mod tests {
     use super::StreamingUtf8;
 
     /// Feeding `bytes` one byte at a time and flushing decodes exactly what
-    /// `String::from_utf8_lossy` (TextDecoder's maximal-subpart rule) does for
+    /// `String::from_utf8_lossy` (`TextDecoder`'s maximal-subpart rule) does for
     /// the whole input.
     fn assert_matches_lossy(bytes: &[u8]) {
         let expected = String::from_utf8_lossy(bytes).into_owned();
@@ -417,10 +417,8 @@ mod tests {
     #[test]
     fn a_surrogate_sequence_gives_one_replacement_per_byte() {
         assert_matches_lossy(b"a\xED\xA0\x80b");
-        assert_eq!(
-            String::from_utf8_lossy(b"\xED\xA0\x80").matches('\u{FFFD}').count(),
-            3
-        );
+        let mut decoder = StreamingUtf8::default();
+        assert_eq!(decoder.decode_chunk(b"\xED\xA0\x80"), "\u{FFFD}".repeat(3));
     }
 
     #[test]
