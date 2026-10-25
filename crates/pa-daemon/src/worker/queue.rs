@@ -21,6 +21,17 @@ impl Lane {
     }
 }
 
+/// How the previous run stopped, as the turn runner saw it: the delivery
+/// after a [`RunBoundary::MidRun`] cut leaves the follow-up lane waiting.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) enum RunBoundary {
+    /// The steering probe stopped the run between tool turns.
+    MidRun,
+    /// The run finished on its own, was aborted or failed, or there was no
+    /// run (first pickup, idle wake, worker restart).
+    RunEnd,
+}
+
 /// How long the close paths (`shutdown`, `kill`) wait for aborted side
 /// question runs to queue their terminal cancelled events: headroom, not a gate.
 pub(crate) const SIDE_QUESTION_SETTLE_TIMEOUT: Duration = Duration::from_secs(3);
@@ -326,21 +337,16 @@ pub(crate) fn queue_lanes(core: &SessionCore) -> QueueLanes {
     }
 }
 
-/// The next delivery: steering first, then follow-up. At the end of a run
-/// the follow-up lane is due anyway, so a steering notification run that
+/// The next delivery: steering first, then follow-up. At a run end the
+/// follow-up lane is due anyway, so a steering notification run that
 /// empties its lane carries follow-up's leading notification run into the
-/// same delivery. A run the steering probe cut mid tool loop leaves the
-/// follow-up lane waiting.
-pub(crate) fn gather_delivery(core: &mut SessionCore) -> Vec<QueuedItem> {
+/// same delivery. After a mid-run cut the follow-up lane keeps waiting.
+pub(crate) fn gather_delivery(core: &mut SessionCore, boundary: RunBoundary) -> Vec<QueuedItem> {
     if core.steering.is_empty() {
         return gather_delivery_batch(core, Lane::FollowUp);
     }
     let mut batch = gather_delivery_batch(core, Lane::Steering);
-    let mid_run = core
-        .store
-        .as_ref()
-        .is_some_and(crate::session_store::SessionFile::ends_mid_tool_loop);
-    if core.steering.is_empty() && batch[0].is_notification() && !mid_run {
+    if core.steering.is_empty() && batch[0].is_notification() && boundary == RunBoundary::RunEnd {
         batch.extend(take_notification_run(&mut core.follow_up));
     }
     batch

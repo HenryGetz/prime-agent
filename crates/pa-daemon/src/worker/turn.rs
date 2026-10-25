@@ -4,8 +4,8 @@ use super::{
     checkpoint_queue_recovery, compact_action_label, create_daemon_event_meta,
     emit_refinement_event_for_session, emit_refinement_row, gather_delivery, json, oneshot,
     session_snapshot, AssistantSnapshot, DaemonOutbound, EngineEvent, EventPump, Map, Notify,
-    OutboundFrame, PromptRequest, QueueCheckpoint, QueuedItem, Result, SessionActionSnapshot,
-    SessionCore, SessionEngine, TurnSettle, Value, WorkerRecoveryJournal,
+    OutboundFrame, PromptRequest, QueueCheckpoint, QueuedItem, Result, RunBoundary,
+    SessionActionSnapshot, SessionCore, SessionEngine, TurnSettle, Value, WorkerRecoveryJournal,
     ABORTED_TURN_SETTLE_ERROR,
 };
 
@@ -43,6 +43,8 @@ pub(super) struct PassivationContext {
 
 impl TurnRunner {
     pub(super) async fn run(self) {
+        // No run precedes the first pickup.
+        let mut boundary = RunBoundary::RunEnd;
         loop {
             let engine = self.engine.clone();
             let item: Option<Vec<QueuedItem>> = {
@@ -64,7 +66,7 @@ impl TurnRunner {
                     core.busy = false;
                     None
                 } else {
-                    let items = gather_delivery(&mut core);
+                    let items = gather_delivery(&mut core, boundary);
                     core.running_admission_ids = items
                         .iter()
                         .filter_map(|item| item.admission_id.clone())
@@ -99,8 +101,9 @@ impl TurnRunner {
                     let _ = self.emit_action_update(&snapshot);
                 }
                 self.push_roster_delta();
-                self.run_turn(engine, items).await;
+                boundary = self.run_turn(engine, items).await;
             } else {
+                boundary = RunBoundary::RunEnd;
                 self.idle_notify.notify_waiters();
                 // Every park re-stamps the activity end: the idle-eviction
                 // window measures from the TRUE last activity.
@@ -299,14 +302,14 @@ impl TurnRunner {
 
     /// One delivery: the first item anchors the turn and the rest ride
     /// as co-delivered rows of the same run (user rows, or the custom rows
-    /// of a notification run).
+    /// of a notification run). Returns how the run stopped.
     pub(super) async fn run_turn(
         &self,
         engine: std::sync::Arc<dyn SessionEngine>,
         items: Vec<QueuedItem>,
-    ) {
+    ) -> RunBoundary {
         let Some((first, batched)) = items.split_first() else {
-            return;
+            return RunBoundary::RunEnd;
         };
         self.emit_turn_event(json!({ "type": "agent_start" }));
         self.emit_turn_event(json!({ "type": "turn_start" }));
@@ -416,6 +419,9 @@ impl TurnRunner {
             // The engine's own terminal `turn_end` frame keeps the
             // trailing `Done` fallback silent.
             let mut engine_turn_ended = false;
+            // Whether the run's last turn executed tool calls: a completed
+            // run that stops there was cut before its next model call.
+            let mut ends_on_tool_results = false;
             let mut active_committed = false;
             let mut active_running = false;
             // Restored next-turn rows are PREFIX rows: the "Starting" row
@@ -431,8 +437,9 @@ impl TurnRunner {
                 // TS still broadcasts for an interrupted turn: aborted row/tool settle
                 // frames and the trailing `Done` (a dropped Done hung `prompt_and_wait`
                 // forever).
-                if matches!(event, EngineEvent::TurnEnd { .. }) {
+                if let EngineEvent::TurnEnd { tool_results, .. } = &event {
                     engine_turn_ended = true;
+                    ends_on_tool_results = !tool_results.is_empty();
                 }
                 if matches!(event, EngineEvent::AgentEnd { .. }) {
                     engine_agent_end_seen.store(true, std::sync::atomic::Ordering::SeqCst);
@@ -1037,8 +1044,9 @@ impl TurnRunner {
                 engine.set_prompt_context_boundary(prompt_context_leaf);
             }
             engine.run_prompt(prompt_index, request, &aborted_probe, &mut emit);
+            ends_on_tool_results
         });
-        let _ = turn.await;
+        let ends_on_tool_results = turn.await.unwrap_or(false);
         // The emit path is joined: a stale parked partial must not
         // surface after the settle events.
         coalescer.close();
@@ -1138,6 +1146,13 @@ impl TurnRunner {
         // The turn is fully unwound: the waiting prompt now resolves, so
         // a client's next request always observes the idle session.
         let settled_outcome = turn_outcome.lock().unwrap().take();
+        // An aborted or failed run ended; only a completed one can be a cut.
+        let boundary =
+            if ends_on_tool_results && matches!(settled_outcome, Some(TurnSettle::Completed)) {
+                RunBoundary::MidRun
+            } else {
+                RunBoundary::RunEnd
+            };
         if let Some(result) = settled_outcome {
             for done in items_done {
                 let _ = done.send(result.clone());
@@ -1217,6 +1232,7 @@ impl TurnRunner {
                 }
             });
         }
+        boundary
     }
 
     /// The post-turn queue projection: an unchanged snapshot stays

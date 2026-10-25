@@ -599,21 +599,6 @@ impl SessionFile {
             .and_then(prompt_timestamp_ms)
     }
 
-    /// Whether the branch ends inside a tool loop: its newest assistant or
-    /// tool-result row is a tool result the model has not answered yet (a
-    /// run the steering probe cut between tool turns). Rows a cut can leave
-    /// behind it (custom notices, compaction, model changes) are skipped.
-    #[must_use]
-    pub fn ends_mid_tool_loop(&self) -> bool {
-        self.walk_back(self.branch_leaf()).find_map(|position| {
-            let entry = &self.entries[position];
-            (entry.type_ == "message")
-                .then(|| entry.fields.get("message").and_then(message_role))
-                .flatten()
-                .filter(|role| matches!(*role, "assistant" | "toolResult"))
-        }) == Some("toolResult")
-    }
-
     /// The durable entry id the compaction cut keeps: the engine's
     /// `firstKeptEntryId` references in-memory ids that never exist in the file —
     /// the re-cut pins the boundary the file read recognizes.
