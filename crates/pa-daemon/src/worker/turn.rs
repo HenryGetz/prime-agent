@@ -2,8 +2,8 @@
 //! engine, and settles the result.
 use super::{
     checkpoint_queue_recovery, compact_action_label, create_daemon_event_meta,
-    emit_refinement_event_for_session, emit_refinement_row, gather_delivery_batch, json, oneshot,
-    session_snapshot, AssistantSnapshot, DaemonOutbound, EngineEvent, EventPump, Lane, Map, Notify,
+    emit_refinement_event_for_session, emit_refinement_row, gather_delivery, json, oneshot,
+    session_snapshot, AssistantSnapshot, DaemonOutbound, EngineEvent, EventPump, Map, Notify,
     OutboundFrame, PromptRequest, QueueCheckpoint, QueuedItem, Result, SessionActionSnapshot,
     SessionCore, SessionEngine, TurnSettle, Value, WorkerRecoveryJournal,
     ABORTED_TURN_SETTLE_ERROR,
@@ -56,34 +56,24 @@ impl TurnRunner {
                 }
                 // A cleared suspension alone must not admit: a manual
                 // compaction is a busy state the resume sites do NOT clear.
-                if self.input_pauses.paused() || core.queued_input_suspended || core.compacting {
+                if self.input_pauses.paused()
+                    || core.queued_input_suspended
+                    || core.compacting
+                    || (core.steering.is_empty() && core.follow_up.is_empty())
+                {
                     core.busy = false;
                     None
-                } else if core.steering.front().is_some() {
-                    let items = gather_delivery_batch(&mut core, Lane::Steering);
-                    core.running_admission_ids = items
-                        .iter()
-                        .filter_map(|item| item.admission_id.clone())
-                        .collect();
-                    core.busy = true;
-                    core.abort_requested = false;
-                    core.retry_abort_requested = false;
-                    core.running_tool_calls.clear();
-                    Some(items)
-                } else if core.follow_up.front().is_some() {
-                    let items = gather_delivery_batch(&mut core, Lane::FollowUp);
-                    core.running_admission_ids = items
-                        .iter()
-                        .filter_map(|item| item.admission_id.clone())
-                        .collect();
-                    core.busy = true;
-                    core.abort_requested = false;
-                    core.retry_abort_requested = false;
-                    core.running_tool_calls.clear();
-                    Some(items)
                 } else {
-                    core.busy = false;
-                    None
+                    let items = gather_delivery(&mut core);
+                    core.running_admission_ids = items
+                        .iter()
+                        .filter_map(|item| item.admission_id.clone())
+                        .collect();
+                    core.busy = true;
+                    core.abort_requested = false;
+                    core.retry_abort_requested = false;
+                    core.running_tool_calls.clear();
+                    Some(items)
                 }
             };
             if let Some(items) = item {
@@ -308,7 +298,8 @@ impl TurnRunner {
     }
 
     /// One delivery: the first item anchors the turn and the rest ride
-    /// as co-delivered user rows of the same run.
+    /// as co-delivered rows of the same run (user rows, or the custom rows
+    /// of a notification run).
     pub(super) async fn run_turn(
         &self,
         engine: std::sync::Arc<dyn SessionEngine>,
@@ -335,6 +326,7 @@ impl TurnRunner {
                 .map(|item| crate::engine::PromptBatchRow {
                     text: item.message.clone(),
                     images: item.images.clone(),
+                    custom_message: item.custom_message.clone(),
                 })
                 .collect(),
             message: first.message.clone(),

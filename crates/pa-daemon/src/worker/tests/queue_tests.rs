@@ -103,19 +103,10 @@ fn queue_priority_interleaves_lanes_fifo_and_preserves_explicit_order() {
             "machine steer 2"
         ]
     );
-    assert_eq!(
-        gather_delivery_batch(&mut core, Lane::Steering)[0].message,
-        "machine steer 1"
-    );
-    assert_eq!(
-        gather_delivery_batch(&mut core, Lane::Steering)[0].message,
-        "human steer 2"
-    );
+    assert_eq!(gather_delivery(&mut core)[0].message, "machine steer 1");
+    assert_eq!(gather_delivery(&mut core)[0].message, "human steer 2");
     core.steering.clear();
-    assert_eq!(
-        gather_delivery_batch(&mut core, Lane::FollowUp)[0].message,
-        "human follow 1"
-    );
+    assert_eq!(gather_delivery(&mut core)[0].message, "human follow 1");
 }
 
 #[test]
@@ -139,12 +130,7 @@ fn queue_priority_drains_four_tiers_and_pinned_front() {
     }
     let mut delivered = Vec::new();
     while !core.steering.is_empty() || !core.follow_up.is_empty() {
-        let lane = if core.steering.is_empty() {
-            Lane::FollowUp
-        } else {
-            Lane::Steering
-        };
-        delivered.push(gather_delivery_batch(&mut core, lane).remove(0).message);
+        delivered.push(gather_delivery(&mut core).remove(0).message);
     }
     assert_eq!(
         delivered,
@@ -156,6 +142,63 @@ fn queue_priority_drains_four_tiers_and_pinned_front() {
             "machine follow"
         ]
     );
+}
+
+/// Contiguous notifications deliver as one turn, in arrival order; user
+/// prompts and session commands stay single. At the end of a run, a steering
+/// notification run that empties its lane takes follow-up's leading
+/// notification run along; after a mid-run steering cut, follow-up waits.
+#[test]
+fn contiguous_notifications_deliver_together_and_user_input_stays_single() {
+    fn notification(text: &str) -> QueuedItem {
+        let mut item = priority_test_item(text, TurnPolicy::Queued);
+        item.priority = QueuePriority::Background;
+        item.custom_message =
+            Some(json!({ "role": "custom", "customType": "notice", "content": text }));
+        item
+    }
+    fn delivered(core: &mut SessionCore) -> Vec<String> {
+        gather_delivery(core)
+            .into_iter()
+            .map(|item| item.message)
+            .collect()
+    }
+    let mut store = crate::session_store::SessionFile::create("/tmp", None, 0);
+    store.append_message(&json!({ "role": "assistant", "content": "done", "stopReason": "stop" }));
+    let mut core = SessionCore::test_core(Some(store), "/tmp".to_string());
+    core.steering.extend([
+        notification("n1"),
+        notification("n2"),
+        priority_test_item("user", TurnPolicy::Queued),
+        priority_test_item("/compact", TurnPolicy::Queued),
+        notification("n3"),
+    ]);
+    core.follow_up.extend([
+        notification("f1"),
+        priority_test_item("follow", TurnPolicy::Queued),
+        notification("f2"),
+    ]);
+    // The run ended on its own.
+    assert_eq!(delivered(&mut core), ["n1", "n2"]);
+    assert_eq!(delivered(&mut core), ["user"]);
+    assert_eq!(delivered(&mut core), ["/compact"]);
+    assert_eq!(delivered(&mut core), ["n3", "f1"]);
+    assert_eq!(delivered(&mut core), ["follow"]);
+    assert_eq!(delivered(&mut core), ["f2"]);
+
+    // The steering probe cut the run between tool turns; a notice row
+    // landing after the tool result does not end the tool loop.
+    let store = core.store.as_mut().unwrap();
+    store.append_message(&json!({ "role": "assistant", "content": [], "stopReason": "toolUse" }));
+    store.append_message(&json!({ "role": "toolResult", "toolCallId": "c", "content": [] }));
+    store.append_entry(
+        "custom_message",
+        json!({ "customType": "notice", "content": "late" }),
+    );
+    core.steering.push_back(notification("n4"));
+    core.follow_up.push_back(notification("f3"));
+    assert_eq!(delivered(&mut core), ["n4"]);
+    assert_eq!(delivered(&mut core), ["f3"]);
 }
 
 #[tokio::test]

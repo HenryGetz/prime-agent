@@ -165,6 +165,18 @@ pub(crate) struct QueuedItem {
     pub(crate) forced_batch: bool,
 }
 
+impl QueuedItem {
+    /// An automated notification: a queued custom row (bash completion,
+    /// agent message, child notice, heartbeat, goal context) that is neither
+    /// a direct prompt admission nor a session command. Contiguous
+    /// notifications deliver together as one turn; anything else is a boundary.
+    pub(crate) fn is_notification(&self) -> bool {
+        self.custom_message.is_some()
+            && self.policy != TurnPolicy::Direct
+            && crate::session_commands::parse_prompt_session_command(&self.message).is_none()
+    }
+}
+
 /// Parse the wire `images` array: entries without payload data or a
 /// mime type are dropped, not failed — the text still admits.
 pub(crate) fn parse_prompt_images(payload: &Value) -> Vec<pa_agent::types::ImageContent> {
@@ -314,10 +326,31 @@ pub(crate) fn queue_lanes(core: &SessionCore) -> QueueLanes {
     }
 }
 
-/// The lane's front item anchors the delivery; under queue mode "all" — or
-/// the forced steering batch — the same-class prefix behind it joins as
-/// co-delivered rows of ONE turn. A non-batchable front delivers solo.
-pub(crate) fn gather_delivery_batch(core: &mut SessionCore, lane: Lane) -> Vec<QueuedItem> {
+/// The next delivery: steering first, then follow-up. At the end of a run
+/// the follow-up lane is due anyway, so a steering notification run that
+/// empties its lane carries follow-up's leading notification run into the
+/// same delivery. A run the steering probe cut mid tool loop leaves the
+/// follow-up lane waiting.
+pub(crate) fn gather_delivery(core: &mut SessionCore) -> Vec<QueuedItem> {
+    if core.steering.is_empty() {
+        return gather_delivery_batch(core, Lane::FollowUp);
+    }
+    let mut batch = gather_delivery_batch(core, Lane::Steering);
+    let mid_run = core
+        .store
+        .as_ref()
+        .is_some_and(crate::session_store::SessionFile::ends_mid_tool_loop);
+    if core.steering.is_empty() && batch[0].is_notification() && !mid_run {
+        batch.extend(take_notification_run(&mut core.follow_up));
+    }
+    batch
+}
+
+/// The lane's front item anchors the delivery. A notification front takes
+/// the contiguous notification run behind it; otherwise, under queue mode
+/// "all" — or the forced steering batch — the same-class prefix of plain
+/// rows joins as co-delivered rows of ONE turn. Any other front delivers solo.
+fn gather_delivery_batch(core: &mut SessionCore, lane: Lane) -> Vec<QueuedItem> {
     let (items, mode) = match lane {
         Lane::Steering => (&mut core.steering, core.steering_mode.as_str()),
         Lane::FollowUp => (&mut core.follow_up, core.follow_up_mode.as_str()),
@@ -336,8 +369,10 @@ pub(crate) fn gather_delivery_batch(core: &mut SessionCore, lane: Lane) -> Vec<Q
     {
         core.forced_all_steering = false;
     }
-    if first.custom_message.is_some()
-        || first.policy == TurnPolicy::Direct
+    if first.is_notification() {
+        return take_notification_run(items);
+    }
+    if first.policy == TurnPolicy::Direct
         || crate::session_commands::parse_prompt_session_command(&first.message).is_some()
     {
         batch.push(items.pop_front().expect("front checked"));
@@ -358,6 +393,15 @@ pub(crate) fn gather_delivery_batch(core: &mut SessionCore, lane: Lane) -> Vec<Q
         }
     }
     batch
+}
+
+/// The contiguous notification run at the lane's front, in arrival order.
+fn take_notification_run(items: &mut VecDeque<QueuedItem>) -> Vec<QueuedItem> {
+    let mut run = Vec::new();
+    while items.front().is_some_and(QueuedItem::is_notification) {
+        run.push(items.pop_front().expect("front checked"));
+    }
+    run
 }
 
 /// Queue snapshot restore from the worker recovery journal (crash/respawn
