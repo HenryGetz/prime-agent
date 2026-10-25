@@ -130,6 +130,8 @@ launch path must keep that test red-first.
   the same gates; CI runs on the org's billing (`.github/workflows/continuous.yml` on `main`
   pushes; `release.yml` on version tags). The PR-only codebase-health check reports growth
   past 2,000 lines as review guidance; it never blocks a merge.
+- PRs that change shipped paths need a `.changes/<branch-slug>.md` fragment (one user-facing
+  bullet; see `.changes/README.md`) or the `no-changelog` label; the changelog-fragment check enforces it.
 - **Parity-diff evidence is a merge gate** (the port's definition, not optional polish): every PR
   that touches a user-visible surface must include a "parity-diff evidence" section in its
   description showing the TS-binary comparison for what it changed: (1) rendered output —
