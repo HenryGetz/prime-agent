@@ -532,8 +532,10 @@ impl AgentSession {
             refinement_history: session_history,
         } = parts.await?;
         let history = crate::refinement::merge_refinement_history(&history, &session_history);
-        let (review_call, billed) =
-            billed_refiner_call(default_refiner_call(api_key.clone()), "refine_review");
+        let (review_call, billed) = billed_refiner_call(
+            default_refiner_call(api_key.clone(), self.session_id().await),
+            "refine_review",
+        );
         let review = review_auto_refine(
             &messages,
             &merged_state,
@@ -645,7 +647,10 @@ pub(crate) fn billed_refiner_call(
 
 /// The default model seam over pa-ai completion.
 #[must_use]
-pub fn default_refiner_call(api_key: Option<String>) -> crate::refinement::executor::RefinerFn {
+pub fn default_refiner_call(
+    api_key: Option<String>,
+    session_id: String,
+) -> crate::refinement::executor::RefinerFn {
     Box::new(move |model, system_prompt, prompt| {
         let api_key = api_key;
         Box::pin(async move {
@@ -661,6 +666,11 @@ pub fn default_refiner_call(api_key: Option<String>) -> crate::refinement::execu
             let mut stream_options =
                 pa_ai::types::SimpleStreamOptions::from_base(pa_ai::types::StreamOptions {
                     api_key,
+                    session_id: Some(session_id),
+                    // One-off prompts ride SSE: they keep the conversation id (cache key,
+                    // opencode routing) but never take or replace the session's Codex
+                    // WebSocket and its continuation.
+                    transport: Some(pa_ai::types::Transport::Sse),
                     ..Default::default()
                 });
             stream_options.reasoning = pa_types::ai::minimum_reasoning(&model);
