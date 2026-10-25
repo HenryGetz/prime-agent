@@ -71,7 +71,9 @@ fn message_from_entry(entry: &FileEntry) -> Option<AgentMessage> {
             _ => Some(message.clone()),
         },
         FileEntry::CustomMessage { payload, .. } => {
-            if payload.custom_type == "harness_digest" {
+            if payload.custom_type == "harness_digest"
+                || payload.custom_type == super::ipython_state::IPYTHON_STATE_CUSTOM_TYPE
+            {
                 return None;
             }
             Some(AgentMessage::Custom(pa_types::session::CustomMessage {
@@ -205,8 +207,8 @@ pub(crate) fn prepare_attempt(
     );
     let tokens_before = context_tokens(&entries, session.get_leaf_id());
     // Every context-producing row counts, not just messages: the rebuilt
-    // context carries kept custom and branch-summary rows too. Digest rows
-    // count even when the built context keeps only the newest —
+    // context carries kept custom and branch-summary rows too. Digest and
+    // kernel-notice rows count even when the built context keeps only the newest —
     // over-rejecting a join falls to the fresh summarize.
     let kept_tokens: u64 = entries[cut.first_kept_entry_index..]
         .iter()

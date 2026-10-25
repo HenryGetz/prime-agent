@@ -392,6 +392,19 @@ pub fn build_session_context(entries: &[FileEntry], leaf_id: Option<&str>) -> Se
             }
         }
     }
+    // Likewise only the newest post-compaction `ipython_state` notice: each copy restates the
+    // whole live namespace, and a compaction whose cut point stays put keeps every earlier copy in
+    // its retained tail (discussion #3745). Persisted entries keep every copy.
+    let newest_kernel_notice_entry_id =
+        path.iter().rev().find_map(|&index| match &entries[index] {
+            FileEntry::CustomMessage { payload, .. }
+                if payload.custom_type
+                    == crate::session_engine::ipython_state::IPYTHON_STATE_CUSTOM_TYPE =>
+            {
+                entries[index].id()
+            }
+            _ => None,
+        });
     let compaction_path_idx = compaction
         .and_then(|compaction_index| path.iter().position(|&index| index == compaction_index));
     // True when the compaction snapshot is the newest digest in context, so
@@ -419,14 +432,20 @@ pub fn build_session_context(entries: &[FileEntry], leaf_id: Option<&str>) -> Se
     });
 
     let mut messages: Vec<AgentMessage> = Vec::new();
-    // The digest supersession is a path-level decision; the row mapping is
-    // [`context_message`]'s one definition.
+    // The digest and kernel-notice supersessions are path-level decisions; the
+    // row mapping is [`context_message`]'s one definition.
     let append_message = |entry: &FileEntry,
                           target: &mut Vec<AgentMessage>,
                           keep_digest_entry_id: Option<&str>| {
         if let FileEntry::CustomMessage { payload, .. } = entry {
             if payload.custom_type == crate::session_engine::headless::HARNESS_DIGEST_CUSTOM_TYPE
                 && entry.id() != keep_digest_entry_id
+            {
+                return;
+            }
+            if payload.custom_type
+                == crate::session_engine::ipython_state::IPYTHON_STATE_CUSTOM_TYPE
+                && entry.id() != newest_kernel_notice_entry_id
             {
                 return;
             }
