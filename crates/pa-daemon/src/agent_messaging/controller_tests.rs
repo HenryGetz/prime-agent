@@ -72,7 +72,7 @@ async fn spawn_fake_supervisor(
                                         { "role": "user", "content": "m1", "timestamp": 11 },
                                         { "role": "user", "content": "m2", "timestamp": 12 },
                                         { "role": "user", "content": "m3", "timestamp": 13 },
-                                        { "role": "user", "content": "m4", "timestamp": 14 },
+                                        { "role": "compactionSummary", "summary": "m4", "timestamp": 14 },
                                     ])
                                 });
                             let messages = messages.as_array().unwrap();
@@ -1062,6 +1062,10 @@ async fn recent_messages_resolves_by_name_and_reports_the_envelope() {
     assert_eq!(recent.messages.len(), 2);
     assert_eq!(recent.messages[0].index, 3);
     assert_eq!(recent.messages[0].text, "m3");
+    assert_eq!(
+        recent.messages[1].text, "m4",
+        "the compaction summary previews"
+    );
     // A target outside the nuclear family never reaches the transcript read.
     let error = observer.recent_messages("ghost", 2, 90).await.unwrap_err();
     assert_eq!(error.to_string(), "agent ghost is not reachable");

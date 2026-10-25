@@ -421,7 +421,12 @@ fn message_preview_text(message: &Value) -> String {
             .filter_map(|block| block.get("text").and_then(Value::as_str))
             .collect::<Vec<_>>()
             .join(""),
-        _ => String::new(),
+        // A `compactionSummary` row keeps its text in `summary`.
+        _ => message
+            .get("summary")
+            .and_then(Value::as_str)
+            .unwrap_or_default()
+            .to_string(),
     }
 }
 
