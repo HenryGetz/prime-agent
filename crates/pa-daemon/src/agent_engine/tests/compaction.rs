@@ -1176,8 +1176,11 @@ fn faux_engine_with_steering_probe(
 /// centers on the crossing turn's and the next turn's measured usages. The
 /// session-scoped faux cache (#3751) counts a turn's new prompt twice (input
 /// plus cache write), so the crossing turn measures one prompt more than the
-/// turns after it. A ~39k-token crossing prompt keeps both inside the band and
-/// above the retention floor (`keep + 2 * reserve`).
+/// turns after it. A finished summarize carries the session id too (#3533) and
+/// replaces the cache entry, so a turn after it reads cold: twice its whole
+/// prompt. Tests with such a turn pass that cold reading as `next_usage`. A
+/// ~39k-token crossing prompt keeps both inside the band and above the
+/// retention floor (`keep + 2 * reserve`).
 fn background_band_reserve(crossing_usage: u64, next_usage: u64) -> u64 {
     (2 * (128_000 - FAUX_REQUEST_BUDGET) - crossing_usage - next_usage) / 4
 }
@@ -1413,11 +1416,9 @@ fn a_finished_background_summary_commits_at_the_next_boundary() {
         .lock()
         .unwrap_or_else(std::sync::PoisonError::into_inner);
     let band_prompt = format!("seed turn {} crossing", "x".repeat(156_000));
-    let usages = probe_usages(&[
-        "seed turn".to_string(),
-        band_prompt.clone(),
-        "a small next turn".to_string(),
-    ]);
+    let usages = probe_usages(&["seed turn".to_string(), band_prompt.clone()]);
+    // The follow-up runs after the summarize finished, so it reads cold.
+    let cold = probe_usages(std::slice::from_ref(&band_prompt));
     let (engine, _engine_dir, registration) = faux_engine_with_registration(
         &serde_json::json!({
             "responses": [
@@ -1427,7 +1428,7 @@ fn a_finished_background_summary_commits_at_the_next_boundary() {
                 {"text": "follow-up reply"},
             ]
         }),
-        background_band_reserve(usages[1], usages[2]),
+        background_band_reserve(usages[1], cold[0]),
     );
     let mut events: Vec<EngineEvent> = Vec::new();
     admit(&engine, "seed turn".to_string(), &mut events);
@@ -1651,14 +1652,12 @@ fn an_unrelieving_finished_background_summary_never_blocks_the_watermark_band() 
         .lock()
         .unwrap_or_else(std::sync::PoisonError::into_inner);
     let band_prompt = format!("seed turn {} crossing", "x".repeat(156_000));
-    let usages = probe_usages(&[
-        "seed turn".to_string(),
-        band_prompt.clone(),
-        "a small next turn".to_string(),
-    ]);
+    let usages = probe_usages(&["seed turn".to_string(), band_prompt.clone()]);
+    // The follow-up runs after the summarize finished, so it reads cold.
+    let cold = probe_usages(std::slice::from_ref(&band_prompt));
     let (engine, _engine_dir, _replaced) = faux_engine_with_registration(
         &serde_json::json!({ "responses": [] }),
-        background_band_reserve(usages[1], usages[2]),
+        background_band_reserve(usages[1], cold[0]),
     );
     // The script registration above is replaced by one serving both lanes,
     // with response chunks large enough that even the oversized summary
