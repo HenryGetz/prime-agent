@@ -32,6 +32,8 @@ pub struct FactoryState {
     pub lifecycle: String,
     pub max_entries: u64,
     pub subagent: Option<String>,
+    /// A python state's `<import>.<callable>`; such a state has no subagent.
+    pub python: Option<String>,
 }
 
 impl FactoryState {
@@ -48,6 +50,11 @@ impl FactoryState {
                 .unwrap_or(1),
             subagent: value
                 .get("subagent")
+                .and_then(Value::as_str)
+                .map(scrubbed)
+                .filter(|text| !text.is_empty()),
+            python: value
+                .get("python")
                 .and_then(Value::as_str)
                 .map(scrubbed)
                 .filter(|text| !text.is_empty()),
