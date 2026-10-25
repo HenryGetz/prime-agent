@@ -316,6 +316,9 @@ impl AgentSession {
                     },
                 )));
             }
+            // A structural conflict retries from PREPARE: the discarded calls
+            // land first, so the retry builds on their row.
+            self.record_model_usage(summaries.bill.take()).await;
             pa_agent::abort::throw_if_aborted_signal(options.abort)?;
         }
         Err(anyhow::anyhow!(
@@ -487,10 +490,10 @@ impl AgentSession {
 }
 
 /// One compaction attempt's summarizer spend until it commits. An attempt
-/// that ends any other way (a structural conflict, a failure, an abort, or
-/// the caller dropping the compaction mid-flight) records its resolved calls
-/// as a `compaction_discarded` `model_usage` row when this drops; a commit
-/// takes the bill first, since the compaction row carries those calls.
+/// that fails, aborts, or whose compaction future is dropped mid-flight
+/// records its resolved calls as a `compaction_discarded` `model_usage` row
+/// when this drops. A commit takes the bill first, since the compaction row
+/// carries those calls; a structural conflict records it before the retry.
 struct UncommittedSummaries {
     store: std::sync::Arc<dyn super::rlm_usage::RlmChildUsageStore>,
     bill: crate::session_engine::compact_session::SummaryBill,
