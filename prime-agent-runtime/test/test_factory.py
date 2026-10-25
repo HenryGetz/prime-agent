@@ -3333,6 +3333,11 @@ class FactoryExecutorTest(_ExecutorTestCase):
             self.assertEqual(spawn[0]["prompt"], "Template by title.")
             self.assertEqual(spawn[0]["kwargs"]["model"], "pi/test-model")
             self.assertEqual(spawn[0]["kwargs"]["thinking"], "low")
+            # The run tag the host records on the child's ledger spawn edge.
+            self.assertEqual(
+                spawn[0]["kwargs"]["factory"],
+                {"runId": result["run_id"], "specId": "sw", "stateId": node_id},
+            )
 
     @async_test
     async def test_inline_subagent_name_labels_the_spawned_child(self) -> None:
