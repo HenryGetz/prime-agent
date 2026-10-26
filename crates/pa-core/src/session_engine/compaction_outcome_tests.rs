@@ -715,7 +715,8 @@ fn budget_recording_step(
 
 /// A refiner reply cut by the output budget (the model burned it on
 /// reasoning and stopped at the length limit) retries once through the
-/// session refine path, with the explicit refinement budget on the wire.
+/// session refine path, with the refinement budget capped at the model's
+/// catalog maximum output.
 #[tokio::test]
 async fn a_budget_truncated_refiner_reply_retries_once_and_lands() {
     let (session, tmp) = refine_test_session().await;
@@ -757,11 +758,8 @@ async fn a_budget_truncated_refiner_reply_retries_once_and_lands() {
     assert!(result.applied_edits[0].applied);
     assert_eq!(
         *budgets.lock().unwrap(),
-        vec![
-            Some(crate::refinement::planner::REFINEMENT_MIN_OUTPUT_TOKENS),
-            Some(crate::refinement::planner::REFINEMENT_MIN_OUTPUT_TOKENS)
-        ],
-        "both requests carry the explicit refinement budget, raised from the 8k default"
+        vec![Some(8_192), Some(8_192)],
+        "both requests stay at the 8k catalog maximum output; the floor never raises past it"
     );
 }
 
@@ -805,11 +803,8 @@ async fn a_mid_json_cut_without_a_length_stop_retries_once_and_lands() {
     assert!(result.applied_edits[0].applied);
     assert_eq!(
         *budgets.lock().unwrap(),
-        vec![
-            Some(crate::refinement::planner::REFINEMENT_MIN_OUTPUT_TOKENS),
-            Some(crate::refinement::planner::REFINEMENT_MIN_OUTPUT_TOKENS)
-        ],
-        "the mid-JSON diagnosis alone retried, with the explicit budget on the wire"
+        vec![Some(8_192), Some(8_192)],
+        "the mid-JSON diagnosis alone retried, both requests capped at the 8k catalog maximum output"
     );
 }
 

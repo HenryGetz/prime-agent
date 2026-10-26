@@ -299,13 +299,15 @@ const REFINEMENT_RETRY_CONVERSATION_CAP: usize = 20_000;
 /// The request's output budget: the room-bounded value, raised to the
 /// refinement floor (reasoning burns into the budget before the JSON
 /// starts; a small catalog default starves the remainder), capped at the
-/// refinement ceiling. An explicitly configured `maxTokens` is honored as
-/// configured and never raised.
+/// refinement ceiling. A catalog `maxTokens` is the model's maximum
+/// output and providers reject a larger request with a 400, so the floor
+/// never lifts the budget past it; an explicitly configured `maxTokens`
+/// is honored as configured and never raised.
 fn refinement_output_budget(model: &pa_types::ai::Model, request_max_tokens: u64) -> u64 {
     let floor = if model.max_tokens_explicit {
         0
     } else {
-        super::planner::REFINEMENT_MIN_OUTPUT_TOKENS
+        super::planner::REFINEMENT_MIN_OUTPUT_TOKENS.min(model.max_tokens)
     };
     request_max_tokens
         .max(floor)
@@ -473,6 +475,34 @@ mod tests {
             let text = text.clone();
             Box::pin(async move { Ok(text_message(&text)) })
         })
+    }
+
+    #[test]
+    fn the_refinement_floor_never_exceeds_a_catalog_maximum_output() {
+        let mut model = test_model();
+        // A catalog `maxTokens` is the model's maximum output (gpt-4-turbo
+        // and gpt-4o-2024-05-13: 4,096; Vertex gemini-2.0-flash: 8,192) and
+        // OpenAI and Vertex reject a larger `max_tokens` with a 400, so the
+        // floor never raises the budget past it.
+        model.max_tokens = 4_096;
+        assert_eq!(refinement_output_budget(&model, 4_096), 4_096);
+        model.max_tokens = 8_192;
+        assert_eq!(refinement_output_budget(&model, 8_192), 8_192);
+        // A roomy catalog model still gets the floor when the context room
+        // leaves less, and the ceiling caps it when the room allows more.
+        model.max_tokens = 131_072;
+        assert_eq!(
+            refinement_output_budget(&model, 8_000),
+            crate::refinement::planner::REFINEMENT_MIN_OUTPUT_TOKENS
+        );
+        assert_eq!(
+            refinement_output_budget(&model, 131_072),
+            REFINEMENT_MAX_OUTPUT_TOKENS
+        );
+        // An explicitly configured `maxTokens` is honored, never raised.
+        model.max_tokens = 4_096;
+        model.max_tokens_explicit = true;
+        assert_eq!(refinement_output_budget(&model, 4_096), 4_096);
     }
 
     #[tokio::test]
