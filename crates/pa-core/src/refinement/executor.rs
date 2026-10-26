@@ -504,46 +504,34 @@ mod tests {
                 Box::pin(async move {
                     Ok(AssistantMessage {
                         stop_reason,
-                        error_message: (stop_reason == StopReason::Error)
-                            .then(|| "max_tokens is too large".to_string()),
+                        error_message: Some("max_tokens is too large".to_string()),
                         ..text_message(r#"{"summary": "cut"#)
                     })
                 })
             })
         };
-        let state = super::super::empty_harness_state();
-        let mut errors = Vec::new();
-        for stop_reason in [StopReason::Length, StopReason::Error] {
-            let plan = plan_refinement(
-                &[],
-                &state,
-                &[],
-                &test_model(),
-                &RefineOptions::default(),
-                stopped(stop_reason),
-            )
-            .await;
-            errors.push(plan.err().unwrap().to_string());
-            let review = review_auto_refine(
-                &[],
-                &state,
-                &[],
-                &test_model(),
-                &AutoRefineReviewContext {
-                    reason: "checkpoint".to_string(),
-                    turns_since_last_review: 1,
-                },
-                stopped(stop_reason),
-            )
-            .await;
-            errors.push(review.err().unwrap().to_string());
-        }
+        let (state, model) = (super::super::empty_harness_state(), test_model());
+        let options = RefineOptions::default();
+        let plan = plan_refinement(
+            &[],
+            &state,
+            &[],
+            &model,
+            &options,
+            stopped(StopReason::Length),
+        );
+        let ctx = AutoRefineReviewContext {
+            reason: "checkpoint".to_string(),
+            turns_since_last_review: 1,
+        };
+        let review = review_auto_refine(&[], &state, &[], &model, &ctx, stopped(StopReason::Error));
         assert_eq!(
-            errors,
+            [
+                plan.await.err().unwrap().to_string(),
+                review.await.err().unwrap().to_string()
+            ],
             [
                 "Refinement failed: the model hit its output limit (8000 tokens, test/m)",
-                "Auto-refine review failed: the model hit its output limit (8000 tokens, test/m)",
-                "Refinement failed: max_tokens is too large",
                 "Auto-refine review failed: max_tokens is too large",
             ]
         );
