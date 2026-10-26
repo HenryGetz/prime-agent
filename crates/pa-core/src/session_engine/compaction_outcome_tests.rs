@@ -677,42 +677,54 @@ async fn refinement_and_auto_review_preserve_conversation_identity() {
     );
 }
 
-/// The /refine user failure: a refiner reply cut by the output budget (the
-/// model burned the budget on reasoning and stopped at the length limit)
-/// used to fail the run outright. The wire now carries an explicitly sized
-/// budget, and one length-stopped reply retries with a reduced request.
+/// A faux refine model with the given catalog output budget and context
+/// window.
+fn register_refine_model(
+    max_tokens: u64,
+    context_window: u64,
+) -> pa_ai::faux::FauxProviderRegistration {
+    pa_ai::faux::register_faux_provider(pa_ai::faux::RegisterFauxProviderOptions {
+        models: Some(vec![pa_ai::faux::FauxModelDefinition {
+            id: "refine-m".to_string(),
+            name: Some("Refine Model".to_string()),
+            reasoning: Some(true),
+            input: Some(vec![pa_types::ai::ModelInput::Text]),
+            cost: None,
+            context_window: Some(context_window),
+            max_tokens: Some(max_tokens),
+        }]),
+        ..Default::default()
+    })
+}
+
+/// A faux step replying with `message` while recording the request's wire
+/// output budget.
+fn budget_recording_step(
+    budgets: &Arc<std::sync::Mutex<Vec<Option<u64>>>>,
+    message: pa_types::ai::AssistantMessage,
+) -> pa_ai::faux::FauxResponseStep {
+    let budgets = Arc::clone(budgets);
+    pa_ai::faux::FauxResponseStep::Factory(Arc::new(move |_, options, _, _| {
+        budgets
+            .lock()
+            .unwrap()
+            .push(options.and_then(|options| options.max_tokens));
+        Ok(message.clone())
+    }))
+}
+
+/// A refiner reply cut by the output budget (the model burned it on
+/// reasoning and stopped at the length limit) retries once through the
+/// session refine path, with the explicit refinement budget on the wire.
 #[tokio::test]
 async fn a_budget_truncated_refiner_reply_retries_once_and_lands() {
     let (session, tmp) = refine_test_session().await;
-    // A model whose catalog default output budget (8k) is the starving kind.
-    let registration =
-        pa_ai::faux::register_faux_provider(pa_ai::faux::RegisterFauxProviderOptions {
-            models: Some(vec![pa_ai::faux::FauxModelDefinition {
-                id: "refine-m".to_string(),
-                name: Some("Refine Model".to_string()),
-                reasoning: Some(true),
-                input: Some(vec![pa_types::ai::ModelInput::Text]),
-                cost: None,
-                context_window: Some(128_000),
-                max_tokens: Some(8_192),
-            }]),
-            ..Default::default()
-        });
+    let registration = register_refine_model(8_192, 128_000);
     let budgets: Arc<std::sync::Mutex<Vec<Option<u64>>>> =
         Arc::new(std::sync::Mutex::new(Vec::new()));
-    let step = |message: pa_types::ai::AssistantMessage,
-                budgets: &Arc<std::sync::Mutex<Vec<Option<u64>>>>| {
-        let budgets = Arc::clone(budgets);
-        pa_ai::faux::FauxResponseStep::Factory(Arc::new(move |_, options, _, _| {
-            budgets
-                .lock()
-                .unwrap()
-                .push(options.and_then(|options| options.max_tokens));
-            Ok(message.clone())
-        }))
-    };
     registration.set_responses(vec![
-        step(
+        budget_recording_step(
+            &budgets,
             pa_ai::faux::faux_assistant_text_message(
                 r#"{"summary":"cut","edits":[{"action":"cre"#,
                 pa_ai::faux::FauxAssistantMessageOptions {
@@ -720,14 +732,13 @@ async fn a_budget_truncated_refiner_reply_retries_once_and_lands() {
                     ..Default::default()
                 },
             ),
-            &budgets,
         ),
-        step(
+        budget_recording_step(
+            &budgets,
             pa_ai::faux::faux_assistant_text_message(
                 r#"{"summary":"one edit","edits":[{"action":"create","kind":"memory","id":"m9","title":"t","content":"c"}]}"#,
                 pa_ai::faux::FauxAssistantMessageOptions::default(),
             ),
-            &budgets,
         ),
     ]);
     let model = registration.get_model();
@@ -751,6 +762,194 @@ async fn a_budget_truncated_refiner_reply_retries_once_and_lands() {
             Some(crate::refinement::planner::REFINEMENT_MIN_OUTPUT_TOKENS)
         ],
         "both requests carry the explicit refinement budget, raised from the 8k default"
+    );
+}
+
+/// Some providers cut the reply without flagging the length stop; the
+/// mid-JSON diagnosis alone must drive the retry.
+#[tokio::test]
+async fn a_mid_json_cut_without_a_length_stop_retries_once_and_lands() {
+    let (session, tmp) = refine_test_session().await;
+    let registration = register_refine_model(8_192, 128_000);
+    let budgets: Arc<std::sync::Mutex<Vec<Option<u64>>>> =
+        Arc::new(std::sync::Mutex::new(Vec::new()));
+    registration.set_responses(vec![
+        budget_recording_step(
+            &budgets,
+            pa_ai::faux::faux_assistant_text_message(
+                r#"{"summary":"cut","edits":[{"action":"cre"#,
+                pa_ai::faux::FauxAssistantMessageOptions::default(),
+            ),
+        ),
+        budget_recording_step(
+            &budgets,
+            pa_ai::faux::faux_assistant_text_message(
+                r#"{"summary":"one edit","edits":[{"action":"create","kind":"memory","id":"m9","title":"t","content":"c"}]}"#,
+                pa_ai::faux::FauxAssistantMessageOptions::default(),
+            ),
+        ),
+    ]);
+    let model = registration.get_model();
+    let global = tmp.path().join("harness");
+    let result = session
+        .refine(
+            &refine::RefineOptions::default(),
+            refine::RefinementSource::User,
+            &model,
+            None,
+            global,
+        )
+        .await
+        .unwrap();
+    assert_eq!(result.summary, "one edit");
+    assert!(result.applied_edits[0].applied);
+    assert_eq!(
+        *budgets.lock().unwrap(),
+        vec![
+            Some(crate::refinement::planner::REFINEMENT_MIN_OUTPUT_TOKENS),
+            Some(crate::refinement::planner::REFINEMENT_MIN_OUTPUT_TOKENS)
+        ],
+        "the mid-JSON diagnosis alone retried, with the explicit budget on the wire"
+    );
+}
+
+/// A parse failure outside the budget class (balanced garbage) surfaces
+/// immediately; only the budget-exhausted class retries.
+#[tokio::test]
+async fn a_non_budget_parse_failure_fails_without_a_retry() {
+    let (session, tmp) = refine_test_session().await;
+    let registration = register_refine_model(8_192, 128_000);
+    let budgets: Arc<std::sync::Mutex<Vec<Option<u64>>>> =
+        Arc::new(std::sync::Mutex::new(Vec::new()));
+    registration.set_responses(vec![budget_recording_step(
+        &budgets,
+        pa_ai::faux::faux_assistant_text_message(
+            "not json",
+            pa_ai::faux::FauxAssistantMessageOptions::default(),
+        ),
+    )]);
+    let model = registration.get_model();
+    let global = tmp.path().join("harness");
+    let error = session
+        .refine(
+            &refine::RefineOptions::default(),
+            refine::RefinementSource::User,
+            &model,
+            None,
+            global,
+        )
+        .await
+        .unwrap_err();
+    assert_eq!(error.to_string(), "Refiner did not return a JSON object");
+    assert_eq!(budgets.lock().unwrap().len(), 1, "garbage never retries");
+}
+
+/// A reply truncated on both attempts surfaces the truncation error.
+#[tokio::test]
+async fn a_twice_truncated_reply_surfaces_the_truncation_error() {
+    let (session, tmp) = refine_test_session().await;
+    let registration = register_refine_model(8_192, 128_000);
+    let budgets: Arc<std::sync::Mutex<Vec<Option<u64>>>> =
+        Arc::new(std::sync::Mutex::new(Vec::new()));
+    let truncated = || {
+        pa_ai::faux::faux_assistant_text_message(
+            r#"{"summary":"cut","edits":[{"action":"cre"#,
+            pa_ai::faux::FauxAssistantMessageOptions {
+                stop_reason: Some(pa_types::ai::StopReason::Length),
+                ..Default::default()
+            },
+        )
+    };
+    registration.set_responses(vec![
+        budget_recording_step(&budgets, truncated()),
+        budget_recording_step(&budgets, truncated()),
+    ]);
+    let model = registration.get_model();
+    let global = tmp.path().join("harness");
+    let error = session
+        .refine(
+            &refine::RefineOptions::default(),
+            refine::RefinementSource::User,
+            &model,
+            None,
+            global,
+        )
+        .await
+        .unwrap_err();
+    assert_eq!(
+        error.to_string(),
+        crate::refinement::planner::TRUNCATED_JSON_ERROR
+    );
+    assert_eq!(budgets.lock().unwrap().len(), 2, "the retry fired once");
+}
+
+/// An explicitly configured `maxTokens` is honored, not raised to the
+/// refinement floor.
+#[tokio::test]
+async fn an_explicitly_configured_budget_is_honored_not_raised() {
+    let (session, tmp) = refine_test_session().await;
+    let registration = register_refine_model(8_192, 128_000);
+    let budgets: Arc<std::sync::Mutex<Vec<Option<u64>>>> =
+        Arc::new(std::sync::Mutex::new(Vec::new()));
+    registration.set_responses(vec![budget_recording_step(
+        &budgets,
+        pa_ai::faux::faux_assistant_text_message(
+            r#"{"summary":"one edit","edits":[{"action":"create","kind":"memory","id":"m9","title":"t","content":"c"}]}"#,
+            pa_ai::faux::FauxAssistantMessageOptions::default(),
+        ),
+    )]);
+    let mut model = registration.get_model();
+    model.max_tokens_explicit = true;
+    let global = tmp.path().join("harness");
+    session
+        .refine(
+            &refine::RefineOptions::default(),
+            refine::RefinementSource::User,
+            &model,
+            None,
+            global,
+        )
+        .await
+        .unwrap();
+    assert_eq!(
+        *budgets.lock().unwrap(),
+        vec![Some(8_192)],
+        "the explicit budget stays as configured"
+    );
+}
+
+/// A roomy catalog model still gets the 32k refinement ceiling.
+#[tokio::test]
+async fn a_roomy_catalog_model_keeps_the_ceiling_capped_budget() {
+    let (session, tmp) = refine_test_session().await;
+    let registration = register_refine_model(131_072, 400_000);
+    let budgets: Arc<std::sync::Mutex<Vec<Option<u64>>>> =
+        Arc::new(std::sync::Mutex::new(Vec::new()));
+    registration.set_responses(vec![budget_recording_step(
+        &budgets,
+        pa_ai::faux::faux_assistant_text_message(
+            r#"{"summary":"one edit","edits":[{"action":"create","kind":"memory","id":"m9","title":"t","content":"c"}]}"#,
+            pa_ai::faux::FauxAssistantMessageOptions::default(),
+        ),
+    )]);
+    let model = registration.get_model();
+    let global = tmp.path().join("harness");
+    session
+        .refine(
+            &refine::RefineOptions::default(),
+            refine::RefinementSource::User,
+            &model,
+            None,
+            global,
+        )
+        .await
+        .unwrap();
+    assert_eq!(
+        *budgets.lock().unwrap(),
+        vec![Some(
+            crate::refinement::planner::REFINEMENT_MAX_OUTPUT_TOKENS
+        )],
+        "the refinement ceiling still caps the budget"
     );
 }
 
