@@ -525,10 +525,17 @@ fn sum_own_usage(node: &ContextNode, total: &mut UsageTotals) {
 
 /// The whole tree's own usage summed per model (the `/context` Cost
 /// section's breakdown), so a mid-conversation model switch shows each
-/// model's share. `None` when a node with billable own usage carries no
-/// per-model fold (a foreign file): a partial breakdown would not add up.
+/// model's share. A deleted row captured before deletes recorded a split
+/// folds into the unknown-model bucket (empty provider and id), so the
+/// lines still add up.
 fn sum_own_usage_by_model(node: &ContextNode, total: &mut Vec<ModelUsage>) {
-    for bucket in &node.own_usage_by_model {
+    let unsplit_deleted =
+        (node.deleted && node.own_usage_by_model.is_empty()).then(|| ModelUsage {
+            provider: String::new(),
+            id: String::new(),
+            totals: node.own_usage,
+        });
+    for bucket in node.own_usage_by_model.iter().chain(&unsplit_deleted) {
         if let Some(existing) = total
             .iter_mut()
             .find(|existing| existing.provider == bucket.provider && existing.id == bucket.id)
@@ -544,12 +551,15 @@ fn sum_own_usage_by_model(node: &ContextNode, total: &mut Vec<ModelUsage>) {
 }
 
 /// The tree's per-model buckets when they account for every billed row.
+/// `None` when a billed live row carries no per-model fold (a foreign
+/// file): a partial breakdown would not add up.
 fn tree_own_usage_by_model(root: &ContextNode) -> Option<Vec<ModelUsage>> {
     fn billed(node: &ContextNode) -> bool {
         node.own_usage.spent_tokens() > 0 || node.own_usage.cost_total > 0.0
     }
     fn covers(node: &ContextNode) -> bool {
-        (!billed(node) || !node.own_usage_by_model.is_empty()) && node.children.iter().all(covers)
+        (!billed(node) || node.deleted || !node.own_usage_by_model.is_empty())
+            && node.children.iter().all(covers)
     }
     if !covers(root) {
         return None;
@@ -844,8 +854,9 @@ pub fn context_tree_rows(
             raw_span(format!(" ${}", js_to_fixed(totals.cost_total, 4))),
         ]);
         // The per-model breakdown (the model mix decides the cost): the whole
-        // tree's buckets, most expensive model first. Rendered only when the tree
-        // used more than one model — a single-model tree already names its model.
+        // tree's buckets, most expensive model first (the unknown-model bucket of
+        // unsplit deleted spend sorts the same way). Rendered only when there is
+        // more than one line — a single-model tree already names its model.
         let by_model = tree_own_usage_by_model(&root);
         if let Some(mut by_model) = by_model.filter(|by_model| by_model.len() > 1) {
             by_model.sort_by(|a, b| {
@@ -856,8 +867,13 @@ pub fn context_tree_rows(
                     .then_with(|| a.id.cmp(&b.id))
             });
             for bucket in &by_model {
+                let label = if bucket.provider.is_empty() {
+                    "unknown model (deleted agents)".to_string()
+                } else {
+                    format!("{}/{}", bucket.provider, bucket.id)
+                };
                 lines.push(vec![
-                    dim(format!("{}/{}:", bucket.provider, bucket.id)),
+                    dim(format!("{label}:")),
                     raw_span(format!(" ${}", js_to_fixed(bucket.totals.cost_total, 4))),
                 ]);
             }

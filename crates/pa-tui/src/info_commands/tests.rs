@@ -989,6 +989,33 @@ fn context_tree_groups_factory_runs_and_deleted_agents() {
         folded.contains(&"Use /context all to show every agent.".to_string()),
         "{folded:#?}"
     );
+
+    // A deleted row without a per-model split (deleted before the capture
+    // existed) keeps the breakdown: its spend is one unknown-model line.
+    let mut split_tree = child("root", "active", 1000, 0.1);
+    split_tree["ownUsageByModel"] = serde_json::json!([
+        {"provider": "anthropic", "id": "claude-opus-4-6", "ownUsage": usage(1000, 0.1)}
+    ]);
+    let mut legacy = child("old", "deleted", 500, 0.05);
+    legacy["deleted"] = serde_json::json!(true);
+    split_tree["children"] = serde_json::json!([legacy]);
+    let split = normalized(context_tree_rows(
+        &split_tree,
+        120,
+        ContextTreeScope::Collapsed,
+        &[],
+    ));
+    let cost_section = &split[split.iter().position(|row| row == "Cost").unwrap()..];
+    assert_eq!(
+        cost_section[..4],
+        [
+            "Cost",
+            "Total: $0.1500",
+            "anthropic/claude-opus-4-6: $0.1000",
+            "unknown model (deleted agents): $0.0500",
+        ],
+        "{split:#?}"
+    );
 }
 
 #[test]
