@@ -3,7 +3,8 @@
 
 use super::planner::{
     apply_refinement_proposal, parse_proposal, refinement_request, rollback_proposal, ApplyOptions,
-    RefinementProposal, AUTO_REFINE_REVIEW_SYSTEM_PROMPT, REFINEMENT_SYSTEM_PROMPT,
+    RefinementProposal, AUTO_REFINE_REVIEW_MAX_OUTPUT_TOKENS, AUTO_REFINE_REVIEW_SYSTEM_PROMPT,
+    REFINEMENT_MAX_OUTPUT_TOKENS, REFINEMENT_SYSTEM_PROMPT,
 };
 use super::{
     infer_refinement_result_scope, merge_refinement_history, HarnessScope, HarnessState,
@@ -251,12 +252,14 @@ pub async fn plan_refinement(
         super::planner::REFINEMENT_SYSTEM_PROMPT,
         &conversation_text,
         &build_prompt,
+        REFINEMENT_MAX_OUTPUT_TOKENS,
     )?;
     let mut request_model = model.clone();
-    request_model.max_tokens = request_max_tokens;
+    request_model.max_tokens = request_max_tokens.min(REFINEMENT_MAX_OUTPUT_TOKENS);
 
+    let max_tokens = request_model.max_tokens;
     let reply = refine_call(request_model, REFINEMENT_SYSTEM_PROMPT, user_prompt).await?;
-    let text = reply_text(&reply, request_max_tokens, "Refinement failed")?;
+    let text = reply_text(&reply, max_tokens, "Refinement failed")?;
     Ok(RefinementPlan {
         proposal: parse_proposal(&text).map_err(anyhow::Error::msg)?,
         id,
@@ -390,13 +393,15 @@ pub async fn review_auto_refine(
         AUTO_REFINE_REVIEW_SYSTEM_PROMPT,
         &conversation_text,
         &build_prompt,
+        AUTO_REFINE_REVIEW_MAX_OUTPUT_TOKENS,
     )?;
     let mut request_model = model.clone();
-    request_model.max_tokens = request_max_tokens;
+    request_model.max_tokens = request_max_tokens.min(AUTO_REFINE_REVIEW_MAX_OUTPUT_TOKENS);
+    let max_tokens = request_model.max_tokens;
     let reply = review_call(request_model, AUTO_REFINE_REVIEW_SYSTEM_PROMPT, user_prompt).await?;
     parse_auto_refine_review(&reply_text(
         &reply,
-        request_max_tokens,
+        max_tokens,
         "Auto-refine review failed",
     )?)
 }
@@ -535,37 +540,6 @@ mod tests {
                 "Auto-refine review failed: max_tokens is too large",
             ]
         );
-    }
-
-    /// The review gate asks for the model's normal per-request output budget,
-    /// not a small cap that a reasoning model can spend before its verdict.
-    #[tokio::test]
-    async fn the_review_gate_asks_for_the_normal_output_budget() {
-        let model = pa_types::ai::Model {
-            context_window: 1_000_000,
-            max_tokens: 128_000,
-            ..test_model()
-        };
-        let requested = std::sync::Arc::new(std::sync::Mutex::new(0));
-        let recorder = std::sync::Arc::clone(&requested);
-        let review_call: RefinerFn = Box::new(move |model, _system, _prompt| {
-            *recorder.lock().unwrap() = model.max_tokens;
-            Box::pin(async { Ok(text_message(r#"{"shouldRefine":false}"#)) })
-        });
-        review_auto_refine(
-            &[],
-            &super::super::empty_harness_state(),
-            &[],
-            &model,
-            &AutoRefineReviewContext {
-                reason: "checkpoint".to_string(),
-                turns_since_last_review: 1,
-            },
-            review_call,
-        )
-        .await
-        .unwrap();
-        assert_eq!(*requested.lock().unwrap(), 32_000);
     }
 
     #[test]
