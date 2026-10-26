@@ -542,7 +542,7 @@ mod tests {
             errors,
             [
                 "Refinement failed: the model hit its output limit (8000 tokens, test/m)",
-                "Auto-refine review failed: the model hit its output limit (4096 tokens, test/m)",
+                "Auto-refine review failed: the model hit its output limit (8000 tokens, test/m)",
                 "Refinement failed: max_tokens is too large",
                 "Auto-refine review failed: max_tokens is too large",
             ]
