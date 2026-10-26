@@ -158,6 +158,16 @@ impl FactoryEdge {
     }
 }
 
+/// One instance row of a node: its status and the child it spawned
+/// (`child`, the `rlm_child_id`; a retry overwrites it in place, so the
+/// row always names its latest attempt). The child id is an identity,
+/// never painted, so it stays raw like the run id.
+#[derive(Debug, Clone, PartialEq)]
+pub struct FactoryInstance {
+    pub status: String,
+    pub child: Option<String>,
+}
+
 /// One live node's runtime state (the `status()` node shape, compact
 /// lane). `running`/`queued` are the kernel's per-stage agent counts —
 /// how many agents run at the stage and how many queue behind them —
@@ -170,7 +180,7 @@ pub struct FactoryNodeState {
     pub entries_used: u64,
     pub max_entries: u64,
     pub entries: Vec<String>,
-    pub instances: Vec<String>,
+    pub instances: Vec<FactoryInstance>,
     pub error: Option<String>,
     pub running: Option<u64>,
     pub queued: Option<u64>,
@@ -203,8 +213,16 @@ impl FactoryNodeState {
                 .map(|instances| {
                     instances
                         .iter()
-                        .filter_map(|instance| instance.get("status").and_then(Value::as_str))
-                        .map(scrubbed)
+                        .filter_map(|instance| {
+                            Some(FactoryInstance {
+                                status: scrubbed(instance.get("status")?.as_str()?),
+                                child: instance
+                                    .get("child")
+                                    .and_then(Value::as_str)
+                                    .filter(|child| !child.is_empty())
+                                    .map(str::to_string),
+                            })
+                        })
                         .collect()
                 })
                 .unwrap_or_default(),
@@ -222,8 +240,24 @@ impl FactoryNodeState {
             self.status,
             self.entries_used,
             self.max_entries,
-            self.instances.join(",")
+            self.instances
+                .iter()
+                .map(|instance| instance.status.as_str())
+                .collect::<Vec<_>>()
+                .join(",")
         )
+    }
+
+    /// The state's latest spawned child: the last instance row (report
+    /// order — entry order, then instance order) that carries a child.
+    /// The one predicate behind a state row's selectability, its muted
+    /// paint, and its open/stop target.
+    #[must_use]
+    pub fn latest_child(&self) -> Option<(&str, &FactoryInstance)> {
+        self.instances
+            .iter()
+            .rev()
+            .find_map(|instance| Some((instance.child.as_deref()?, instance)))
     }
 
     /// Whether the node is in flight: an entry pending (awaiting its
@@ -266,7 +300,10 @@ impl FactoryNodeState {
     }
 
     fn instance_count(&self, status: &str) -> u64 {
-        self.instances.iter().filter(|row| *row == status).count() as u64
+        self.instances
+            .iter()
+            .filter(|row| row.status == status)
+            .count() as u64
     }
 
     /// The stage's occupancy label — `3 run · 2 queued` — when agents
