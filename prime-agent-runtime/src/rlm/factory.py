@@ -1428,9 +1428,8 @@ class _PythonProcess:
             raise
         return cls(proc, stdout, stderr)
 
-    async def stop(self) -> None:
-        """Kill the call's whole process group (the process alone on
-        Windows), wait for it to exit, and release its files."""
+    def _kill(self) -> None:
+        """Kill the call's whole process group (the process alone on Windows)."""
         if os.name == "posix":
             from .bash import _signal_group
 
@@ -1440,11 +1439,18 @@ class _PythonProcess:
                 self.proc.kill()
             except ProcessLookupError:
                 pass  # already exited
+
+    async def stop(self) -> None:
+        """Kill a running call, wait for it to exit, and release its files."""
+        self._kill()
         await self.proc.wait()
         self.finish()
 
     def finish(self) -> tuple[str, str]:
-        """Read stdout and the stderr tail of an exited call, then close both."""
+        """Read stdout and the stderr tail of an exited call, then close both.
+        A call lives no longer than its exit: anything it left running in its
+        process group is killed."""
+        self._kill()
         self._stdout.seek(0)
         stdout = self._stdout.read().decode("utf-8", "replace")
         self._stderr.seek(0, os.SEEK_END)
