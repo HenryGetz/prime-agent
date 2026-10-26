@@ -637,10 +637,6 @@ pub fn default_refiner_call(
                     // opencode routing) but never take or replace the session's Codex
                     // WebSocket and its continuation.
                     transport: Some(pa_ai::types::Transport::Sse),
-                    // The request model's output budget is sized by the caller for
-                    // the refinement effort; it rides the wire explicitly instead
-                    // of being re-derived by the model's default resolution.
-                    max_tokens: (model.max_tokens > 0).then_some(model.max_tokens),
                     ..Default::default()
                 });
             stream_options.reasoning = pa_types::ai::minimum_reasoning(&model);

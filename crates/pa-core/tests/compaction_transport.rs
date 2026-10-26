@@ -240,3 +240,25 @@ async fn refiner_call_respects_mandatory_thinking() {
     assert_eq!(request.await.unwrap()["enable_thinking"], json!(true));
     assert!(server.await.unwrap());
 }
+
+#[tokio::test]
+async fn refiner_call_rides_the_model_resolved_output_budget() {
+    let (model, request, server) = mock_summary(Reply::Complete).await;
+    let reply = default_refiner_call(Some("synthetic-key".into()), "synthetic-session".into())(
+        model,
+        "system",
+        "prompt".into(),
+    )
+    .await
+    .unwrap();
+    assert!(matches!(
+        reply.content.as_slice(),
+        [pa_types::ai::AssistantContentBlock::Text(text)] if text.text == "summary"
+    ));
+    // The refine pass rides no explicit option override: the wire budget
+    // resolves from the request model's maxTokens (`build_base_options`
+    // fills the per-model default), so the body carries the catalog value.
+    let body = request.await.unwrap();
+    assert_eq!(body["max_completion_tokens"], json!(2048));
+    assert!(server.await.unwrap());
+}

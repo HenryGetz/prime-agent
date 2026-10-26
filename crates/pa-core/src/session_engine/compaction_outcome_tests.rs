@@ -697,18 +697,15 @@ fn register_refine_model(
     })
 }
 
-/// A faux step replying with `message` while recording the request's wire
-/// output budget.
+/// A faux step replying with `message` while recording the request model's
+/// output budget (the value a provider resolves the wire budget from).
 fn budget_recording_step(
     budgets: &Arc<std::sync::Mutex<Vec<Option<u64>>>>,
     message: pa_types::ai::AssistantMessage,
 ) -> pa_ai::faux::FauxResponseStep {
     let budgets = Arc::clone(budgets);
-    pa_ai::faux::FauxResponseStep::Factory(Arc::new(move |_, options, _, _| {
-        budgets
-            .lock()
-            .unwrap()
-            .push(options.and_then(|options| options.max_tokens));
+    pa_ai::faux::FauxResponseStep::Factory(Arc::new(move |_, _options, _, model| {
+        budgets.lock().unwrap().push(Some(model.max_tokens));
         Ok(message.clone())
     }))
 }
