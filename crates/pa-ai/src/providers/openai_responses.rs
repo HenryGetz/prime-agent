@@ -12,8 +12,8 @@ use crate::event_stream::{
 use crate::models::{clamp_thinking_level, supports_thinking};
 use crate::providers::openai_responses_shared::{
     apply_service_tier_pricing, convert_responses_messages, convert_responses_tools,
-    ConvertResponsesMessagesOptions, ConvertResponsesToolsOptions, ReasoningSummary,
-    ResponsesStreamHooks, OPENAI_TOOL_CALL_PROVIDERS,
+    omitted_effort_off_value, ConvertResponsesMessagesOptions, ConvertResponsesToolsOptions,
+    ReasoningSummary, ResponsesStreamHooks, OPENAI_TOOL_CALL_PROVIDERS,
 };
 use crate::providers::simple_options::build_base_options;
 use crate::registry::Provider;
@@ -261,14 +261,7 @@ fn build_params(model: &Model, context: &Context, options: &OpenAIResponsesOptio
             );
             params.insert("include".into(), json!(["reasoning.encrypted_content"]));
         } else if model.provider != "github-copilot" {
-            let off_null = model
-                .thinking_level_map_value(ModelThinkingLevel::Off)
-                .is_some_and(|value| value.is_none());
-            if !off_null {
-                let off_value = model
-                    .thinking_level_map_value(ModelThinkingLevel::Off)
-                    .and_then(Option::<&String>::cloned)
-                    .unwrap_or_else(|| "none".to_string());
+            if let Some(off_value) = omitted_effort_off_value(model) {
                 params.insert("reasoning".into(), json!({ "effort": off_value }));
             }
         }
