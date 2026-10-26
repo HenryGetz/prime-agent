@@ -752,9 +752,11 @@ def _note_scan_cost(command: str, scan_timeout: float | None = None) -> None:
     hint = (
         "bash: this recursive scan of home-scale directories is unbounded "
         "in time; output caps (| head) do not bound scan time, and "
-        "awaiting it inline can stall the turn. Wrap it in `timeout 60 "
-        "...`, add --max-depth / -maxdepth, or background it and end the "
-        "turn."
+        "awaiting it inline can stall the turn. Bound it with "
+        "`yield_after` or background it and end the turn (not the shell "
+        "`timeout` prefix, which stock macOS lacks while `2>/dev/null` "
+        "masks its failure), add --max-depth / -maxdepth, or scan a "
+        "narrower directory."
     )
     if scan_timeout is not None:
         hint += (

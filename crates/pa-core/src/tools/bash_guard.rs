@@ -1291,7 +1291,7 @@ pub(crate) fn scan_timeout_from_env(
 
 /// The scan-cost warning: names the fix, never blocks the search.
 pub(crate) fn format_scan_cost_warning(auto_timeout: Option<f64>) -> String {
-    let base = "Warning: this recursive scan of home-scale directories is unbounded in time; output caps (like `| head`) do not bound scan time. Add `timeout 60 ...`, a depth bound (`--max-depth` for rg, `-maxdepth` for find), or scan a narrower directory.";
+    let base = "Warning: this recursive scan of home-scale directories is unbounded in time; output caps (like `| head`) do not bound scan time. Bound it with this tool's `timeout` parameter (not the shell `timeout` prefix, which stock macOS lacks while `2>/dev/null` masks its failure), a depth bound (`--max-depth` for rg, `-maxdepth` for find), or a narrower directory.";
     match auto_timeout {
         Some(secs) => {
             format!("{base} A {SCAN_TIMEOUT_ENV} scan timeout of {secs}s applies to this command.")
@@ -1440,6 +1440,18 @@ mod tests {
             "find ~/Documents -maxdepth 2 -name '*.pdf'",
             None
         ));
+    }
+
+    #[test]
+    fn scan_warning_bounds_portably_not_via_the_shell_timeout() {
+        // Stock macOS has no GNU `timeout`, and the incident-style
+        // `timeout 60 grep ... 2>/dev/null` masks its command-not-found
+        // failure, so the warning must point at the tool's own bounds.
+        let warning = format_scan_cost_warning(None);
+        assert!(warning.contains("this tool's `timeout` parameter"));
+        assert!(warning.contains("`--max-depth`"));
+        assert!(warning.contains("`-maxdepth`"));
+        assert!(!warning.contains("timeout 60"));
     }
 
     #[test]

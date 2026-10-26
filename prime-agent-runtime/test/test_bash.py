@@ -1677,8 +1677,20 @@ class ScanCostGuardTest(unittest.IsolatedAsyncioTestCase):
                 bash_module._note_scan_cost("grep -rl needle ~/Documents")
             bash_module._note_scan_cost("grep -rl needle .")
         self.assertEqual(err.getvalue().count("unbounded"), 3)
-        self.assertIn("timeout 60", err.getvalue())
+        self.assertIn("yield_after", err.getvalue())
         self.assertIn("background it", err.getvalue())
+
+    def test_dispatch_hint_bounds_portably_not_via_the_shell_timeout(self):
+        # Stock macOS has no GNU `timeout`, and the incident-style
+        # `timeout 60 grep ... 2>/dev/null` masks its command-not-found
+        # failure, so the hint must not recommend the shell prefix.
+        with (
+            mock.patch.object(bash_module, "_scan_hints_written", 0),
+            mock.patch("sys.stderr", new=io.StringIO()) as err,
+        ):
+            bash_module._note_scan_cost("grep -rl needle ~/Documents")
+        self.assertIn("yield_after", err.getvalue())
+        self.assertNotIn("timeout 60", err.getvalue())
 
     def test_persistent_dispatch_teaches_the_scan_cost_too(self):
         # The hint sits at the single dispatch point before the persistent
