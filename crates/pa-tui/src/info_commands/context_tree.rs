@@ -607,45 +607,46 @@ pub fn context_tree_rows(
     // fit keeps its group row alone. Ties keep tree order (stable sort).
     let mut summary: Option<HiddenAgents> = None;
     let row_count: usize = units.iter().map(|unit| unit.rows.len()).sum();
-    let rows: Vec<TreeRow<'_>> =
-        if scope == ContextTreeScope::Collapsed && row_count > CONTEXT_ROW_BUDGET {
-            units.sort_by(|left, right| {
-                right
-                    .usage
-                    .spent_tokens()
-                    .cmp(&left.usage.spent_tokens())
-                    .then_with(|| right.usage.cost_total.total_cmp(&left.usage.cost_total))
-            });
-            let mut shown = Vec::new();
-            let mut hidden_count = 0;
-            let mut hidden_total = UsageTotals::default();
-            for mut unit in units {
-                let free_rows = CONTEXT_ROW_BUDGET - shown.len();
-                if unit.rows.len() <= free_rows {
-                    shown.extend(unit.rows);
-                } else if free_rows > 0 && unit.rows.len() > 1 {
-                    unit.rows.truncate(1);
-                    if let RowKind::Group(group) = &mut unit.rows[0].kind {
-                        group.folded = true;
-                    }
-                    shown.extend(unit.rows);
-                } else {
-                    hidden_count += unit.agents;
-                    hidden_total.add_fold(&unit.usage);
+    // Over the budget something always folds or hides: the hint follows.
+    let collapsed = scope == ContextTreeScope::Collapsed && row_count > CONTEXT_ROW_BUDGET;
+    let rows: Vec<TreeRow<'_>> = if collapsed {
+        units.sort_by(|left, right| {
+            right
+                .usage
+                .spent_tokens()
+                .cmp(&left.usage.spent_tokens())
+                .then_with(|| right.usage.cost_total.total_cmp(&left.usage.cost_total))
+        });
+        let mut shown = Vec::new();
+        let mut hidden_count = 0;
+        let mut hidden_total = UsageTotals::default();
+        for mut unit in units {
+            let free_rows = CONTEXT_ROW_BUDGET - shown.len();
+            if unit.rows.len() <= free_rows {
+                shown.extend(unit.rows);
+            } else if free_rows > 0 && unit.rows.len() > 1 {
+                unit.rows.truncate(1);
+                if let RowKind::Group(group) = &mut unit.rows[0].kind {
+                    group.folded = true;
                 }
+                shown.extend(unit.rows);
+            } else {
+                hidden_count += unit.agents;
+                hidden_total.add_fold(&unit.usage);
             }
-            if hidden_count > 0 {
-                let noun = if hidden_count == 1 { "agent" } else { "agents" };
-                summary = Some(HiddenAgents {
-                    label: format!("{hidden_count} more {noun}"),
-                    tokens: crate::chrome::format_token_count(hidden_total.spent_tokens()),
-                    cost: format_cost(hidden_total.cost_total),
-                });
-            }
-            shown
-        } else {
-            units.into_iter().flat_map(|unit| unit.rows).collect()
-        };
+        }
+        if hidden_count > 0 {
+            let noun = if hidden_count == 1 { "agent" } else { "agents" };
+            summary = Some(HiddenAgents {
+                label: format!("{hidden_count} more {noun}"),
+                tokens: crate::chrome::format_token_count(hidden_total.spent_tokens()),
+                cost: format_cost(hidden_total.cost_total),
+            });
+        }
+        shown
+    } else {
+        units.into_iter().flat_map(|unit| unit.rows).collect()
+    };
 
     let token_cells: Vec<String> = rows
         .iter()
@@ -768,7 +769,7 @@ pub fn context_tree_rows(
     }
 
     if let Some(hidden) = &summary {
-        // The summary row and the expand affordance.
+        // The summary row.
         let label_space = label_width.saturating_sub(2).max(1);
         let label = truncate_plain(&hidden.label, label_space);
         let mut spans = vec![dim("..."), dim(format!(" {label}"))];
@@ -790,6 +791,8 @@ pub fn context_tree_rows(
         spans.push(raw_span("  "));
         spans.push(dim("-"));
         lines.push(spans);
+    }
+    if collapsed {
         lines.push(vec![dim("Use /context all to show every agent.")]);
     }
 

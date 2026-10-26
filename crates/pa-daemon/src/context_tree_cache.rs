@@ -83,11 +83,9 @@ impl ContextTreeCache {
             invalidated.clone()
         };
         let deleted = |node: &Value| {
-            !is_deleted_row(node)
-                && node
-                    .get("id")
-                    .and_then(Value::as_str)
-                    .is_some_and(|id| invalidated.contains(id))
+            node.get("id")
+                .and_then(Value::as_str)
+                .is_some_and(|id| invalidated.contains(id))
         };
         // A live row's cached body: the live-node entry first, then the
         // persisted row with the same id — a child that went live AFTER the
@@ -159,9 +157,8 @@ impl ContextTreeCache {
                 .unwrap_or_else(std::sync::PoisonError::into_inner);
             if let Some(walk) = state.as_mut() {
                 walk.live_nodes.remove(child_id);
-                walk.persisted.retain(|node| {
-                    is_deleted_row(node) || node.get("id").and_then(Value::as_str) != Some(child_id)
-                });
+                walk.persisted
+                    .retain(|node| node.get("id").and_then(Value::as_str) != Some(child_id));
             }
         }
         self.invalidated
@@ -279,8 +276,7 @@ impl ContextTreeCache {
                         for child_id in invalidated.iter() {
                             live_nodes.remove(child_id);
                             persisted.retain(|node| {
-                                is_deleted_row(node)
-                                    || node.get("id").and_then(Value::as_str) != Some(child_id)
+                                node.get("id").and_then(Value::as_str) != Some(child_id)
                             });
                         }
                         invalidated.clear();
@@ -324,13 +320,6 @@ impl ContextTreeCache {
             }
         });
     }
-}
-
-/// A deleted child's billing row: it IS the post-deletion state, so the
-/// delete invalidation (which retires the child's live/persisted rows)
-/// never drops it.
-fn is_deleted_row(node: &Value) -> bool {
-    node.get("deleted").and_then(Value::as_bool) == Some(true)
 }
 
 /// One full artifact-tree walk: the model registry, the ledger facts, every
@@ -679,7 +668,7 @@ mod tests {
         };
         assert_eq!(persisted.len(), 2, "{persisted:?}");
         assert_eq!(by_id("sub-live")["factory"], json!(tag));
-        let deleted = by_id("sub-gone");
+        let deleted = by_id("deleted:sub-gone");
         assert_eq!(deleted["deleted"], json!(true));
         assert_eq!(
             deleted["factory"],

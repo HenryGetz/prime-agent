@@ -35,10 +35,13 @@ impl ContextLedger {
     /// filtering and no deleted rows.
     pub fn read(ledger: &crate::rlm_ledger::RlmSpawnLedger) -> Self {
         let mut facts = Self::default();
-        for edge in ledger.edges(true).unwrap_or_default() {
-            if let Some(tag) = edge.factory.clone() {
-                facts.factory.insert(edge.child_id.clone(), tag);
-            }
+        let (edges, deleted) = ledger.edges_with_deleted_children().unwrap_or_default();
+        // Replay order: the last edge of a reused child id decides its tag.
+        for edge in edges {
+            match edge.factory.clone() {
+                Some(tag) => facts.factory.insert(edge.child_id.clone(), tag),
+                None => facts.factory.remove(&edge.child_id),
+            };
             if edge.deleted.is_some() {
                 facts
                     .tombstoned
@@ -49,7 +52,7 @@ impl ContextLedger {
                     .insert(edge.child_id);
             }
         }
-        for (parent, children) in ledger.deleted_children_by_parent().unwrap_or_default() {
+        for (parent, children) in deleted {
             facts.deleted.insert(PathBuf::from(parent), children);
         }
         facts
@@ -105,8 +108,10 @@ impl ContextLedger {
                     cache_write,
                     summary.cost,
                 );
+                // Its own id namespace: a live child reusing the id must
+                // never collide with (or invalidate) the deleted spend.
                 let mut node = json!({
-                    "id": child.child_id,
+                    "id": format!("deleted:{}", child.child_id),
                     "label": child.name,
                     "status": "deleted",
                     "deleted": true,

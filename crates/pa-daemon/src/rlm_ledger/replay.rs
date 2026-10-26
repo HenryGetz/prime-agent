@@ -180,7 +180,7 @@ pub(super) struct ReplayState {
 #[derive(Debug)]
 pub(super) struct DeletedBucket {
     pub(super) inputs: Vec<Option<FileIdentity>>,
-    pub(super) children: HashMap<String, Vec<super::DeletedChildUsage>>,
+    pub(super) children: super::DeletedChildrenByParent,
 }
 
 pub(super) fn edge_key(child_id: &str, child: &str) -> String {

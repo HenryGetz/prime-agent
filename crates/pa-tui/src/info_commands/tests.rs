@@ -963,6 +963,32 @@ fn context_tree_groups_factory_runs_and_deleted_agents() {
         collapsed.contains(&"... 7 more agents 700 $0.01 -".to_string()),
         "{collapsed:#?}"
     );
+
+    // A run that only folds (nothing hidden) still offers the expand hint.
+    let mut folded_tree = child("root", "active", 1000, 0.1);
+    folded_tree["children"] = (0..10)
+        .map(|index| {
+            let mut member = child(&format!("m{index}"), "done", 100, 0.001);
+            member["factory"] = serde_json::json!({"runId": "fedcba987654", "specId": "sw"});
+            member
+        })
+        .collect();
+    let folded = normalized(context_tree_rows(
+        &folded_tree,
+        120,
+        ContextTreeScope::Collapsed,
+        &[],
+    ));
+    assert!(
+        folded.contains(
+            &"\u{2514}\u{2500} \u{2713} factory sw fedcba (10 agents) 1.0k $0.01 -".to_string()
+        ),
+        "{folded:#?}"
+    );
+    assert!(
+        folded.contains(&"Use /context all to show every agent.".to_string()),
+        "{folded:#?}"
+    );
 }
 
 #[test]

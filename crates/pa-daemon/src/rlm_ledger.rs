@@ -131,6 +131,9 @@ pub struct DeletedChildUsage {
     pub by_model: Option<Vec<crate::session_usage::ModelUsageSummary>>,
 }
 
+/// The billable deleted children keyed by the parent's canonical session path.
+pub type DeletedChildrenByParent = HashMap<String, Vec<DeletedChildUsage>>;
+
 fn zero_usage() -> crate::session_usage::SessionUsageSummary {
     crate::session_usage::SessionUsageSummary {
         input_tokens: 0,
@@ -543,7 +546,7 @@ impl RlmSpawnLedger {
     /// Recursive spend of tombstoned descendants keyed by the parent's
     /// canonical session path (TS `deletedDescendantUsageByParent`, the
     /// agents-view cost rollup's bucket): the sum of the parent's
-    /// [`Self::deleted_children_by_parent`] entries, so every surface that
+    /// [`Self::deleted_children_of`] entries, so every surface that
     /// bills deleted subagents reads one fold.
     ///
     /// # Errors
@@ -553,8 +556,10 @@ impl RlmSpawnLedger {
     pub fn deleted_descendant_usage_by_parent(
         &self,
     ) -> Result<HashMap<String, crate::session_usage::SessionUsageSummary>> {
+        self.seed_once()?;
+        let state = self.replay_cached()?;
         Ok(self
-            .deleted_children_by_parent()?
+            .deleted_children_of(&state)?
             .into_iter()
             .map(|(parent, children)| {
                 let total = children
@@ -563,6 +568,23 @@ impl RlmSpawnLedger {
                 (parent, total)
             })
             .collect())
+    }
+
+    /// Every edge (tombstones included) and the billable deleted children
+    /// ([`Self::deleted_children_of`]) from ONE replay snapshot, so a delete
+    /// appended mid-read cannot both keep a transcript row and add its
+    /// deleted row.
+    ///
+    /// # Errors
+    ///
+    /// Returns an error when the ledger replay fails (an oversized
+    /// ledger) or a prior panic poisoned the deleted-usage cache.
+    pub fn edges_with_deleted_children(
+        &self,
+    ) -> Result<(Vec<RlmLedgerEdge>, DeletedChildrenByParent)> {
+        self.seed_once()?;
+        let state = self.replay_cached()?;
+        Ok((state.edges.clone(), self.deleted_children_of(&state)?))
     }
 
     /// The billable tombstoned children keyed by the parent's canonical
@@ -585,11 +607,9 @@ impl RlmSpawnLedger {
     ///
     /// # Errors
     ///
-    /// Returns an error when the ledger replay fails (an oversized
-    /// ledger) or a prior panic poisoned the deleted-usage cache.
-    pub fn deleted_children_by_parent(&self) -> Result<HashMap<String, Vec<DeletedChildUsage>>> {
-        self.seed_once()?;
-        let state = self.replay_cached()?;
+    /// Returns an error when a deleted child's file cannot be stat'ed or a
+    /// prior panic poisoned the deleted-usage cache.
+    fn deleted_children_of(&self, state: &ReplayState) -> Result<DeletedChildrenByParent> {
         let inputs = state
             .edges
             .iter()
@@ -611,10 +631,7 @@ impl RlmSpawnLedger {
         Ok(children)
     }
 
-    fn fold_deleted_children(
-        &self,
-        edges: &[RlmLedgerEdge],
-    ) -> HashMap<String, Vec<DeletedChildUsage>> {
+    fn fold_deleted_children(&self, edges: &[RlmLedgerEdge]) -> DeletedChildrenByParent {
         use crate::session_usage::{ModelUsageSummary, SessionUsageSummary};
         let canonical = |path: &str| {
             canonical_session_path(Path::new(path))
@@ -735,7 +752,7 @@ impl RlmSpawnLedger {
                 }
             }
         }
-        let mut deleted_by_parent: HashMap<String, Vec<DeletedChildUsage>> = HashMap::new();
+        let mut deleted_by_parent: DeletedChildrenByParent = HashMap::new();
         for (parent, children) in &children_by_parent {
             let billed: Vec<DeletedChildUsage> = children
                 .iter()
