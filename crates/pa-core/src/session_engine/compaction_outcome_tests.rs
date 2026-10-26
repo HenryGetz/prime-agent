@@ -340,6 +340,14 @@ const EMPTY_PLAN: &str = r#"{"summary":"bench","edits":[]}"#;
 /// A persisted session over two seeded rows, with the live loop context
 /// built the way the resume path builds it (one rebuild).
 async fn refine_test_session() -> (AgentSession, tempfile::TempDir) {
+    refine_test_session_over(Vec::new()).await
+}
+
+/// [`refine_test_session`] with extra rows appended after the seed pair
+/// (a seeded long transcript for the retry-reduction pin).
+async fn refine_test_session_over(
+    extra_rows: Vec<SessionAgentMessage>,
+) -> (AgentSession, tempfile::TempDir) {
     let provider = Arc::new(ScriptedProvider::new(test_model()));
     let options = AgentOptions {
         initial_state: AgentInitialState {
@@ -363,6 +371,9 @@ async fn refine_test_session() -> (AgentSession, tempfile::TempDir) {
         }))
         .unwrap();
     manager.append_message(refine_assistant_row(false)).unwrap();
+    for row in extra_rows {
+        manager.append_message(row).unwrap();
+    }
     let session = AgentSession::new(Arc::new(agent), manager, vec![])
         .await
         .unwrap();
@@ -710,6 +721,30 @@ fn budget_recording_step(
     }))
 }
 
+/// A faux step replying with `message` while recording the request's user
+/// prompt (what a real provider would send the refiner).
+fn prompt_recording_step(
+    prompts: &Arc<std::sync::Mutex<Vec<String>>>,
+    message: pa_types::ai::AssistantMessage,
+) -> pa_ai::faux::FauxResponseStep {
+    let prompts = Arc::clone(prompts);
+    pa_ai::faux::FauxResponseStep::Factory(Arc::new(move |context, _options, _, _model| {
+        let prompt = context
+            .messages
+            .iter()
+            .find_map(|message| match message {
+                pa_types::ai::Message::User(user) => match &user.content {
+                    pa_types::ai::UserContent::Text(text) => Some(text.clone()),
+                    pa_types::ai::UserContent::Blocks(_) => None,
+                },
+                _ => None,
+            })
+            .unwrap_or_default();
+        prompts.lock().unwrap().push(prompt);
+        Ok(message.clone())
+    }))
+}
+
 /// A refiner reply cut by the output budget (the model burned it on
 /// reasoning and stopped at the length limit) retries once through the
 /// session refine path, with the refinement budget capped at the model's
@@ -757,6 +792,80 @@ async fn a_budget_truncated_refiner_reply_retries_once_and_lands() {
         *budgets.lock().unwrap(),
         vec![Some(8_192), Some(8_192)],
         "both requests stay at the 8k catalog maximum output; the floor never raises past it"
+    );
+}
+
+/// A length-stopped first reply retries with the reduced request: the
+/// first attempt carries the full conversation, the retry only its
+/// bounded tail — and exactly one extra call, the hold extension the
+/// session lock pays for a truncated refine.
+#[tokio::test]
+async fn a_length_truncated_reply_retries_with_the_reduced_transcript() {
+    let early_filler = "y".repeat(30_000);
+    let late_filler = "z".repeat(30_000);
+    let (session, tmp) = refine_test_session_over(vec![
+        SessionAgentMessage::User(pa_types::ai::UserMessage {
+            content: pa_types::ai::UserContent::Text(format!(
+                "RETRY_EARLY_MARKER_7429 {early_filler}"
+            )),
+            timestamp: 0,
+            rest: serde_json::Map::default(),
+        }),
+        SessionAgentMessage::User(pa_types::ai::UserMessage {
+            content: pa_types::ai::UserContent::Text(format!(
+                "{late_filler} RETRY_LATE_MARKER_8643"
+            )),
+            timestamp: 0,
+            rest: serde_json::Map::default(),
+        }),
+    ])
+    .await;
+    let registration = register_refine_model(8_192, 128_000);
+    let prompts: Arc<std::sync::Mutex<Vec<String>>> = Arc::new(std::sync::Mutex::new(Vec::new()));
+    registration.set_responses(vec![
+        prompt_recording_step(
+            &prompts,
+            pa_ai::faux::faux_assistant_text_message(
+                r#"{"summary":"cut","edits":[{"action":"cre"#,
+                pa_ai::faux::FauxAssistantMessageOptions {
+                    stop_reason: Some(pa_types::ai::StopReason::Length),
+                    ..Default::default()
+                },
+            ),
+        ),
+        prompt_recording_step(
+            &prompts,
+            pa_ai::faux::faux_assistant_text_message(
+                r#"{"summary":"one edit","edits":[{"action":"create","kind":"memory","id":"m9","title":"t","content":"c"}]}"#,
+                pa_ai::faux::FauxAssistantMessageOptions::default(),
+            ),
+        ),
+    ]);
+    let model = registration.get_model();
+    let global = tmp.path().join("harness");
+    session
+        .refine(
+            &refine::RefineOptions::default(),
+            refine::RefinementSource::User,
+            &model,
+            None,
+            global,
+        )
+        .await
+        .unwrap();
+    let prompts = prompts.lock().unwrap();
+    assert_eq!(prompts.len(), 2, "the retry is one bounded extra call");
+    assert!(
+        prompts[0].contains("RETRY_EARLY_MARKER_7429"),
+        "the first attempt carries the full transcript"
+    );
+    assert!(
+        !prompts[1].contains("RETRY_EARLY_MARKER_7429"),
+        "the retry re-sends only the bounded transcript tail"
+    );
+    assert!(
+        prompts[1].contains("RETRY_LATE_MARKER_8643"),
+        "the retry keeps the most recent conversation"
     );
 }
 

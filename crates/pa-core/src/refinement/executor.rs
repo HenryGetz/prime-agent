@@ -188,9 +188,16 @@ fn conversation_text(messages: &[AgentMessage], cap: usize) -> String {
 
 /// Produce a refinement proposal (rollback, or the LLM pass) without mutating
 /// any harness state. Callers re-read the harness file before applying because
-/// the LLM call can take many seconds. A reply that exhausted its output
-/// budget (length stop or mid-JSON cut) retries once with a reduced request
-/// before the parse error surfaces.
+/// the LLM call can take many seconds. A reply that stopped at the length
+/// limit without parsing as JSON retries once — a reduced request, the
+/// bounded tail of the conversation — before the parse error surfaces; a
+/// mid-JSON cut without a length stop does not retry.
+///
+/// In the session engine the plan runs inside `refine_with_refiner`, which
+/// holds the session mutex and the compaction flight for the whole plan, so
+/// a truncated refine holds both across two model calls instead of one; the
+/// extension is bounded to that single retry. Planning moves off those holds
+/// with the background refinement boundary work.
 ///
 /// # Errors
 ///

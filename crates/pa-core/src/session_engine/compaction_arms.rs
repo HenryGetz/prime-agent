@@ -421,7 +421,10 @@ impl AgentSession {
         // compaction's rebuild: this round's outcome rows persist and then
         // push onto the context the compaction replaces, so the push must
         // not interleave with a replace (duplicating in the rebuilt view
-        // or vanishing under it).
+        // or vanishing under it). The whole plan below — including a
+        // truncation retry — rides under this hold and the session lock,
+        // so a truncated refine holds both across two model calls; planning
+        // moves off them with the background refinement boundary work.
         let _flight = self.compaction_flight.lock().await;
         // The transcript's consumed artifacts are extracted under this first
         // lock straight from the retained rows: no second clone of the rows.
