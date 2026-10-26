@@ -617,7 +617,8 @@ pub fn default_refiner_call(
     session_id: String,
 ) -> crate::refinement::executor::RefinerFn {
     Box::new(move |model, system_prompt, prompt| {
-        let api_key = api_key;
+        let api_key = api_key.clone();
+        let session_id = session_id.clone();
         Box::pin(async move {
             let context = pa_types::ai::Context {
                 system_prompt: Some(system_prompt.to_string()),
@@ -636,6 +637,10 @@ pub fn default_refiner_call(
                     // opencode routing) but never take or replace the session's Codex
                     // WebSocket and its continuation.
                     transport: Some(pa_ai::types::Transport::Sse),
+                    // The request model's output budget is sized by the caller for
+                    // the refinement effort; it rides the wire explicitly instead
+                    // of being re-derived by the model's default resolution.
+                    max_tokens: (model.max_tokens > 0).then_some(model.max_tokens),
                     ..Default::default()
                 });
             stream_options.reasoning = pa_types::ai::minimum_reasoning(&model);
@@ -676,7 +681,7 @@ mod tests {
     fn seam(text: &str) -> RefinerFn {
         let text = text.to_string();
         Box::new(move |_model, _system, _prompt| {
-            let text = text;
+            let text = text.clone();
             Box::pin(async move { Ok(text_assistant(&text)) })
         })
     }
@@ -1162,7 +1167,7 @@ Reviewer instructions: record it"
                         system,
                         user: prompt,
                     });
-                    let reply = reply;
+                    let reply = reply.clone();
                     Box::pin(async move { Ok(text_assistant(&reply)) })
                 }),
                 None,

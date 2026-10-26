@@ -244,6 +244,32 @@ fn session_ai_model() -> pa_types::ai::Model {
     .unwrap()
 }
 
+/// A refiner seam reply: the text with the given stop reason (the
+/// truncation class stops at `Length`).
+fn refiner_reply(text: &str, stop_reason: pa_types::ai::StopReason) -> AssistantMessage {
+    AssistantMessage {
+        content: vec![pa_types::ai::AssistantContentBlock::Text(
+            pa_types::ai::TextContent {
+                text: text.to_string(),
+                text_signature: None,
+                rest: serde_json::Map::default(),
+            },
+        )],
+        api: "openai-completions".to_string(),
+        provider: "test".to_string(),
+        model: "m".to_string(),
+        response_model: None,
+        response_id: None,
+        diagnostics: None,
+        usage: pa_types::ai::Usage::default(),
+        stop_reason,
+        stop_reason_raw: None,
+        error_message: None,
+        timestamp: 0,
+        rest: serde_json::Map::default(),
+    }
+}
+
 fn refine_assistant_row(error: bool) -> SessionAgentMessage {
     SessionAgentMessage::Assistant(pa_types::ai::AssistantMessage {
         content: vec![pa_types::ai::AssistantContentBlock::Text(
@@ -648,5 +674,201 @@ async fn refinement_and_auto_review_preserve_conversation_identity() {
     assert_eq!(
         *observed.lock().unwrap(),
         vec![(Some(expected), Some(pa_ai::types::Transport::Sse)); 2]
+    );
+}
+
+/// The /refine user failure: a refiner reply cut by the output budget (the
+/// model burned the budget on reasoning and stopped at the length limit)
+/// used to fail the run outright. The wire now carries an explicitly sized
+/// budget, and one length-stopped reply retries with a reduced request.
+#[tokio::test]
+async fn a_budget_truncated_refiner_reply_retries_once_and_lands() {
+    let (session, tmp) = refine_test_session().await;
+    // A model whose catalog default output budget (8k) is the starving kind.
+    let registration =
+        pa_ai::faux::register_faux_provider(pa_ai::faux::RegisterFauxProviderOptions {
+            models: Some(vec![pa_ai::faux::FauxModelDefinition {
+                id: "refine-m".to_string(),
+                name: Some("Refine Model".to_string()),
+                reasoning: Some(true),
+                input: Some(vec![pa_types::ai::ModelInput::Text]),
+                cost: None,
+                context_window: Some(128_000),
+                max_tokens: Some(8_192),
+            }]),
+            ..Default::default()
+        });
+    let budgets: Arc<std::sync::Mutex<Vec<Option<u64>>>> =
+        Arc::new(std::sync::Mutex::new(Vec::new()));
+    let step = |message: pa_types::ai::AssistantMessage,
+                budgets: &Arc<std::sync::Mutex<Vec<Option<u64>>>>| {
+        let budgets = Arc::clone(budgets);
+        pa_ai::faux::FauxResponseStep::Factory(Arc::new(move |_, options, _, _| {
+            budgets
+                .lock()
+                .unwrap()
+                .push(options.and_then(|options| options.max_tokens));
+            Ok(message.clone())
+        }))
+    };
+    registration.set_responses(vec![
+        step(
+            pa_ai::faux::faux_assistant_text_message(
+                r#"{"summary":"cut","edits":[{"action":"cre"#,
+                pa_ai::faux::FauxAssistantMessageOptions {
+                    stop_reason: Some(pa_types::ai::StopReason::Length),
+                    ..Default::default()
+                },
+            ),
+            &budgets,
+        ),
+        step(
+            pa_ai::faux::faux_assistant_text_message(
+                r#"{"summary":"one edit","edits":[{"action":"create","kind":"memory","id":"m9","title":"t","content":"c"}]}"#,
+                pa_ai::faux::FauxAssistantMessageOptions::default(),
+            ),
+            &budgets,
+        ),
+    ]);
+    let model = registration.get_model();
+    let global = tmp.path().join("harness");
+    let result = session
+        .refine(
+            &refine::RefineOptions::default(),
+            refine::RefinementSource::User,
+            &model,
+            None,
+            global,
+        )
+        .await
+        .unwrap();
+    assert_eq!(result.summary, "one edit");
+    assert!(result.applied_edits[0].applied);
+    assert_eq!(
+        *budgets.lock().unwrap(),
+        vec![
+            Some(crate::refinement::planner::REFINEMENT_MIN_OUTPUT_TOKENS),
+            Some(crate::refinement::planner::REFINEMENT_MIN_OUTPUT_TOKENS)
+        ],
+        "both requests carry the explicit refinement budget, raised from the 8k default"
+    );
+}
+
+/// The retry doubles the planning window: a kernel harness write landing
+/// between the two attempts must still be rejected by the baseline recheck,
+/// not clobbered by the retry's plan.
+#[tokio::test]
+async fn a_retry_rejects_an_entry_changed_during_planning() {
+    let (session, tmp) = refine_test_session().await;
+    let global = tmp.path().join("harness");
+    let local_dir = {
+        let persistence = session.shared_persistence();
+        let manager = persistence.lock().await;
+        refine::local_harness_state_dir(&manager)
+    };
+    let seed_entry = |content: &str| {
+        crate::refinement::try_update_harness_state(
+            &local_dir,
+            crate::refinement::HarnessScope::Local,
+            |state| {
+                state
+                    .entries
+                    .get_mut(&crate::refinement::RefinementKind::Memory)
+                    .unwrap()
+                    .insert(
+                        "m1".to_string(),
+                        crate::refinement::HarnessEntry {
+                            id: "m1".to_string(),
+                            kind: crate::refinement::RefinementKind::Memory,
+                            title: "Concurrent".to_string(),
+                            content: content.to_string(),
+                            path: "/memories/m1".to_string(),
+                            scope: Some(crate::refinement::HarnessScope::Local),
+                            reference: serde_json::Map::default(),
+                            arguments: serde_json::Map::default(),
+                            metadata: serde_json::Map::default(),
+                            source: "test".to_string(),
+                            created_at: String::new(),
+                            updated_at: String::new(),
+                            version: 1,
+                        },
+                    );
+                anyhow::Ok(())
+            },
+        )
+        .unwrap();
+    };
+    seed_entry("original content");
+    let calls = Arc::new(std::sync::Mutex::new(0usize));
+    let call_counter = Arc::clone(&calls);
+    let mid_plan_write = local_dir.clone();
+    let seam: crate::refinement::executor::RefinerFn = Box::new(move |_model, _system, _prompt| {
+        let first = {
+            let mut calls = call_counter.lock().unwrap();
+            *calls += 1;
+            *calls == 1
+        };
+        let mid_plan_write = mid_plan_write.clone();
+        Box::pin(async move {
+            if first {
+                // A kernel write racing the planning window the retry widened.
+                crate::refinement::try_update_harness_state(
+                    &mid_plan_write,
+                    crate::refinement::HarnessScope::Local,
+                    |state| {
+                        state
+                            .entries
+                            .get_mut(&crate::refinement::RefinementKind::Memory)
+                            .unwrap()
+                            .get_mut("m1")
+                            .unwrap()
+                            .content = "changed by the kernel mid-planning".to_string();
+                        anyhow::Ok(())
+                    },
+                )
+                .unwrap();
+                Ok(refiner_reply(
+                    r#"{"summary":"cut","edits":[{"action":"cre"#,
+                    pa_types::ai::StopReason::Length,
+                ))
+            } else {
+                Ok(refiner_reply(
+                    r#"{"summary":"update","edits":[{"action":"update","kind":"memory","id":"m1","title":"Concurrent","content":"the plan's content"}]}"#,
+                    pa_types::ai::StopReason::Stop,
+                ))
+            }
+        })
+    });
+    let result = session
+        .refine_with_refiner(
+            &refine::RefineOptions::default(),
+            refine::RefinementSource::User,
+            &session_ai_model(),
+            seam,
+            global,
+        )
+        .await
+        .unwrap();
+    assert_eq!(*calls.lock().unwrap(), 2, "the truncated reply retried");
+    assert!(
+        !result.applied_edits[0].applied,
+        "the stale-baseline edit is rejected"
+    );
+    assert_eq!(
+        result.applied_edits[0].error.as_deref(),
+        Some("entry changed during refinement planning")
+    );
+    let after = {
+        let persistence = session.shared_persistence();
+        let manager = persistence.lock().await;
+        crate::refinement::load_harness_state(
+            &refine::local_harness_state_dir(&manager),
+            crate::refinement::HarnessScope::Local,
+        )
+    };
+    assert_eq!(
+        after.entries[&crate::refinement::RefinementKind::Memory]["m1"].content,
+        "changed by the kernel mid-planning",
+        "the concurrent kernel write survives"
     );
 }

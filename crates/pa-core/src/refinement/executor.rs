@@ -21,6 +21,7 @@ pub struct RefineOptions {
 }
 
 /// A planned refinement awaiting application.
+#[derive(Debug)]
 pub struct RefinementPlan {
     pub proposal: RefinementProposal,
     pub id: String,
@@ -126,9 +127,11 @@ pub fn history_for_prompt(history: &[RefinementResult]) -> String {
 
 /// Model-call seam (test seam over pa-ai completion): takes the request
 /// model (output budget pre-clamped), the call's system prompt, and the
-/// user prompt; returns the reply text.
+/// user prompt; returns the reply text. `Fn`, not `FnOnce`: the planning
+/// pass calls it a second time when a reply exhausts its output budget
+/// and the reduced-request retry fires.
 pub type RefinerFn = Box<
-    dyn FnOnce(
+    dyn Fn(
             pa_types::ai::Model,
             &'static str,
             String,
@@ -186,7 +189,9 @@ fn conversation_text(messages: &[AgentMessage], cap: usize) -> String {
 
 /// Produce a refinement proposal (rollback, or the LLM pass) without mutating
 /// any harness state. Callers re-read the harness file before applying because
-/// the LLM call can take many seconds.
+/// the LLM call can take many seconds. A reply that exhausted its output
+/// budget (length stop or mid-JSON cut) retries once with a reduced request
+/// before the parse error surfaces.
 ///
 /// # Errors
 ///
@@ -217,7 +222,7 @@ pub async fn plan_refinement(
         });
     }
 
-    let conversation_text = conversation_text(messages, 80_000);
+    let full_conversation_text = conversation_text(messages, 80_000);
     let scope_instruction = if options.global {
         "Requested refinement scope: global. Only propose stable cross-session continual harness edits, durable user preferences, reusable skills/subagents, or explicitly project-qualified facts that should affect future Prime Agent sessions. Do not persist session-only progress, temporary blockers, or current-run coordination globally."
     } else {
@@ -250,21 +255,72 @@ pub async fn plan_refinement(
     let (request_max_tokens, user_prompt) = refinement_request(
         model,
         super::planner::REFINEMENT_SYSTEM_PROMPT,
-        &conversation_text,
+        &full_conversation_text,
         &build_prompt,
         REFINEMENT_MAX_OUTPUT_TOKENS,
     )?;
     let mut request_model = model.clone();
-    request_model.max_tokens = request_max_tokens.min(REFINEMENT_MAX_OUTPUT_TOKENS);
+    request_model.max_tokens = refinement_output_budget(model, request_max_tokens);
 
     let reply = refine_call(request_model, REFINEMENT_SYSTEM_PROMPT, user_prompt).await?;
-    let text = assistant_text(&reply);
+    let proposal = match parse_proposal(&assistant_text(&reply)) {
+        Ok(proposal) => proposal,
+        Err(error) if !budget_exhausted(&reply, &error) => {
+            return Err(anyhow::Error::msg(error));
+        }
+        Err(_) => {
+            // One retry with a reduced request — a bounded section of the
+            // transcript — so the output budget the reasoning burn eats has
+            // less input to think over and the JSON completes.
+            let retry_conversation = conversation_text(messages, REFINEMENT_RETRY_CONVERSATION_CAP);
+            let (retry_max_tokens, retry_prompt) = refinement_request(
+                model,
+                REFINEMENT_SYSTEM_PROMPT,
+                &retry_conversation,
+                &build_prompt,
+                REFINEMENT_MAX_OUTPUT_TOKENS,
+            )?;
+            let mut retry_model = model.clone();
+            retry_model.max_tokens = refinement_output_budget(model, retry_max_tokens);
+            let reply = refine_call(retry_model, REFINEMENT_SYSTEM_PROMPT, retry_prompt).await?;
+            parse_proposal(&assistant_text(&reply)).map_err(anyhow::Error::msg)?
+        }
+    };
     Ok(RefinementPlan {
-        proposal: parse_proposal(&text).map_err(anyhow::Error::msg)?,
+        proposal,
         id,
         rollback_of: None,
         rollback_scope: None,
     })
+}
+
+/// The transcript tail the truncation retry re-sends: a bounded section of
+/// the conversation, a quarter of the first attempt's cap.
+const REFINEMENT_RETRY_CONVERSATION_CAP: usize = 20_000;
+
+/// The request's output budget: the room-bounded value, raised to the
+/// refinement floor (reasoning burns into the budget before the JSON
+/// starts; a small catalog default starves the remainder), capped at the
+/// refinement ceiling. An explicitly configured `maxTokens` is honored as
+/// configured and never raised.
+fn refinement_output_budget(model: &pa_types::ai::Model, request_max_tokens: u64) -> u64 {
+    let floor = if model.max_tokens_explicit {
+        0
+    } else {
+        super::planner::REFINEMENT_MIN_OUTPUT_TOKENS
+    };
+    request_max_tokens
+        .max(floor)
+        .min(REFINEMENT_MAX_OUTPUT_TOKENS)
+}
+
+/// Whether a failed parse is the exhausted-output-budget class: the reply
+/// stopped at the length limit (an empty reply burned whole on reasoning
+/// parses as "did not return a JSON object", not as truncation) or was
+/// diagnosed as cut mid-JSON.
+fn budget_exhausted(reply: &AssistantMessage, error: &str) -> bool {
+    reply.stop_reason == pa_types::ai::StopReason::Length
+        || error == super::planner::TRUNCATED_JSON_ERROR
 }
 
 fn assistant_text(reply: &AssistantMessage) -> String {
@@ -416,7 +472,7 @@ mod tests {
     fn seam(text: &str) -> RefinerFn {
         let text = text.to_string();
         Box::new(move |_model, _system, _prompt| {
-            let text = text;
+            let text = text.clone();
             Box::pin(async move { Ok(text_message(&text)) })
         })
     }
@@ -460,7 +516,7 @@ mod tests {
         let reply = r#"{"summary":"s","edits":[]}"#.to_string();
         let plan_call: RefinerFn = Box::new(move |_model, system, _prompt| {
             plan_recorder.lock().unwrap().push(system);
-            let reply = reply;
+            let reply = reply.clone();
             Box::pin(async move { Ok(text_message(&reply)) })
         });
         let state = super::super::empty_harness_state();
@@ -518,6 +574,222 @@ mod tests {
         assert!(overview.contains("memory: 1"));
         assert!(overview.contains("- [local:m1] Fact (/m/m1, v0): builds are green"));
         assert_eq!(history_for_prompt(&[]), "No prior refinement history.");
+    }
+
+    fn stopped_message(text: &str, stop_reason: pa_types::ai::StopReason) -> AssistantMessage {
+        AssistantMessage {
+            stop_reason,
+            ..text_message(text)
+        }
+    }
+
+    type RecordedRefinerCalls = std::sync::Arc<std::sync::Mutex<Vec<(u64, String)>>>;
+
+    /// A scripted refiner seam: serves the queued replies in order and records
+    /// each call's request (the output budget and the user prompt).
+    fn scripted_refiner(replies: Vec<AssistantMessage>) -> (RefinerFn, RecordedRefinerCalls) {
+        let replies: std::sync::Arc<
+            std::sync::Mutex<std::collections::VecDeque<AssistantMessage>>,
+        > = std::sync::Arc::new(std::sync::Mutex::new(replies.into()));
+        let calls: std::sync::Arc<std::sync::Mutex<Vec<(u64, String)>>> =
+            std::sync::Arc::new(std::sync::Mutex::new(Vec::new()));
+        let recorded = std::sync::Arc::clone(&calls);
+        let seam: RefinerFn = Box::new(
+            move |model: pa_types::ai::Model, _system: &'static str, prompt: String| {
+                let reply = replies
+                    .lock()
+                    .unwrap()
+                    .pop_front()
+                    .expect("every scripted refiner call has a reply");
+                recorded.lock().unwrap().push((model.max_tokens, prompt));
+                Box::pin(async move { Ok(reply) })
+            },
+        );
+        (seam, calls)
+    }
+
+    fn user_message(text: &str) -> AgentMessage {
+        AgentMessage::User(pa_types::ai::UserMessage {
+            content: pa_types::ai::UserContent::Text(text.to_string()),
+            timestamp: 0,
+            rest: serde_json::Map::default(),
+        })
+    }
+
+    const APPLIED_PLAN: &str = r#"{"summary":"note it","rationale":"seen twice","expectedOutcome":"recall","edits":[{"action":"create","kind":"memory","id":"retry_m","title":"Note","content":"value"}]}"#;
+    const TRUNCATED_MID_JSON: &str = r#"{"summary":"cut","rationale":"seen twice","expectedOutcome":"recall","edits":[{"action":"create","kind":"memory","id":"m","title":"Note","content":"truncat"#;
+
+    #[tokio::test]
+    async fn a_truncated_reply_retries_once_with_a_smaller_request_and_lands() {
+        let state = super::super::empty_harness_state();
+        let head = "head of the conversation ".repeat(2_000);
+        let tail = "tail marker the retry keeps";
+        let messages = vec![user_message(&head), user_message(tail)];
+        let (refiner, calls) = scripted_refiner(vec![
+            stopped_message(TRUNCATED_MID_JSON, pa_types::ai::StopReason::Length),
+            stopped_message(APPLIED_PLAN, pa_types::ai::StopReason::Stop),
+        ]);
+        let plan = plan_refinement(
+            &messages,
+            &state,
+            &[],
+            &test_model(),
+            &RefineOptions::default(),
+            refiner,
+        )
+        .await
+        .unwrap();
+        assert_eq!(plan.proposal.edits.len(), 1);
+        let calls = calls.lock().unwrap();
+        assert_eq!(calls.len(), 2, "the truncation retried once");
+        // The request budget is explicitly sized for the refinement effort,
+        // not the model's 8k catalog default.
+        assert_eq!(
+            calls[0].0,
+            super::super::planner::REFINEMENT_MIN_OUTPUT_TOKENS
+        );
+        assert_eq!(
+            calls[1].0,
+            super::super::planner::REFINEMENT_MIN_OUTPUT_TOKENS
+        );
+        // The retry sends a reduced request: a bounded section of the
+        // transcript, tail kept.
+        assert!(
+            calls[1].1.len() < calls[0].1.len(),
+            "the retry prompt shrinks"
+        );
+        assert!(
+            calls[1].1.contains(tail),
+            "the retry keeps the transcript tail"
+        );
+    }
+
+    #[tokio::test]
+    async fn an_empty_length_reply_retries_and_lands() {
+        // The content=null/finish_reason=length class: the whole budget
+        // burned on reasoning leaves no JSON to diagnose as truncated.
+        let state = super::super::empty_harness_state();
+        let (refiner, calls) = scripted_refiner(vec![
+            stopped_message("", pa_types::ai::StopReason::Length),
+            stopped_message(APPLIED_PLAN, pa_types::ai::StopReason::Stop),
+        ]);
+        let plan = plan_refinement(
+            &[],
+            &state,
+            &[],
+            &test_model(),
+            &RefineOptions::default(),
+            refiner,
+        )
+        .await
+        .unwrap();
+        assert_eq!(plan.proposal.edits.len(), 1);
+        assert_eq!(calls.lock().unwrap().len(), 2);
+    }
+
+    #[tokio::test]
+    async fn budget_exhausted_twice_surfaces_the_truncation_error() {
+        let state = super::super::empty_harness_state();
+        let (refiner, calls) = scripted_refiner(vec![
+            stopped_message(TRUNCATED_MID_JSON, pa_types::ai::StopReason::Length),
+            stopped_message(TRUNCATED_MID_JSON, pa_types::ai::StopReason::Length),
+        ]);
+        let error = plan_refinement(
+            &[],
+            &state,
+            &[],
+            &test_model(),
+            &RefineOptions::default(),
+            refiner,
+        )
+        .await
+        .unwrap_err();
+        assert_eq!(
+            error.to_string(),
+            super::super::planner::TRUNCATED_JSON_ERROR
+        );
+        assert_eq!(calls.lock().unwrap().len(), 2);
+    }
+
+    #[tokio::test]
+    async fn a_clean_reply_never_retries() {
+        let state = super::super::empty_harness_state();
+        let (refiner, calls) = scripted_refiner(vec![stopped_message(
+            APPLIED_PLAN,
+            pa_types::ai::StopReason::Stop,
+        )]);
+        let plan = plan_refinement(
+            &[],
+            &state,
+            &[],
+            &test_model(),
+            &RefineOptions::default(),
+            refiner,
+        )
+        .await
+        .unwrap();
+        assert_eq!(plan.proposal.summary, "note it");
+        assert_eq!(calls.lock().unwrap().len(), 1);
+    }
+
+    #[tokio::test]
+    async fn balanced_garbage_does_not_retry() {
+        let state = super::super::empty_harness_state();
+        let (refiner, calls) = scripted_refiner(vec![stopped_message(
+            "not json",
+            pa_types::ai::StopReason::Stop,
+        )]);
+        let error = plan_refinement(
+            &[],
+            &state,
+            &[],
+            &test_model(),
+            &RefineOptions::default(),
+            refiner,
+        )
+        .await
+        .unwrap_err();
+        assert_eq!(error.to_string(), "Refiner did not return a JSON object");
+        assert_eq!(calls.lock().unwrap().len(), 1);
+    }
+
+    #[tokio::test]
+    async fn an_explicitly_configured_max_tokens_is_honored_not_raised() {
+        let state = super::super::empty_harness_state();
+        let mut model = test_model();
+        model.max_tokens_explicit = true;
+        let (refiner, calls) = scripted_refiner(vec![stopped_message(
+            APPLIED_PLAN,
+            pa_types::ai::StopReason::Stop,
+        )]);
+        plan_refinement(&[], &state, &[], &model, &RefineOptions::default(), refiner)
+            .await
+            .unwrap();
+        assert_eq!(
+            calls.lock().unwrap()[0].0,
+            8_000,
+            "the explicit budget stays as configured"
+        );
+    }
+
+    #[tokio::test]
+    async fn a_roomy_catalog_model_keeps_the_ceiling_capped_budget() {
+        let state = super::super::empty_harness_state();
+        let mut model = test_model();
+        model.max_tokens = 131_072;
+        model.context_window = 400_000;
+        let (refiner, calls) = scripted_refiner(vec![stopped_message(
+            APPLIED_PLAN,
+            pa_types::ai::StopReason::Stop,
+        )]);
+        plan_refinement(&[], &state, &[], &model, &RefineOptions::default(), refiner)
+            .await
+            .unwrap();
+        assert_eq!(
+            calls.lock().unwrap()[0].0,
+            REFINEMENT_MAX_OUTPUT_TOKENS,
+            "the refinement ceiling still caps the budget"
+        );
     }
 
     #[tokio::test]

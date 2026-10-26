@@ -13,6 +13,11 @@ pub const AUTO_REFINE_REVIEW_SYSTEM_PROMPT: &str = "You are Prime Agent's automa
 
 /// Output caps (reasoning off shares the model's output budget with JSON).
 pub const REFINEMENT_MAX_OUTPUT_TOKENS: u64 = 32_000;
+/// The floor the refine request raises a small catalog default to: a
+/// reasoning model burns part of the output budget on thinking before the
+/// JSON starts, and a small default starves the remainder (empty or
+/// cut-off replies). An explicitly configured `maxTokens` is not raised.
+pub const REFINEMENT_MIN_OUTPUT_TOKENS: u64 = 16_000;
 pub const AUTO_REFINE_REVIEW_MAX_OUTPUT_TOKENS: u64 = 4_096;
 pub const REFINEMENT_CONTEXT_OVERHEAD_TOKENS: u64 = 1_024;
 
