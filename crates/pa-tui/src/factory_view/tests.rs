@@ -305,6 +305,28 @@ fn the_diagram_renders_states_edges_and_the_fired_marker() {
     );
 }
 
+/// A python state paints its callable where a subagent state paints its
+/// subagent name.
+#[test]
+fn a_python_state_renders_its_callable() {
+    let mut snapshot = scripted_snapshot();
+    snapshot["machine"]["states"][0] = json!({
+        "id": "collect", "entry": true, "lifecycle": "task", "maxEntries": 1, "retries": 0,
+        "python": "my_tools.gh.open_prs"
+    });
+    let runs = parse_factory_runs(&runs_response(&snapshot));
+    assert_eq!(
+        runs[0].states[0].python.as_deref(),
+        Some("my_tools.gh.open_prs")
+    );
+    let mut view = FactoryView::new(runs, 40);
+    let joined = frame_text(&mut view).join("\n");
+    assert!(
+        joined.contains("collect (py my_tools.gh.open_prs)"),
+        "{joined}"
+    );
+}
+
 /// The per-stage agent occupancy (the UX ask): a stage's label carries
 /// how many agents sit at it — `reviewing (3 run · 2 queued)` — read
 /// from the kernel's per-state counts, with the instance rows as the
