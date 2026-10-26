@@ -45,13 +45,16 @@ pub struct ResolvedAuxiliaryModel {
 }
 
 /// The output budget a side call asks for: the model's whole `max_tokens`
-/// while the call runs with reasoning (thinking and the answer share it, so a
-/// cap can cut the answer off), and at most `no_reasoning_cap` without
-/// reasoning. The caller still fits it to the context room its input leaves.
+/// while the call may reason (thinking and the answer share it, so a cap can
+/// cut the answer off), and at most `no_reasoning_cap` when it really runs
+/// without reasoning: it sends none (`minimum_reasoning` is `None`) and the
+/// route turns thinking off for that. The caller still fits it to the context
+/// room its input leaves.
 pub(crate) fn side_call_output_budget(model: &Model, no_reasoning_cap: u64) -> u64 {
-    match pa_types::ai::minimum_reasoning(model) {
-        Some(_) => model.max_tokens,
-        None => model.max_tokens.min(no_reasoning_cap),
+    if pa_types::ai::minimum_reasoning(model).is_none() && pa_ai::omitted_reasoning_is_off(model) {
+        model.max_tokens.min(no_reasoning_cap)
+    } else {
+        model.max_tokens
     }
 }
 
@@ -312,9 +315,9 @@ mod tests {
         assert_eq!(routed.api_key.as_deref(), Some("session-key"));
     }
 
-    /// Whether the faux model can run with reasoning off.
+    /// The faux model's thinking: none at all, or required.
     enum Thinking {
-        Optional,
+        Absent,
         Mandatory,
     }
 
@@ -331,7 +334,7 @@ mod tests {
             pa_ai::faux::register_faux_provider(pa_ai::faux::RegisterFauxProviderOptions {
                 models: Some(vec![pa_ai::faux::FauxModelDefinition {
                     id: "side-call-model".to_string(),
-                    reasoning: Some(true),
+                    reasoning: Some(matches!(thinking, Thinking::Mandatory)),
                     context_window: Some(context_window),
                     max_tokens: Some(max_tokens),
                     ..Default::default()
@@ -439,9 +442,63 @@ mod tests {
         requests.into_iter().map(|(budget, _)| budget).collect()
     }
 
+    /// The review gate's budget on an openai-completions model that can turn
+    /// thinking off, so the call sends no reasoning.
+    async fn review_gate_budget(thinking_format: &str) -> u64 {
+        let model: Model = serde_json::from_value(serde_json::json!({
+            "id": "m", "name": "m", "api": "openai-completions", "provider": "p",
+            "baseUrl": "http://localhost", "reasoning": true, "input": ["text"],
+            "cost": { "input": 0, "output": 0, "cacheRead": 0, "cacheWrite": 0 },
+            "contextWindow": 1_000_000, "maxTokens": 128_000,
+            "compat": { "thinkingFormat": thinking_format }
+        }))
+        .unwrap();
+        let budget = std::sync::Arc::new(std::sync::Mutex::new(0));
+        let recorder = std::sync::Arc::clone(&budget);
+        let review_call: crate::refinement::executor::RefinerFn =
+            Box::new(move |model, _system, _prompt| {
+                *recorder.lock().unwrap() = model.max_tokens;
+                Box::pin(async {
+                    Ok(pa_ai::faux::faux_assistant_text_message(
+                        r#"{"shouldRefine":false}"#,
+                        pa_ai::faux::FauxAssistantMessageOptions::default(),
+                    ))
+                })
+            });
+        crate::refinement::executor::review_auto_refine(
+            &[],
+            &crate::refinement::empty_harness_state(),
+            &[],
+            &model,
+            &crate::refinement::executor::AutoRefineReviewContext {
+                reason: "checkpoint".to_string(),
+                turns_since_last_review: 1,
+            },
+            review_call,
+        )
+        .await
+        .unwrap();
+        let budget = *budget.lock().unwrap();
+        budget
+    }
+
+    /// An effort route sends no effort for omitted reasoning, so the server
+    /// default may reason and the review gate gets the whole budget; a toggle
+    /// route sends thinking off and keeps the cap.
+    #[tokio::test]
+    async fn the_review_gate_keeps_its_cap_only_where_the_route_turns_thinking_off() {
+        assert_eq!(
+            [
+                review_gate_budget("openai").await,
+                review_gate_budget("zai").await
+            ],
+            [128_000, 4_096]
+        );
+    }
+
     /// Refine, the auto-refine review, and a branch summary on a model that must
-    /// reason get its whole output budget; with reasoning off they keep their
-    /// caps; no budget exceeds the model's max output or the context room.
+    /// reason get its whole output budget; on a model without thinking they keep
+    /// their caps; no budget exceeds the model's max output or the context room.
     #[tokio::test]
     async fn side_calls_size_their_output_budget_for_reasoning() {
         assert_eq!(
@@ -449,11 +506,11 @@ mod tests {
             [128_000; 3]
         );
         assert_eq!(
-            side_call_budgets(Thinking::Optional, 1_000_000, 128_000).await,
+            side_call_budgets(Thinking::Absent, 1_000_000, 128_000).await,
             [32_000, 4_096, 2_048]
         );
         assert_eq!(
-            side_call_budgets(Thinking::Optional, 1_000_000, 1_000).await,
+            side_call_budgets(Thinking::Absent, 1_000_000, 1_000).await,
             [1_000; 3]
         );
         // The room, not the model's max output, bounds a small window.

@@ -16,6 +16,15 @@ pub use crate::providers::openai_responses_stream::{
     apply_service_tier_pricing, ResponsesStreamHooks, ResponsesStreamProcessor,
 };
 
+/// The `reasoning.effort` a Responses request sends when no effort is set: the model's mapped
+/// off value, else `"none"`; `None` (send nothing) when the map sets off to null.
+pub(crate) fn omitted_effort_off_value(model: &Model) -> Option<String> {
+    match model.thinking_level_map_value(crate::types::ModelThinkingLevel::Off) {
+        Some(off) => off.cloned(),
+        None => Some("none".to_string()),
+    }
+}
+
 pub(crate) fn encode_text_signature_v1(id: &str, phase: Option<TextSignaturePhase>) -> String {
     let mut payload = Map::new();
     payload.insert("v".into(), json!(1));
