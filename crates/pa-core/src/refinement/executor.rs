@@ -3,9 +3,7 @@
 
 use super::planner::{
     apply_refinement_proposal, parse_proposal, refinement_request, rollback_proposal, ApplyOptions,
-    RefinementProposal, AUTO_REFINE_REVIEW_NO_REASONING_MAX_OUTPUT_TOKENS,
-    AUTO_REFINE_REVIEW_SYSTEM_PROMPT, REFINEMENT_NO_REASONING_MAX_OUTPUT_TOKENS,
-    REFINEMENT_SYSTEM_PROMPT,
+    RefinementProposal, AUTO_REFINE_REVIEW_SYSTEM_PROMPT, REFINEMENT_SYSTEM_PROMPT,
 };
 use super::{
     infer_refinement_result_scope, merge_refinement_history, HarnessScope, HarnessState,
@@ -126,8 +124,8 @@ pub fn history_for_prompt(history: &[RefinementResult]) -> String {
 }
 
 /// Model-call seam (test seam over pa-ai completion): takes the request
-/// model (its `max_tokens` is the call's output budget, to send as is), the
-/// call's system prompt, and the user prompt; returns the reply text.
+/// model (output budget pre-clamped), the call's system prompt, and the
+/// user prompt; returns the reply text.
 pub type RefinerFn = Box<
     dyn FnOnce(
             pa_types::ai::Model,
@@ -253,7 +251,6 @@ pub async fn plan_refinement(
         super::planner::REFINEMENT_SYSTEM_PROMPT,
         &conversation_text,
         &build_prompt,
-        REFINEMENT_NO_REASONING_MAX_OUTPUT_TOKENS,
     )?;
     let mut request_model = model.clone();
     request_model.max_tokens = request_max_tokens;
@@ -393,7 +390,6 @@ pub async fn review_auto_refine(
         AUTO_REFINE_REVIEW_SYSTEM_PROMPT,
         &conversation_text,
         &build_prompt,
-        AUTO_REFINE_REVIEW_NO_REASONING_MAX_OUTPUT_TOKENS,
     )?;
     let mut request_model = model.clone();
     request_model.max_tokens = request_max_tokens;
@@ -551,6 +547,37 @@ mod tests {
                 "Auto-refine review failed: max_tokens is too large",
             ]
         );
+    }
+
+    /// The review gate asks for the model's normal per-request output budget,
+    /// not a small cap that a reasoning model can spend before its verdict.
+    #[tokio::test]
+    async fn the_review_gate_asks_for_the_normal_output_budget() {
+        let model = pa_types::ai::Model {
+            context_window: 1_000_000,
+            max_tokens: 128_000,
+            ..test_model()
+        };
+        let requested = std::sync::Arc::new(std::sync::Mutex::new(0));
+        let recorder = std::sync::Arc::clone(&requested);
+        let review_call: RefinerFn = Box::new(move |model, _system, _prompt| {
+            *recorder.lock().unwrap() = model.max_tokens;
+            Box::pin(async { Ok(text_message(r#"{"shouldRefine":false}"#)) })
+        });
+        review_auto_refine(
+            &[],
+            &super::super::empty_harness_state(),
+            &[],
+            &model,
+            &AutoRefineReviewContext {
+                reason: "checkpoint".to_string(),
+                turns_since_last_review: 1,
+            },
+            review_call,
+        )
+        .await
+        .unwrap();
+        assert_eq!(*requested.lock().unwrap(), 32_000);
     }
 
     #[test]

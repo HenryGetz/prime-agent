@@ -162,50 +162,6 @@ pub fn effective_request_max_tokens(model: &Model, reasoning: ModelThinkingLevel
     }
 }
 
-/// Whether a simple-stream request that sends no reasoning (`reasoning: None`) really runs with
-/// thinking off on `model`'s route. Unknown apis count as "may reason". Must agree with the
-/// builders: it shares their helpers (`uses_thinking_levels`, `is_anthropic_claude_model`, the
-/// always-on adaptive checks, `get_compat`, `omitted_effort_off_value`).
-#[must_use]
-pub fn omitted_reasoning_is_off(model: &Model) -> bool {
-    use crate::providers::{
-        anthropic, azure_openai_responses, bedrock, google_shared, openai_completions,
-        openai_responses, openai_responses_shared::omitted_effort_off_value,
-    };
-    use crate::types::ThinkingFormat;
-    if !crate::models::supports_thinking(model) {
-        return true;
-    }
-    match model.api.as_str() {
-        anthropic::API_ANTHROPIC_MESSAGES => {
-            !anthropic::is_always_on_adaptive_thinking_model(&model.id)
-        }
-        bedrock::API_BEDROCK_CONVERSE_STREAM => {
-            bedrock::is_anthropic_claude_model(model)
-                && !bedrock::supports_always_on_adaptive_thinking(&model.id, Some(&model.name))
-        }
-        google_shared::API_GOOGLE_GENERATIVE_AI | google_shared::API_GOOGLE_VERTEX => {
-            !google_shared::uses_thinking_levels(model)
-        }
-        openai_completions::API_OPENAI_COMPLETIONS => {
-            match openai_completions::get_compat(model).thinking_format {
-                ThinkingFormat::Zai
-                | ThinkingFormat::Qwen
-                | ThinkingFormat::QwenChatTemplate
-                | ThinkingFormat::Deepseek => true,
-                ThinkingFormat::Openai | ThinkingFormat::Openrouter => false,
-            }
-        }
-        openai_responses::API_OPENAI_RESPONSES => {
-            model.provider != "github-copilot" && omitted_effort_off_value(model).is_some()
-        }
-        azure_openai_responses::API_AZURE_OPENAI_RESPONSES => {
-            omitted_effort_off_value(model).is_some()
-        }
-        _ => false,
-    }
-}
-
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -395,53 +351,5 @@ mod tests {
             effective_request_max_tokens(&bare, ModelThinkingLevel::High),
             0
         );
-    }
-
-    #[test]
-    fn omitted_reasoning_is_off_only_where_the_route_sends_off() {
-        let completions = |format: &str| -> Model {
-            let mut value = serde_json::to_value(model("openai-completions", "m", 8_000)).unwrap();
-            value["compat"] = json!({ "thinkingFormat": format });
-            serde_json::from_value(value).unwrap()
-        };
-        let mut copilot = model("openai-responses", "gpt-x", 8_000);
-        copilot.provider = "github-copilot".to_string();
-        let mut null_off = model("azure-openai-responses", "gpt-x", 8_000);
-        null_off.thinking_level_map = Some(pa_types::ai::thinking_level_map(&[(
-            ModelThinkingLevel::Off,
-            None,
-        )]));
-        let cases = [
-            (model("google-vertex", "gemini-2.5-flash", 8_000), true),
-            (model("google-vertex", "gemini-3-pro", 8_000), false),
-            (
-                model(
-                    "bedrock-converse-stream",
-                    "anthropic.claude-sonnet-4",
-                    8_000,
-                ),
-                true,
-            ),
-            (
-                model("bedrock-converse-stream", "deepseek.r1", 8_000),
-                false,
-            ),
-            (model("anthropic-messages", "claude-sonnet-4", 8_000), true),
-            (model("anthropic-messages", "claude-opus-5-5", 8_000), false),
-            (model("openai-responses", "gpt-x", 8_000), true),
-            (copilot, false),
-            (null_off, false),
-            (completions("zai"), true),
-            (completions("openai"), false),
-        ];
-        for (model, off) in cases {
-            assert_eq!(
-                omitted_reasoning_is_off(&model),
-                off,
-                "{} {}",
-                model.api,
-                model.id
-            );
-        }
     }
 }
