@@ -177,8 +177,9 @@ struct WireItem {
     display_name: Option<String>,
     #[serde(default)]
     pricing: WirePricing,
+    /// Routes without published specs send `null`.
     #[serde(default)]
-    specs: WireSpecs,
+    specs: Option<WireSpecs>,
     /// The raw `supported_parameters` list: non-strings drop during
     /// sanitization, so a mixed array must not fail the whole item. Feeds
     /// the tool-capability filter and the reasoning controls.
@@ -318,11 +319,12 @@ pub fn parse_prime_inference_model_catalog(
                     .to_string()
             })
             .filter(|name| !name.is_empty());
-        let has_specs = wire.specs.context_window.is_some()
-            && wire.specs.max_output_tokens.is_some()
-            && wire.specs.supports_reasoning.is_some()
-            && !wire.specs.modalities.input.is_empty()
-            && !wire.specs.modalities.output.is_empty();
+        let specs = wire.specs.unwrap_or_default();
+        let has_specs = specs.context_window.is_some()
+            && specs.max_output_tokens.is_some()
+            && specs.supports_reasoning.is_some()
+            && !specs.modalities.input.is_empty()
+            && !specs.modalities.output.is_empty();
         let reasoning_spec = wire
             .reasoning
             .as_ref()
@@ -352,14 +354,14 @@ pub fn parse_prime_inference_model_catalog(
             ..PrimeInferenceEntry::default()
         };
         if has_specs {
-            let context_window = positive_integer(wire.specs.context_window).unwrap_or_default();
-            let max_tokens = positive_integer(wire.specs.max_output_tokens)
+            let context_window = positive_integer(specs.context_window).unwrap_or_default();
+            let max_tokens = positive_integer(specs.max_output_tokens)
                 .map(|max| max.min(context_window))
                 .unwrap_or_default();
             entry.context_window = Some(context_window);
             entry.max_tokens = Some(max_tokens);
-            entry.vision = Some(wire.specs.modalities.input.iter().any(|m| m == "image"));
-            entry.reasoning = wire.specs.supports_reasoning;
+            entry.vision = Some(specs.modalities.input.iter().any(|m| m == "image"));
+            entry.reasoning = specs.supports_reasoning;
         }
         entries.push(entry);
     }
@@ -387,7 +389,9 @@ fn default_compat() -> ModelCompat {
 }
 
 /// Build the live model list from fetched entries against the compiled
-/// templates. `None` means the coverage gate rejected the result.
+/// templates. Entries without specs take their limits from the same model on
+/// another provider in `catalog`, else from the template. `None` means the
+/// coverage gate rejected the result.
 ///
 /// # Panics
 ///
@@ -399,6 +403,7 @@ pub fn build_prime_inference_models(
     entries: &[PrimeInferenceEntry],
     include_private: bool,
     minimum_models: Option<usize>,
+    catalog: &[Model],
 ) -> Option<Vec<Model>> {
     let templates: std::collections::HashMap<String, &Model> = bundled
         .iter()
@@ -417,13 +422,37 @@ pub fn build_prime_inference_models(
         {
             continue;
         }
+        // Without specs, limits come from the same model elsewhere: the
+        // first-party route (`openai/gpt-5.6` is provider `openai`, id
+        // `gpt-5.6`), else the same id on another provider; else the template.
+        let limits = entry
+            .max_tokens
+            .is_none()
+            .then(|| {
+                let first_party = entry.id.split_once('/');
+                catalog
+                    .iter()
+                    .find(|model| {
+                        first_party.is_some_and(|(vendor, id)| {
+                            model.provider.eq_ignore_ascii_case(vendor)
+                                && model.id.eq_ignore_ascii_case(id)
+                        })
+                    })
+                    .or_else(|| {
+                        catalog.iter().find(|model| {
+                            model.provider != "prime-inference" && model.id == entry.id
+                        })
+                    })
+            })
+            .flatten()
+            .or(template);
         let context_window = entry
             .context_window
-            .or_else(|| template.map(|t| t.context_window))
+            .or_else(|| limits.map(|t| t.context_window))
             .unwrap_or_default();
         let max_tokens = entry
             .max_tokens
-            .or_else(|| template.map(|t| t.max_tokens))
+            .or_else(|| limits.map(|t| t.max_tokens))
             .unwrap_or_default()
             .min(context_window);
         let anthropic = entry.id.to_ascii_lowercase().starts_with("anthropic/");
@@ -558,7 +587,8 @@ pub fn merge_prime_inference_models(bundled: &[Model], live: Option<&[Model]>) -
 /// The scope-keyed Prime Inference catalog: one last-good snapshot per
 /// credential+team scope, fetched live with credentials.
 pub struct PrimeInferenceCatalog {
-    cache: CatalogCache<Vec<Model>>,
+    templates: Arc<Vec<Model>>,
+    cache: CatalogCache<Vec<PrimeInferenceEntry>>,
 }
 
 impl PrimeInferenceCatalog {
@@ -566,25 +596,7 @@ impl PrimeInferenceCatalog {
     /// as templates.
     #[must_use]
     pub fn new(models_dir: Option<PathBuf>) -> Self {
-        let templates = Arc::new(transports::prime_inference_offline_entries());
-        let cache_path = models_dir.map(|dir| dir.join(CACHE_FILE));
-        let parse_templates = Arc::clone(&templates);
-        let parse: crate::cache::CatalogParse<Vec<Model>> = Arc::new(move |payload, _scope| {
-            let entries = parse_prime_inference_model_catalog(payload, false)?;
-            build_prime_inference_models(&parse_templates, &entries, false, None)
-                .ok_or_else(|| "Prime Inference catalog coverage gate failed".to_string())
-        });
-        Self {
-            cache: CatalogCache::new(
-                &format!("{PRIME_INFERENCE_BASE_URL}/models"),
-                cache_path,
-                Arc::new(CatalogFetcher::with_limits(
-                    crate::fetch::FETCH_TIMEOUT,
-                    MAX_RESPONSE_BYTES,
-                )),
-                parse,
-            ),
-        }
+        Self::with_base_url(models_dir, PRIME_INFERENCE_BASE_URL)
     }
 
     /// [`PrimeInferenceCatalog::new`] with an explicit API base URL (test
@@ -594,12 +606,15 @@ impl PrimeInferenceCatalog {
         let templates = Arc::new(transports::prime_inference_offline_entries());
         let cache_path = models_dir.map(|dir| dir.join(CACHE_FILE));
         let parse_templates = Arc::clone(&templates);
-        let parse: crate::cache::CatalogParse<Vec<Model>> = Arc::new(move |payload, _scope| {
-            let entries = parse_prime_inference_model_catalog(payload, false)?;
-            build_prime_inference_models(&parse_templates, &entries, false, None)
-                .ok_or_else(|| "Prime Inference catalog coverage gate failed".to_string())
-        });
+        let parse: crate::cache::CatalogParse<Vec<PrimeInferenceEntry>> =
+            Arc::new(move |payload, _scope| {
+                let entries = parse_prime_inference_model_catalog(payload, false)?;
+                build_prime_inference_models(&parse_templates, &entries, false, None, &[])
+                    .map(|_| entries)
+                    .ok_or_else(|| "Prime Inference catalog coverage gate failed".to_string())
+            });
         Self {
+            templates,
             cache: CatalogCache::new(
                 &format!("{base_url}/models"),
                 cache_path,
@@ -626,10 +641,16 @@ impl PrimeInferenceCatalog {
         self.cache.stored_scope()
     }
 
-    /// The last-good snapshot for a scope, or None (callers fall back to the
-    /// compiled offline entries).
-    pub fn get(&self, credentials: &PrimeInferenceCredentials) -> Option<Vec<Model>> {
-        self.cache.get(&self.scope_for(credentials))
+    /// The models of the last-good snapshot for a scope, or None (callers
+    /// fall back to the compiled offline entries). `catalog` holds the other
+    /// providers' models that entries without specs take their limits from.
+    pub fn get(
+        &self,
+        credentials: &PrimeInferenceCredentials,
+        catalog: &[Model],
+    ) -> Option<Vec<Model>> {
+        let entries = self.cache.get(&self.scope_for(credentials))?;
+        build_prime_inference_models(&self.templates, &entries, false, None, catalog)
     }
 
     /// Clear one scope's cache (revocation, logout).
@@ -643,7 +664,7 @@ impl PrimeInferenceCatalog {
         &self,
         credentials: &PrimeInferenceCredentials,
         force: bool,
-    ) -> Option<Vec<Model>> {
+    ) -> Option<Vec<PrimeInferenceEntry>> {
         let mut headers = vec![(
             "Authorization".to_string(),
             format!("Bearer {}", credentials.api_key),
@@ -747,7 +768,7 @@ mod tests {
         let compiled = transports::prime_inference_offline_entries();
         let ids: Vec<&str> = compiled.iter().map(|m| m.id.as_str()).take(60).collect();
         let entries = parse_prime_inference_model_catalog(&payload(&ids), false).expect("entries");
-        let built = build_prime_inference_models(&compiled, &entries, false, None)
+        let built = build_prime_inference_models(&compiled, &entries, false, None, &[])
             .expect("coverage met (60 >= 55)");
         assert_eq!(built.len(), 60);
         assert!(built.iter().all(|m| m.provider == "prime-inference"));
@@ -755,7 +776,7 @@ mod tests {
         let thin: Vec<&str> = compiled.iter().map(|m| m.id.as_str()).take(5).collect();
         let entries = parse_prime_inference_model_catalog(&payload(&thin), false).expect("entries");
         assert!(
-            build_prime_inference_models(&compiled, &entries, false, None).is_none(),
+            build_prime_inference_models(&compiled, &entries, false, None, &[]).is_none(),
             "coverage gate rejects thin fetches"
         );
     }
@@ -769,7 +790,7 @@ mod tests {
         }]});
         let entries = parse_prime_inference_model_catalog(&unknown, false).expect("entries");
         let built =
-            build_prime_inference_models(&compiled, &entries, false, Some(0)).expect("built");
+            build_prime_inference_models(&compiled, &entries, false, Some(0), &[]).expect("built");
         assert_eq!(built.len(), 0, "entry without template and specs dropped");
     }
 
@@ -792,7 +813,8 @@ mod tests {
             .unwrap()
             .push(wire_entry("anthropic/live-only-model", 2.0, 4.0));
         let entries = parse_prime_inference_model_catalog(&value, false).expect("entries");
-        let built = build_prime_inference_models(&compiled, &entries, false, None).expect("built");
+        let built =
+            build_prime_inference_models(&compiled, &entries, false, None, &[]).expect("built");
         let anthropic = built
             .iter()
             .find(|m| m.id == "anthropic/live-only-model")
@@ -1055,6 +1077,7 @@ mod tests {
             &[effort_entry("z-ai/glm-5.3")],
             false,
             Some(0),
+            &[],
         )
         .expect("built");
         let live = &built[0];
@@ -1078,6 +1101,7 @@ mod tests {
             &[toggle_entry("z-ai/glm-4.7")],
             false,
             Some(0),
+            &[],
         )
         .expect("built");
         let live = &built[0];
@@ -1103,6 +1127,7 @@ mod tests {
             &[route_entry("z-ai/glm-5.3")],
             false,
             Some(0),
+            &[],
         )
         .expect("built");
         let live = &built[0];
@@ -1123,6 +1148,7 @@ mod tests {
             &[reasoning_free],
             false,
             Some(0),
+            &[],
         )
         .expect("built");
         let live = &built[0];
@@ -1138,6 +1164,7 @@ mod tests {
             &[effort_entry("vendor/new"), route_entry("vendor/plain")],
             false,
             Some(0),
+            &[],
         )
         .expect("built");
         let declared: Vec<Option<bool>> = built

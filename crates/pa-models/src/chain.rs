@@ -186,7 +186,7 @@ impl ModelCatalog {
             },
         };
         let live = credentials
-            .and_then(|credentials| self.prime_inference.get(&credentials.as_inference()));
+            .and_then(|credentials| self.prime_inference.get(&credentials.as_inference(), &base));
         match live {
             Some(live) => merge_prime_inference_models(&base, Some(&live)),
             None => base,
@@ -476,7 +476,11 @@ mod tests {
     /// Write the Prime Inference disk snapshot for `credentials`' scope
     /// (the shape `CatalogCache` persists; a fresh process seeds its first
     /// auth-scope observation from it).
-    fn write_pi_snapshot(dir: &std::path::Path, credentials: &PrimeCredentials) {
+    fn write_pi_snapshot(
+        dir: &std::path::Path,
+        credentials: &PrimeCredentials,
+        payload: &serde_json::Value,
+    ) {
         let scope = crate::prime_inference::scope_key(
             &credentials.api_key,
             credentials.team_id.as_deref().unwrap_or_default(),
@@ -485,7 +489,7 @@ mod tests {
             "url": "http://catalog.test/api/v1/models",
             "scope": scope,
             "fetchedAt": 1,
-            "payload": pi_snapshot_payload(),
+            "payload": payload,
         });
         std::fs::write(
             dir.join("prime-inference-models-cache.json"),
@@ -514,7 +518,7 @@ mod tests {
     fn first_observation_after_a_restart_compares_against_the_stored_scope() {
         let dir = tempfile::tempdir().unwrap();
         let account_a = account("sk-a", "team-a");
-        write_pi_snapshot(dir.path(), &account_a);
+        write_pi_snapshot(dir.path(), &account_a, &pi_snapshot_payload());
 
         let catalog = hermetic_catalog(dir.path());
         assert!(!catalog.credentials_changed(Some(&account_a)));
@@ -534,5 +538,75 @@ mod tests {
         let account_a = account("sk-a", "team-a");
         assert!(catalog.credentials_changed(Some(&account_a)));
         assert!(!catalog.credentials_changed(Some(&account_a)));
+    }
+
+    /// Resolve `openai/gpt-5.6` for an account whose Prime Inference snapshot
+    /// has no specs for it, over a bundled catalog listing `openai_ids` at
+    /// 128,000 output / 1,050,000 context.
+    fn resolve_specless_prime_model(openai_ids: &[&str]) -> Model {
+        let dir = tempfile::tempdir().unwrap();
+        let openai = transports::compiled_models()
+            .iter()
+            .find(|m| m.provider == "openai")
+            .expect("compiled openai");
+        let models: Vec<serde_json::Value> = openai_ids
+            .iter()
+            .map(|id| {
+                json!({
+                    "id": id,
+                    "name": id,
+                    "api": openai.api,
+                    "provider": openai.provider,
+                    "baseUrl": openai.base_url,
+                    "reasoning": true,
+                    "input": ["text"],
+                    "cost": {"input": 0, "output": 0, "cacheRead": 0, "cacheWrite": 0},
+                    "contextWindow": 1_050_000,
+                    "maxTokens": 128_000,
+                })
+            })
+            .collect();
+        std::fs::write(
+            dir.path().join("models.bundled.json"),
+            serde_json::to_string(&json!({"schemaVersion": 1, "models": models})).unwrap(),
+        )
+        .unwrap();
+        let mut payload = pi_snapshot_payload();
+        let entry = payload["data"]
+            .as_array_mut()
+            .unwrap()
+            .iter_mut()
+            .find(|entry| entry["id"] == "openai/gpt-5.6")
+            .expect("compiled openai/gpt-5.6");
+        entry["specs"] = serde_json::Value::Null;
+        let credentials = account("sk-a", "team-a");
+        write_pi_snapshot(dir.path(), &credentials, &payload);
+        hermetic_catalog(dir.path())
+            .resolve(Some(&credentials))
+            .into_iter()
+            .find(|m| m.provider == "prime-inference" && m.id == "openai/gpt-5.6")
+            .expect("resolved openai/gpt-5.6")
+    }
+
+    #[test]
+    fn prime_models_without_specs_take_the_limits_of_the_same_model_elsewhere() {
+        let model = resolve_specless_prime_model(&["gpt-5.6"]);
+        assert_eq!(
+            (model.max_tokens, model.context_window),
+            (128_000, 1_050_000)
+        );
+    }
+
+    #[test]
+    fn prime_models_without_specs_keep_the_template_when_no_provider_lists_them() {
+        let template = transports::prime_inference_offline_entries()
+            .into_iter()
+            .find(|m| m.id == "openai/gpt-5.6")
+            .expect("compiled openai/gpt-5.6");
+        let model = resolve_specless_prime_model(&["gpt-4.1"]);
+        assert_eq!(
+            (model.max_tokens, model.context_window),
+            (template.max_tokens, template.context_window)
+        );
     }
 }

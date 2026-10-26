@@ -1,0 +1,1 @@
+- Prime Inference models whose catalog entry has no specs (for example `openai/gpt-5.6`) are listed again, like the TypeScript version, and now use the output and context limits other providers publish for the same model (128,000 / 1,050,000 for gpt-5.6) instead of the built-in 8,192 / 128,000 fallback. The fallback is only used when no other provider lists the model.

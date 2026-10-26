@@ -389,10 +389,11 @@ async fn prime_inference_cache_is_scope_keyed_and_isolated() {
         team_id: Some("team-b".into()),
     };
 
-    let a = catalog
+    catalog
         .refresh(&team_a, true)
         .await
-        .expect("team-a live models");
+        .expect("team-a live fetch");
+    let a = catalog.get(&team_a, &[]).expect("team-a live models");
     assert_eq!(a.len(), 60, "public live entries only");
     // The public models cache never includes private ids (the private
     // entitlement flow is the registry's, over its own authorization).
@@ -405,17 +406,17 @@ async fn prime_inference_cache_is_scope_keyed_and_isolated() {
     assert!(request.contains("x-prime-team-id: team-a"), "{request}");
 
     assert!(
-        catalog.get(&team_b).is_none(),
+        catalog.get(&team_b, &[]).is_none(),
         "account B sees nothing from account A's scope"
     );
 
     let fresh = PrimeInferenceCatalog::with_base_url(Some(PathBuf::from(dir.path())), &base);
     assert!(
-        fresh.get(&team_a).is_some(),
+        fresh.get(&team_a, &[]).is_some(),
         "A's scope reloads its own disk snapshot"
     );
     assert!(
-        fresh.get(&team_b).is_none(),
+        fresh.get(&team_b, &[]).is_none(),
         "B's scope stays empty across processes"
     );
     let stored: Value = serde_json::from_slice(
@@ -467,17 +468,17 @@ async fn unauthorized_prime_inference_clears_only_that_scope() {
         team_id: Some("team-z".into()),
     };
     assert!(catalog.refresh(&creds, true).await.is_some(), "good fetch");
-    assert!(catalog.get(&creds).is_some());
+    assert!(catalog.get(&creds, &[]).is_some());
 
     assert!(catalog.refresh(&creds, true).await.is_none(), "401");
-    assert!(catalog.get(&creds).is_none(), "scope cleared");
+    assert!(catalog.get(&creds, &[]).is_none(), "scope cleared");
     assert!(
         !dir.path()
             .join("prime-inference-models-cache.json")
             .exists(),
         "cache file removed"
     );
-    assert!(catalog.get(&other).is_none());
+    assert!(catalog.get(&other, &[]).is_none());
 }
 
 #[test]
@@ -488,7 +489,7 @@ fn prime_inference_parse_and_coverage_gate_use_public_fns() {
     let compiled = pa_models::transports::prime_inference_offline_entries();
     let payload = json!({"data": []});
     let entries = parse_prime_inference_model_catalog(&payload, true).expect("empty ok");
-    assert!(build_prime_inference_models(&compiled, &entries, false, None).is_none());
+    assert!(build_prime_inference_models(&compiled, &entries, false, None, &[]).is_none());
 }
 
 #[tokio::test]
