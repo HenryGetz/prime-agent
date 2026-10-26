@@ -262,12 +262,9 @@ pub async fn plan_refinement(
     request_model.max_tokens = refinement_output_budget(model, request_max_tokens);
 
     let reply = refine_call(request_model, REFINEMENT_SYSTEM_PROMPT, user_prompt).await?;
-    let proposal = match parse_proposal(&assistant_text(&reply)) {
+    let proposal = match parse_refiner_reply(&reply) {
         Ok(proposal) => proposal,
-        Err(error) if !budget_exhausted(&reply, &error) => {
-            return Err(anyhow::Error::msg(error));
-        }
-        Err(_) => {
+        Err(_) if reply.stop_reason == pa_types::ai::StopReason::Length => {
             // One retry with a reduced request — a bounded section of the
             // transcript — so the output budget the reasoning burn eats has
             // less input to think over and the JSON completes.
@@ -282,8 +279,9 @@ pub async fn plan_refinement(
             let mut retry_model = model.clone();
             retry_model.max_tokens = refinement_output_budget(model, retry_max_tokens);
             let reply = refine_call(retry_model, REFINEMENT_SYSTEM_PROMPT, retry_prompt).await?;
-            parse_proposal(&assistant_text(&reply)).map_err(anyhow::Error::msg)?
+            parse_refiner_reply(&reply)?
         }
+        Err(error) => return Err(error),
     };
     Ok(RefinementPlan {
         proposal,
@@ -314,13 +312,17 @@ fn refinement_output_budget(model: &pa_types::ai::Model, request_max_tokens: u64
         .min(REFINEMENT_MAX_OUTPUT_TOKENS)
 }
 
-/// Whether a failed parse is the exhausted-output-budget class: the reply
-/// stopped at the length limit (an empty reply burned whole on reasoning
-/// parses as "did not return a JSON object", not as truncation) or was
-/// diagnosed as cut mid-JSON.
-fn budget_exhausted(reply: &AssistantMessage, error: &str) -> bool {
-    reply.stop_reason == pa_types::ai::StopReason::Length
-        || error == super::planner::TRUNCATED_JSON_ERROR
+/// Parse the refiner's reply as a proposal. A provider failure reports
+/// itself — the provider's message, as TS does — never re-diagnosed from
+/// the partial text a failed stream may still hold.
+fn parse_refiner_reply(reply: &AssistantMessage) -> anyhow::Result<RefinementProposal> {
+    if reply.stop_reason == pa_types::ai::StopReason::Error {
+        anyhow::bail!(
+            "Refinement failed: {}",
+            reply.error_message.as_deref().unwrap_or("Unknown error")
+        );
+    }
+    parse_proposal(&assistant_text(reply)).map_err(anyhow::Error::msg)
 }
 
 fn assistant_text(reply: &AssistantMessage) -> String {

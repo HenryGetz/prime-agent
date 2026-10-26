@@ -763,33 +763,25 @@ async fn a_budget_truncated_refiner_reply_retries_once_and_lands() {
     );
 }
 
-/// Some providers cut the reply without flagging the length stop; the
-/// mid-JSON diagnosis alone must drive the retry.
+/// A mid-JSON cut with a normal stop is not the budget class: the
+/// diagnosis surfaces immediately, with no reduced-transcript retry
+/// (a partial provider failure rides the same diagnosis).
 #[tokio::test]
-async fn a_mid_json_cut_without_a_length_stop_retries_once_and_lands() {
+async fn a_mid_json_cut_without_a_length_stop_never_retries() {
     let (session, tmp) = refine_test_session().await;
     let registration = register_refine_model(8_192, 128_000);
     let budgets: Arc<std::sync::Mutex<Vec<Option<u64>>>> =
         Arc::new(std::sync::Mutex::new(Vec::new()));
-    registration.set_responses(vec![
-        budget_recording_step(
-            &budgets,
-            pa_ai::faux::faux_assistant_text_message(
-                r#"{"summary":"cut","edits":[{"action":"cre"#,
-                pa_ai::faux::FauxAssistantMessageOptions::default(),
-            ),
+    registration.set_responses(vec![budget_recording_step(
+        &budgets,
+        pa_ai::faux::faux_assistant_text_message(
+            r#"{"summary":"cut","edits":[{"action":"cre"#,
+            pa_ai::faux::FauxAssistantMessageOptions::default(),
         ),
-        budget_recording_step(
-            &budgets,
-            pa_ai::faux::faux_assistant_text_message(
-                r#"{"summary":"one edit","edits":[{"action":"create","kind":"memory","id":"m9","title":"t","content":"c"}]}"#,
-                pa_ai::faux::FauxAssistantMessageOptions::default(),
-            ),
-        ),
-    ]);
+    )]);
     let model = registration.get_model();
     let global = tmp.path().join("harness");
-    let result = session
+    let error = session
         .refine(
             &refine::RefineOptions::default(),
             refine::RefinementSource::User,
@@ -798,13 +790,58 @@ async fn a_mid_json_cut_without_a_length_stop_retries_once_and_lands() {
             global,
         )
         .await
-        .unwrap();
-    assert_eq!(result.summary, "one edit");
-    assert!(result.applied_edits[0].applied);
+        .unwrap_err();
     assert_eq!(
-        *budgets.lock().unwrap(),
-        vec![Some(8_192), Some(8_192)],
-        "the mid-JSON diagnosis alone retried, both requests capped at the 8k catalog maximum output"
+        error.to_string(),
+        crate::refinement::planner::TRUNCATED_JSON_ERROR
+    );
+    assert_eq!(
+        budgets.lock().unwrap().len(),
+        1,
+        "the mid-JSON diagnosis alone never retries"
+    );
+}
+
+/// A provider failure keeps its own message: no reduced-transcript
+/// retry, and the error names the provider's message instead of a
+/// truncation diagnosis from the partial text the failed stream kept.
+#[tokio::test]
+async fn a_provider_error_reply_surfaces_the_provider_message_without_a_retry() {
+    let (session, tmp) = refine_test_session().await;
+    let registration = register_refine_model(8_192, 128_000);
+    let budgets: Arc<std::sync::Mutex<Vec<Option<u64>>>> =
+        Arc::new(std::sync::Mutex::new(Vec::new()));
+    registration.set_responses(vec![budget_recording_step(
+        &budgets,
+        pa_ai::faux::faux_assistant_text_message(
+            r#"{"summary":"cut","edits":[{"action":"cre"#,
+            pa_ai::faux::FauxAssistantMessageOptions {
+                stop_reason: Some(pa_types::ai::StopReason::Error),
+                error_message: Some("max_tokens is too large".to_string()),
+                ..Default::default()
+            },
+        ),
+    )]);
+    let model = registration.get_model();
+    let global = tmp.path().join("harness");
+    let error = session
+        .refine(
+            &refine::RefineOptions::default(),
+            refine::RefinementSource::User,
+            &model,
+            None,
+            global,
+        )
+        .await
+        .unwrap_err();
+    assert_eq!(
+        error.to_string(),
+        "Refinement failed: max_tokens is too large"
+    );
+    assert_eq!(
+        budgets.lock().unwrap().len(),
+        1,
+        "a provider error never reaches the reduced-transcript retry"
     );
 }
 
