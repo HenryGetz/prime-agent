@@ -712,6 +712,33 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn a_mid_json_cut_without_a_length_stop_still_retries() {
+        // Some providers cut the reply without flagging the length stop; the
+        // mid-JSON diagnosis alone must drive the retry.
+        let state = super::super::empty_harness_state();
+        let (refiner, calls) = scripted_refiner(vec![
+            stopped_message(TRUNCATED_MID_JSON, pa_types::ai::StopReason::Stop),
+            stopped_message(APPLIED_PLAN, pa_types::ai::StopReason::Stop),
+        ]);
+        let plan = plan_refinement(
+            &[],
+            &state,
+            &[],
+            &test_model(),
+            &RefineOptions::default(),
+            refiner,
+        )
+        .await
+        .unwrap();
+        assert_eq!(plan.proposal.edits.len(), 1);
+        assert_eq!(
+            calls.lock().unwrap().len(),
+            2,
+            "the mid-JSON diagnosis alone retried"
+        );
+    }
+
+    #[tokio::test]
     async fn a_clean_reply_never_retries() {
         let state = super::super::empty_harness_state();
         let (refiner, calls) = scripted_refiner(vec![stopped_message(
