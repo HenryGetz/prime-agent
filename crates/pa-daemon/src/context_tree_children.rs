@@ -20,14 +20,15 @@ const LABEL_MAX_CHARS: usize = 80;
 const ELLIPSIS: &str = "...";
 
 /// The RLM ledger facts the walk reads, keyed by the parent session file
-/// (canonicalized): the tombstoned child ids whose transcripts stay hidden,
-/// the billable deleted children (the agents view's deleted-spend fold),
-/// and each child's factory run tag.
+/// (canonicalized): the tombstoned child ids whose transcripts stay hidden
+/// and the billable deleted children (the agents view's deleted-spend
+/// fold); plus each child's factory run tag, keyed by the child's own
+/// session file (child ids are only unique under one parent).
 #[derive(Debug, Default)]
 pub struct ContextLedger {
     tombstoned: HashMap<PathBuf, HashSet<String>>,
     deleted: HashMap<PathBuf, Vec<crate::rlm_ledger::DeletedChildUsage>>,
-    factory: HashMap<String, crate::rlm_ledger::RlmFactoryTag>,
+    factory: HashMap<PathBuf, crate::rlm_ledger::RlmFactoryTag>,
 }
 
 impl ContextLedger {
@@ -36,11 +37,12 @@ impl ContextLedger {
     pub fn read(ledger: &crate::rlm_ledger::RlmSpawnLedger) -> Self {
         let mut facts = Self::default();
         let (edges, deleted) = ledger.edges_with_deleted_children().unwrap_or_default();
-        // Replay order: the last edge of a reused child id decides its tag.
+        // Replay order: the last edge at a child session file decides its tag.
         for edge in edges {
+            let child = crate::lease::canonical_session_path(Path::new(&edge.child));
             match edge.factory.clone() {
-                Some(tag) => facts.factory.insert(edge.child_id.clone(), tag),
-                None => facts.factory.remove(&edge.child_id),
+                Some(tag) => facts.factory.insert(child, tag),
+                None => facts.factory.remove(&child),
             };
             if edge.deleted.is_some() {
                 facts
@@ -66,13 +68,13 @@ impl ContextLedger {
             .unwrap_or_default()
     }
 
-    /// Set a child node's `factory` run tag from its ledger edge.
-    pub fn tag(&self, node: &mut Value) {
-        let tag = node
-            .get("id")
-            .and_then(Value::as_str)
-            .and_then(|id| self.factory.get(id));
-        if let Some(tag) = tag {
+    /// Set a child node's `factory` run tag from the ledger edge of its
+    /// session file.
+    fn tag(&self, node: &mut Value, session_file: &Path) {
+        if let Some(tag) = self
+            .factory
+            .get(&crate::lease::canonical_session_path(session_file))
+        {
             node["factory"] = json!(tag);
         }
     }
@@ -229,7 +231,7 @@ pub fn load_context_tree_child(
     if let Some(by_model) = own_usage_by_model {
         node["ownUsageByModel"] = json!(by_model);
     }
-    ledger.tag(&mut node);
+    ledger.tag(&mut node, &store.path);
     // The child's own deleted subagents stay hidden one level down and
     // bill through their deleted rows: the ledger keys by the deleted
     // child's parent session file.

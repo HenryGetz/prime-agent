@@ -374,7 +374,6 @@ fn walk_children(
         node["id"] = child.get("id").cloned().unwrap_or(Value::Null);
         node["label"] = child.get("label").cloned().unwrap_or(Value::Null);
         node["status"] = child.get("status").cloned().unwrap_or(Value::Null);
-        ledger.tag(&mut node);
         let id = node
             .get("id")
             .and_then(Value::as_str)
@@ -644,6 +643,23 @@ mod tests {
                 })
                 .unwrap();
         }
+        // Another session's untagged child that drew the same child id,
+        // spawned later: tags key by child session file, so it neither
+        // clears this run's tag nor inherits it.
+        let twin = agent_dir.join("session-artifacts/01a0other-0000/sub-live/01a0twin-0000.jsonl");
+        ledger
+            .append_spawn(&crate::rlm_ledger::RlmSpawnInput {
+                child_id: "sub-live".to_string(),
+                parent: sessions_dir
+                    .join("01a0other-0000.jsonl")
+                    .to_string_lossy()
+                    .to_string(),
+                child: twin.to_string_lossy().to_string(),
+                depth: 1,
+                name: "twin".to_string(),
+                factory: None,
+            })
+            .unwrap();
         // The production delete: the tombstone, then the usage amendment.
         let gone = gone_file.to_string_lossy().to_string();
         ledger
