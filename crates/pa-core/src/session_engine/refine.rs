@@ -787,6 +787,7 @@ mod tests {
             harness_state_path: String::new(),
             rollback_of: None,
             scope: Some(HarnessScope::Local),
+            reduced_context_retry: false,
         };
         let outcome = create_refinement_outcome_message(&result);
         assert_eq!(outcome.custom_type, "refinement_outcome");

@@ -331,6 +331,15 @@ pub fn get_refinement_history_path(harness_state_dir: &Path) -> PathBuf {
     harness_state_dir.join(REFINEMENT_HISTORY_FILE_NAME)
 }
 
+/// `skip_serializing_if` predicate for [`RefinementResult::reduced_context_retry`]:
+/// the audit and global-history JSON stays byte-identical for first-attempt
+/// plans (the flag serializes only when the reduced-context retry produced
+/// the plan).
+#[allow(clippy::trivially_copy_pass_by_ref)] // serde's skip predicate ABI takes the field by reference
+fn is_false(value: &bool) -> bool {
+    !*value
+}
+
 /// One refinement outcome (applied-edit record), persisted for rollback.
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 #[serde(rename_all = "camelCase")]
@@ -345,6 +354,12 @@ pub struct RefinementResult {
     pub rollback_of: Option<String>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub scope: Option<HarnessScope>,
+    /// Set when the applied plan came from the reduced-context retry: the
+    /// first reply exhausted its output budget and the retry planned on
+    /// only the bounded transcript tail. Traces a refinement planned on the
+    /// reduced context from the result and its audit row.
+    #[serde(default, skip_serializing_if = "is_false")]
+    pub reduced_context_retry: bool,
 }
 
 /// One applied (or failed) edit with before/after snapshots: the TS
@@ -813,6 +828,7 @@ mod tests {
             harness_state_path: get_harness_state_path(&dir).display().to_string(),
             rollback_of: None,
             scope: None,
+            reduced_context_retry: false,
         };
         append_global_refinement(&dir, &result).unwrap();
         let loaded = load_global_refinement_history(&dir);
@@ -858,6 +874,7 @@ mod tests {
             harness_state_path: String::new(),
             rollback_of: None,
             scope: None,
+            reduced_context_retry: false,
         };
         let body = format_refinement_notice_body(&result);
         assert!(body.starts_with("created a memory about the flaky test"));

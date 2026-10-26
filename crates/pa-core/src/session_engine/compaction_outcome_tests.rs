@@ -843,7 +843,7 @@ async fn a_length_truncated_reply_retries_with_the_reduced_transcript() {
     ]);
     let model = registration.get_model();
     let global = tmp.path().join("harness");
-    session
+    let result = session
         .refine(
             &refine::RefineOptions::default(),
             refine::RefinementSource::User,
@@ -853,19 +853,34 @@ async fn a_length_truncated_reply_retries_with_the_reduced_transcript() {
         )
         .await
         .unwrap();
-    let prompts = prompts.lock().unwrap();
-    assert_eq!(prompts.len(), 2, "the retry is one bounded extra call");
+    {
+        let prompts = prompts.lock().unwrap();
+        assert_eq!(prompts.len(), 2, "the retry is one bounded extra call");
+        assert!(
+            prompts[0].contains("RETRY_EARLY_MARKER_7429"),
+            "the first attempt carries the full transcript"
+        );
+        assert!(
+            !prompts[1].contains("RETRY_EARLY_MARKER_7429"),
+            "the retry re-sends only the bounded transcript tail"
+        );
+        assert!(
+            prompts[1].contains("RETRY_LATE_MARKER_8643"),
+            "the retry keeps the most recent conversation"
+        );
+    }
     assert!(
-        prompts[0].contains("RETRY_EARLY_MARKER_7429"),
-        "the first attempt carries the full transcript"
+        result.reduced_context_retry,
+        "the result records the reduced-context retry"
     );
+    let recorded = refine::session_refinement_history(&session.entries().await);
+    let row = recorded
+        .iter()
+        .find(|row| row.id == result.id)
+        .expect("the audit row records this refinement");
     assert!(
-        !prompts[1].contains("RETRY_EARLY_MARKER_7429"),
-        "the retry re-sends only the bounded transcript tail"
-    );
-    assert!(
-        prompts[1].contains("RETRY_LATE_MARKER_8643"),
-        "the retry keeps the most recent conversation"
+        row.reduced_context_retry,
+        "the audit row records the reduced-context retry"
     );
 }
 
@@ -1039,7 +1054,7 @@ async fn an_explicitly_configured_budget_is_honored_not_raised() {
     let mut model = registration.get_model();
     model.max_tokens_explicit = true;
     let global = tmp.path().join("harness");
-    session
+    let result = session
         .refine(
             &refine::RefineOptions::default(),
             refine::RefinementSource::User,
@@ -1053,6 +1068,10 @@ async fn an_explicitly_configured_budget_is_honored_not_raised() {
         *budgets.lock().unwrap(),
         vec![Some(8_192)],
         "the explicit budget stays as configured"
+    );
+    assert!(
+        !result.reduced_context_retry,
+        "a first-attempt plan is not flagged as a reduced-context retry"
     );
 }
 

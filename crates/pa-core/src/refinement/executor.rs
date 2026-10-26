@@ -26,6 +26,11 @@ pub struct RefinementPlan {
     pub id: String,
     pub rollback_of: Option<String>,
     pub rollback_scope: Option<HarnessScope>,
+    /// Set when the plan came from the reduced-context retry rather than a
+    /// first attempt: the first reply exhausted its output budget and the
+    /// retry planned on only the bounded transcript tail. Carried onto the
+    /// applied result so a reduced-context refinement is traceable.
+    pub reduced_context_retry: bool,
 }
 
 /// Mint a refinement id in the canonical `refine_<timestamp>` format.
@@ -178,9 +183,15 @@ fn kind_value(name: &str) -> RefinementKind {
 /// Serialize the conversation for the refine prompt, tail-capped.
 fn conversation_text(messages: &[AgentMessage], cap: usize) -> String {
     let serialized = crate::session_engine::compaction_utils::serialize_conversation(messages);
-    let chars: Vec<char> = serialized.chars().collect();
+    tail_capped(&serialized, cap)
+}
+
+/// The last `cap` characters of a conversation text (the whole text when
+/// shorter).
+fn tail_capped(text: &str, cap: usize) -> String {
+    let chars: Vec<char> = text.chars().collect();
     if chars.len() <= cap {
-        serialized
+        text.to_string()
     } else {
         chars[chars.len() - cap..].iter().collect()
     }
@@ -191,7 +202,10 @@ fn conversation_text(messages: &[AgentMessage], cap: usize) -> String {
 /// the LLM call can take many seconds. A reply that stopped at the length
 /// limit without parsing as JSON retries once — a reduced request, the
 /// bounded tail of the conversation — before the parse error surfaces; a
-/// mid-JSON cut without a length stop does not retry.
+/// mid-JSON cut without a length stop does not retry. A plan the retry
+/// produced is flagged (`reduced_context_retry`, riding onto the applied
+/// result) so a refinement planned on the reduced transcript stays
+/// traceable from the result and its audit row.
 ///
 /// In the session engine the plan runs inside `refine_with_refiner`, which
 /// holds the session mutex and the compaction flight for the whole plan, so
@@ -225,6 +239,7 @@ pub async fn plan_refinement(
             id,
             rollback_of: Some(target.id.clone()),
             rollback_scope: Some(infer_refinement_result_scope(target).unwrap_or(fallback_scope)),
+            reduced_context_retry: false,
         });
     }
 
@@ -269,13 +284,17 @@ pub async fn plan_refinement(
     request_model.max_tokens = refinement_output_budget(model, request_max_tokens);
 
     let reply = refine_call(request_model, REFINEMENT_SYSTEM_PROMPT, user_prompt).await?;
+    let mut reduced_context_retry = false;
     let proposal = match parse_refiner_reply(&reply) {
         Ok(proposal) => proposal,
         Err(_) if reply.stop_reason == pa_types::ai::StopReason::Length => {
-            // One retry with a reduced request — a bounded section of the
-            // transcript — so the output budget the reasoning burn eats has
-            // less input to think over and the JSON completes.
-            let retry_conversation = conversation_text(messages, REFINEMENT_RETRY_CONVERSATION_CAP);
+            reduced_context_retry = true;
+            // One retry with a reduced request — the bounded tail of the
+            // already-serialized transcript, not a second serialization —
+            // so the output budget the reasoning burn eats has less input
+            // to think over and the JSON completes.
+            let retry_conversation =
+                tail_capped(&full_conversation_text, REFINEMENT_RETRY_CONVERSATION_CAP);
             let (retry_max_tokens, retry_prompt) = refinement_request(
                 model,
                 REFINEMENT_SYSTEM_PROMPT,
@@ -295,6 +314,7 @@ pub async fn plan_refinement(
         id,
         rollback_of: None,
         rollback_scope: None,
+        reduced_context_retry,
     })
 }
 
@@ -344,7 +364,8 @@ fn assistant_text(reply: &AssistantMessage) -> String {
         .join("\n")
 }
 
-/// Apply a plan to the (re-read) harness state. `factory_enabled` is the
+/// Apply a plan to the (re-read) harness state, carrying the plan's
+/// `reduced_context_retry` onto the result. `factory_enabled` is the
 /// `factory.enabled` opt-in (default off), resolved by the caller
 /// immediately before this call — after the planning request — so the
 /// synchronous apply always decides on the current setting, never a
@@ -363,7 +384,8 @@ pub fn apply_refinement_plan(
     } else {
         HarnessScope::Local
     });
-    apply_refinement_proposal(
+    let reduced_context_retry = plan.reduced_context_retry;
+    let mut result = apply_refinement_proposal(
         state,
         &plan.proposal,
         ApplyOptions {
@@ -373,7 +395,9 @@ pub fn apply_refinement_plan(
             baseline_state,
             factory_enabled,
         },
-    )
+    );
+    result.reduced_context_retry = reduced_context_retry;
+    result
 }
 
 #[derive(Debug, Default, Clone, PartialEq)]
