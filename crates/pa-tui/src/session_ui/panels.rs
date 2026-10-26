@@ -242,11 +242,13 @@ impl SessionUi {
         self.dirty = true;
     }
 
-    /// Mount the panel an agents-view activity line requested; its close returns to the agents
+    /// Mount the panel an agents-view activity line (or a return to the page that requested the
+    /// session just left) asked for; with `closes_to_agents_view`, its close returns to the agents
     /// view.
     pub(crate) fn open_agents_view_panel(
         &mut self,
         panel: crate::interactive::SessionPanel,
+        closes_to_agents_view: bool,
         view: &mut AgentView,
     ) {
         match panel {
@@ -256,9 +258,16 @@ impl SessionUi {
                     bash_view.select(&id);
                 }
             }
-            crate::interactive::SessionPanel::FactoryRuns => self.open_factory_page(view),
+            crate::interactive::SessionPanel::FactoryRuns { row } => {
+                self.open_factory_page(view);
+                if let (Some(row), Some(factory_view)) = (row, view.factory_view.as_mut()) {
+                    factory_view.select(row);
+                    self.sync_factory_selection(view);
+                }
+            }
         }
-        self.panel_returns_to_agents_view = view.bash_view.is_some() || view.factory_view.is_some();
+        self.panel_returns_to_agents_view =
+            closes_to_agents_view && (view.bash_view.is_some() || view.factory_view.is_some());
     }
 
     /// The close of a panel the agents view requested hands the pane back to it; returns whether

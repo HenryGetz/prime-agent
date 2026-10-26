@@ -585,7 +585,7 @@ fn agents_view_factory_panel_opens_on_the_run_list_and_returns() {
     });
     let outcome = run_plan_with(
         vec![wait_render("solo-spec"), key(KeyCode::Esc)],
-        Some(SessionPanel::FactoryRuns),
+        Some(SessionPanel::FactoryRuns { row: None }),
         Some(graph),
     );
     assert!(

@@ -373,12 +373,12 @@ pub enum FactoryViewAction {
 /// One selectable row, by identity: a run's header (`state_id` `None`)
 /// or one of its states with a session.
 #[derive(Debug, Clone, PartialEq, Eq)]
-struct RowId {
-    run_id: String,
-    state_id: Option<String>,
+pub struct FactoryRow {
+    pub run_id: String,
+    pub state_id: Option<String>,
 }
 
-impl RowId {
+impl FactoryRow {
     fn header(run_id: &str) -> Self {
         Self {
             run_id: run_id.to_string(),
@@ -396,12 +396,12 @@ pub struct FactoryView {
     /// signature changed, decayed on the next cycle (no per-transition
     /// repaint spam — one marker per notice-worthy change).
     recent_change: Vec<bool>,
-    selected: Option<RowId>,
+    selected: Option<FactoryRow>,
     /// The row a first stop press armed, with the stop it armed: the next
     /// stop press on the same row confirms exactly that stop (a child a
     /// retry replaced in between is a different stop), any other key
     /// disarms.
-    armed: Option<(RowId, FactoryViewAction)>,
+    armed: Option<(FactoryRow, FactoryViewAction)>,
     error: Option<String>,
     viewport_rows: usize,
 }
@@ -464,10 +464,10 @@ impl FactoryView {
     /// The selectable rows in display order, flattened across panels:
     /// each run's header, then its states whose node has a session
     /// ([`FactoryNodeState::latest_child`]).
-    fn rows(&self) -> Vec<RowId> {
+    fn rows(&self) -> Vec<FactoryRow> {
         let mut rows = Vec::new();
         for run in &self.runs {
-            rows.push(RowId::header(&run.run_id));
+            rows.push(FactoryRow::header(&run.run_id));
             rows.extend(
                 run.states
                     .iter()
@@ -477,7 +477,7 @@ impl FactoryView {
                             .and_then(FactoryNodeState::latest_child)
                             .is_some()
                     })
-                    .map(|state| RowId {
+                    .map(|state| FactoryRow {
                         run_id: run.run_id.clone(),
                         state_id: Some(state.id.clone()),
                     }),
@@ -514,8 +514,8 @@ impl FactoryView {
         let rows = self.rows();
         self.selected = match self.selected.take() {
             Some(row) if rows.contains(&row) => Some(row),
-            Some(row) if rows.contains(&RowId::header(&row.run_id)) => {
-                Some(RowId::header(&row.run_id))
+            Some(row) if rows.contains(&FactoryRow::header(&row.run_id)) => {
+                Some(FactoryRow::header(&row.run_id))
             }
             _ => rows.into_iter().next(),
         };
@@ -538,6 +538,18 @@ impl FactoryView {
     pub fn selected_run(&self) -> Option<&FactoryRunSnapshot> {
         let selected = self.selected.as_ref()?;
         self.runs.iter().find(|run| run.run_id == selected.run_id)
+    }
+
+    #[must_use]
+    pub fn selected_row(&self) -> Option<&FactoryRow> {
+        self.selected.as_ref()
+    }
+
+    /// Select `row` by identity. A row the batch does not list yet stays
+    /// selected until the refresh that lists it lands ([`Self::apply_runs`]
+    /// keeps a listed selection).
+    pub fn select(&mut self, row: FactoryRow) {
+        self.selected = Some(row);
     }
 
     /// Record one fetch/error line from the session UI's refresh. The
@@ -637,14 +649,14 @@ impl FactoryView {
     }
 
     /// A state row's latest child and its instance row.
-    fn row_child(&self, row: &RowId) -> Option<(&str, &diagram::FactoryInstance)> {
+    fn row_child(&self, row: &FactoryRow) -> Option<(&str, &diagram::FactoryInstance)> {
         let run = self.runs.iter().find(|run| run.run_id == row.run_id)?;
         run.nodes.get(row.state_id.as_ref()?)?.latest_child()
     }
 
     /// The row's display label: the run's name, `<run>/<state>` for a
     /// state.
-    fn row_label(&self, row: &RowId) -> String {
+    fn row_label(&self, row: &FactoryRow) -> String {
         let run = self
             .runs
             .iter()
@@ -659,7 +671,7 @@ impl FactoryView {
     /// What a confirmed stop on the row does, when the row can be stopped
     /// now: a header stops its run while the run offers stop; a state
     /// stops its latest child while that child runs.
-    fn stop_action(&self, row: &RowId) -> Option<FactoryViewAction> {
+    fn stop_action(&self, row: &FactoryRow) -> Option<FactoryViewAction> {
         if row.state_id.is_some() {
             let (child_id, instance) = self.row_child(row)?;
             return (instance.status == "running").then(|| FactoryViewAction::StopChild {

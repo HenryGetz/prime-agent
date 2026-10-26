@@ -16,7 +16,7 @@ use crate::factory_view::{
     factory_reply_lists_runs, live_run_count, parse_factory_runs, FactoryView, FactoryViewAction,
     FACTORY_WATCH_TICK_MS,
 };
-use crate::interactive::SessionSelection;
+use crate::interactive::{SelectionOrigin, SessionPanel, SessionSelection};
 use crate::session_ui::{picker_viewport_rows, UI_REQUEST_TIMEOUT_MS};
 use crate::subagents::{descendant_entries_with_depth, SessionIdentity};
 
@@ -127,13 +127,26 @@ impl super::SessionUi {
     }
 
     /// Open a state's child session: hand off like `/resume <session>`
-    /// (the selection plus the leave-now signal). A child the roster
-    /// cannot open yet reports on the page's error line.
+    /// (the selection plus the leave-now signal), with the child's depth
+    /// and this page on its selected row as the origin leaving the child
+    /// returns to. A child the roster cannot open yet reports on the
+    /// page's error line.
     fn open_factory_child(&mut self, view: &mut AgentView, child_id: &str) {
-        if let Some(selection) =
+        if let Some((selection, rlm_depth)) =
             factory_child_selection(&self.roster, &self.session_identity(), child_id)
         {
             self.pending_selection = Some(selection);
+            self.pending_selection_rlm_depth = rlm_depth;
+            self.pending_selection_origin = Some(SelectionOrigin {
+                panel: SessionPanel::FactoryRuns {
+                    row: view
+                        .factory_view
+                        .as_ref()
+                        .and_then(FactoryView::selected_row)
+                        .cloned(),
+                },
+                closes_to_agents_view: self.panel_returns_to_agents_view,
+            });
             self.exit_requested = true;
         } else if let Some(factory_view) = view.factory_view.as_mut() {
             factory_view.set_error(Some(format!(
@@ -460,18 +473,23 @@ impl super::SessionUi {
 
 /// How a factory child opens: its roster row among this session's DIRECT
 /// children (child ids are only unique among siblings), opened like an
-/// agents-view row ([`SessionSelection::open_summary`]).
+/// agents-view row ([`SessionSelection::open_summary`], with the row's
+/// `rlmDepth`).
 fn factory_child_selection(
     roster: &[Value],
     session: &SessionIdentity,
     child_id: &str,
-) -> Option<SessionSelection> {
-    descendant_entries_with_depth(roster, session)
+) -> Option<(SessionSelection, Option<u32>)> {
+    let summary = descendant_entries_with_depth(roster, session)
         .into_iter()
         .filter(|(_, depth)| *depth == 1)
         .filter_map(|(entry, _)| entry.get("summary"))
-        .find(|summary| summary.get("rlmChildId").and_then(Value::as_str) == Some(child_id))
-        .and_then(SessionSelection::open_summary)
+        .find(|summary| summary.get("rlmChildId").and_then(Value::as_str) == Some(child_id))?;
+    let rlm_depth = summary
+        .get("rlmDepth")
+        .and_then(Value::as_u64)
+        .map(|depth| depth as u32);
+    Some((SessionSelection::open_summary(summary)?, rlm_depth))
 }
 
 #[cfg(test)]
@@ -482,7 +500,7 @@ mod fold_tests {
 
     /// A factory child opens through the roster: among this session's
     /// direct children, a live runtime attaches and a saved-only child
-    /// resumes its file; a deeper descendant reusing the id (child ids
+    /// resumes its file, each with its row's depth; a deeper descendant reusing the id (child ids
     /// are only unique among siblings) and an unknown id resolve nothing.
     #[test]
     fn a_factory_child_resolves_to_attach_or_resume_via_the_roster() {
@@ -503,7 +521,7 @@ mod fold_tests {
                 "a",
                 "review-1",
                 "root",
-                json!({ "activeSessionId": "live-a" }),
+                json!({ "activeSessionId": "live-a", "rlmDepth": 1 }),
             ),
             child("b", "fix-1", "root", json!({ "sessionFile": "/s/b.jsonl" })),
             child(
@@ -516,11 +534,11 @@ mod fold_tests {
         let root = SessionIdentity::new(Some("root".to_string()), None, None);
         assert_eq!(
             factory_child_selection(&roster, &root, "review-1"),
-            Some(SessionSelection::Attach("live-a".to_string()))
+            Some((SessionSelection::Attach("live-a".to_string()), Some(1)))
         );
         assert_eq!(
             factory_child_selection(&roster, &root, "fix-1"),
-            Some(SessionSelection::Resume("/s/b.jsonl".into()))
+            Some((SessionSelection::Resume("/s/b.jsonl".into()), None))
         );
         assert_eq!(factory_child_selection(&roster, &root, "deep-1"), None);
         assert_eq!(factory_child_selection(&roster, &root, "missing"), None);

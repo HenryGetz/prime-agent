@@ -644,7 +644,7 @@ fn selected_row(view: &FactoryView) -> (String, Option<String>) {
 /// Select a run's header directly (the many-run battery targets a run
 /// without walking every row above it).
 fn select_run(view: &mut FactoryView, run_id: &str) {
-    view.selected = Some(RowId::header(run_id));
+    view.selected = Some(FactoryRow::header(run_id));
 }
 
 fn row(run_id: &str, state_id: Option<&str>) -> (String, Option<String>) {
@@ -1696,7 +1696,7 @@ fn fifteen_panels_window_to_the_focus_on_a_small_viewport() {
     // A selected state deep inside a tall panel: the window slides to
     // the row itself, so the open/stop target stays visible.
     let mut short = FactoryView::new(parse_factory_runs(&world_response()), 10);
-    short.selected = Some(RowId {
+    short.selected = Some(FactoryRow {
         run_id: "run-w07".to_string(),
         state_id: Some("watchdog".to_string()),
     });
