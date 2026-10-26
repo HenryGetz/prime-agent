@@ -498,6 +498,8 @@ pub(crate) mod tests {
             name: name.to_string(),
             deleted: None,
             deleted_usage: None,
+            deleted_usage_by_model: None,
+            factory: None,
         }
     }
 
@@ -669,6 +671,7 @@ pub(crate) mod tests {
                 child: child.to_string_lossy().to_string(),
                 depth: 1,
                 name: "lane".to_string(),
+                factory: None,
             })
             .expect("append spawn");
     }
@@ -973,6 +976,8 @@ pub(crate) mod tests {
                     name: "w9".to_string(),
                     deleted: None,
                     deleted_usage: None,
+                    deleted_usage_by_model: None,
+                    factory: None,
                 },
             );
             roster.write_seeded(candidate.summary, candidate.seeded_cwd)

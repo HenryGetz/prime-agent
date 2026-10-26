@@ -2960,13 +2960,17 @@ class FactoryExecutor:
         ``stop()`` is retracted (deleted and cancelled) instead of
         registered running.
         """
-        from . import spawn
+        from . import _spawn
 
         instance.attempt += 1
         child_name = _spawn_label(state.name, run.run_id, state.state_id, instance.index, instance.attempt)
         try:
-            handle = await spawn(
-                instance.prompt, name=child_name, model=state.model, thinking=state.thinking
+            handle = await _spawn(
+                instance.prompt,
+                name=child_name,
+                model=state.model,
+                thinking=state.thinking,
+                factory={"runId": run.run_id, "specId": run.spec_id, "stateId": state.state_id},
             )
         except RuntimeError as exc:
             last_error = str(exc)
