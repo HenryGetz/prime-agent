@@ -2,6 +2,8 @@
 //! and branch summaries resolve their model through the `auxiliaryModel`
 //! setting, so their one-off prompts stay off the prompt-cache prefix; an
 //! unset, equal, or unusable selector falls back to the session model.
+//! Also sizes the output budget of side calls (refine, the auto-refine
+//! review, branch summaries).
 
 use std::path::PathBuf;
 
@@ -40,6 +42,17 @@ pub struct ResolvedAuxiliaryModel {
     pub model: Model,
     pub api_key: Option<String>,
     pub headers: Option<std::collections::BTreeMap<String, String>>,
+}
+
+/// The output budget a side call asks for: the model's whole `max_tokens`
+/// while the call runs with reasoning (thinking and the answer share it, so a
+/// cap can cut the answer off), and at most `no_reasoning_cap` without
+/// reasoning. The caller still fits it to the context room its input leaves.
+pub(crate) fn side_call_output_budget(model: &Model, no_reasoning_cap: u64) -> u64 {
+    match pa_types::ai::minimum_reasoning(model) {
+        Some(_) => model.max_tokens,
+        None => model.max_tokens.min(no_reasoning_cap),
+    }
 }
 
 /// The fallback warning: the selector is logged, never the auth-stack
@@ -297,5 +310,154 @@ mod tests {
         );
         assert_eq!(routed.model.id, "session-model");
         assert_eq!(routed.api_key.as_deref(), Some("session-key"));
+    }
+
+    /// Whether the faux model can run with reasoning off.
+    enum Thinking {
+        Optional,
+        Mandatory,
+    }
+
+    /// Run refine, the auto-refine review, and a branch summary on a faux model
+    /// and return the output budget each request resolves to on the wire (an
+    /// unset budget resolves like `build_base_options`). Every budget must fit
+    /// the context room the request's input leaves (pa-ai's chars/4 estimate).
+    async fn side_call_budgets(
+        thinking: Thinking,
+        context_window: u64,
+        max_tokens: u64,
+    ) -> Vec<u64> {
+        let registration =
+            pa_ai::faux::register_faux_provider(pa_ai::faux::RegisterFauxProviderOptions {
+                models: Some(vec![pa_ai::faux::FauxModelDefinition {
+                    id: "side-call-model".to_string(),
+                    reasoning: Some(true),
+                    context_window: Some(context_window),
+                    max_tokens: Some(max_tokens),
+                    ..Default::default()
+                }]),
+                ..Default::default()
+            });
+        let mut model = registration.get_model();
+        if let Thinking::Mandatory = thinking {
+            model.thinking_level_map = Some(pa_types::ai::thinking_level_map(&[(
+                pa_types::ai::ModelThinkingLevel::Off,
+                None,
+            )]));
+        }
+        let requests = std::sync::Arc::new(std::sync::Mutex::new(Vec::new()));
+        let recorder = std::sync::Arc::clone(&requests);
+        let step = pa_ai::faux::FauxResponseStep::Factory(std::sync::Arc::new(
+            move |context: &pa_types::ai::Context,
+                  options: Option<&pa_ai::types::StreamOptions>,
+                  _call: u64,
+                  model: &Model| {
+                let budget = options
+                    .and_then(|options| options.max_tokens)
+                    .or_else(|| pa_ai::default_request_max_tokens(model))
+                    .unwrap();
+                let input_chars = context
+                    .system_prompt
+                    .as_deref()
+                    .unwrap_or("")
+                    .chars()
+                    .count()
+                    + context
+                        .messages
+                        .iter()
+                        .map(|message| match message {
+                            pa_types::ai::Message::User(user) => {
+                                user.content.text().chars().count()
+                            }
+                            _ => 0,
+                        })
+                        .sum::<usize>();
+                let room = context_window - (input_chars as u64).div_ceil(4);
+                recorder.lock().unwrap().push((budget, room));
+                Ok(pa_ai::faux::faux_assistant_text_message(
+                    r#"{"summary":"s","edits":[],"shouldRefine":false}"#,
+                    pa_ai::faux::FauxAssistantMessageOptions::default(),
+                ))
+            },
+        ));
+        registration.set_responses(vec![step; 3]);
+
+        let message = pa_types::session::AgentMessage::User(pa_types::ai::UserMessage {
+            content: pa_types::ai::UserContent::Text("explore the widget".to_string()),
+            timestamp: 0,
+            rest: serde_json::Map::default(),
+        });
+        let state = crate::refinement::empty_harness_state();
+        let refiner =
+            || crate::session_engine::refine::default_refiner_call(None, "session".to_string());
+        crate::refinement::executor::plan_refinement(
+            std::slice::from_ref(&message),
+            &state,
+            &[],
+            &model,
+            &crate::refinement::executor::RefineOptions::default(),
+            refiner(),
+        )
+        .await
+        .unwrap();
+        crate::refinement::executor::review_auto_refine(
+            std::slice::from_ref(&message),
+            &state,
+            &[],
+            &model,
+            &crate::refinement::executor::AutoRefineReviewContext {
+                reason: "checkpoint".to_string(),
+                turns_since_last_review: 1,
+            },
+            refiner(),
+        )
+        .await
+        .unwrap();
+        let dir = tempfile::tempdir().unwrap();
+        let mut session = crate::session::manager::SessionManager::in_memory(dir.path());
+        session.append_message(message).unwrap();
+        let summary = super::super::branch_summarization::generate_branch_summary(
+            session.retained_entries(),
+            super::super::branch_summarization::GenerateBranchSummaryOptions {
+                model: &model,
+                api_key: None,
+                custom_instructions: None,
+                replace_instructions: false,
+                reserve_tokens: super::super::branch_summarization::DEFAULT_BRANCH_RESERVE_TOKENS,
+                auxiliary: None,
+                session_id: None,
+            },
+        )
+        .await;
+        assert_eq!(summary.error, None);
+        registration.unregister();
+        let requests = requests.lock().unwrap().clone();
+        assert!(
+            requests.iter().all(|(budget, room)| budget <= room),
+            "{requests:?}"
+        );
+        requests.into_iter().map(|(budget, _)| budget).collect()
+    }
+
+    /// Refine, the auto-refine review, and a branch summary on a model that must
+    /// reason get its whole output budget; with reasoning off they keep their
+    /// caps; no budget exceeds the model's max output or the context room.
+    #[tokio::test]
+    async fn side_calls_size_their_output_budget_for_reasoning() {
+        assert_eq!(
+            side_call_budgets(Thinking::Mandatory, 1_000_000, 128_000).await,
+            [128_000; 3]
+        );
+        assert_eq!(
+            side_call_budgets(Thinking::Optional, 1_000_000, 128_000).await,
+            [32_000, 4_096, 2_048]
+        );
+        assert_eq!(
+            side_call_budgets(Thinking::Optional, 1_000_000, 1_000).await,
+            [1_000; 3]
+        );
+        // The room, not the model's max output, bounds a small window.
+        let budgets = side_call_budgets(Thinking::Mandatory, 40_000, 128_000).await;
+        assert!(budgets.iter().all(|budget| *budget < 40_000), "{budgets:?}");
     }
 }

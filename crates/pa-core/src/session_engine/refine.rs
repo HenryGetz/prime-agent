@@ -630,6 +630,8 @@ pub fn default_refiner_call(
             };
             let mut stream_options =
                 pa_ai::types::SimpleStreamOptions::from_base(pa_ai::types::StreamOptions {
+                    // Sent as is: left unset, providers would cap it at the per-turn default.
+                    max_tokens: Some(model.max_tokens),
                     api_key,
                     session_id: Some(session_id),
                     // One-off prompts ride SSE: they keep the conversation id (cache key,

@@ -11,9 +11,10 @@ pub const REFINEMENT_SYSTEM_PROMPT: &str = "You are Prime Agent's /refine contin
 
 pub const AUTO_REFINE_REVIEW_SYSTEM_PROMPT: &str = "You are Prime Agent's automatic /refine review gate.\n\nDecide whether this checkpoint should run /refine. Auto /refine writes local continual harness state by default, so approve when the trajectory contains evidence useful to this session's future turns.\nReject one-off noise, unsupported hypotheses, and transient tool outputs. Ask for global refinement only for durable cross-session lessons or explicitly project-qualified lessons likely to be reused in future sessions.\n\nReturn JSON only:\n{\n  \"shouldRefine\": true|false,\n  \"rationale\": \"short reason\",\n  \"instructions\": \"optional concise instructions for /refine if shouldRefine is true\"\n}";
 
-/// Output caps (reasoning off shares the model's output budget with JSON).
-pub const REFINEMENT_MAX_OUTPUT_TOKENS: u64 = 32_000;
-pub const AUTO_REFINE_REVIEW_MAX_OUTPUT_TOKENS: u64 = 4_096;
+/// Output caps for calls that run with reasoning off; a reasoning call shares
+/// the model's whole output budget between thinking and the JSON.
+pub const REFINEMENT_NO_REASONING_MAX_OUTPUT_TOKENS: u64 = 32_000;
+pub const AUTO_REFINE_REVIEW_NO_REASONING_MAX_OUTPUT_TOKENS: u64 = 4_096;
 pub const REFINEMENT_CONTEXT_OVERHEAD_TOKENS: u64 = 1_024;
 
 pub const TRUNCATED_JSON_ERROR: &str = "the model stopped before completing its JSON object. This usually means the output budget was exhausted; retry with a smaller request.";
@@ -570,7 +571,8 @@ fn refinement_input_token_bound(text: &str) -> u64 {
 }
 
 /// Fit the refinement request into the model context: trim conversation from
-/// the front (binary search) and clamp output tokens.
+/// the front (binary search) and clamp the side call's output budget to the
+/// room left.
 ///
 /// # Errors
 ///
@@ -580,16 +582,17 @@ pub fn refinement_request(
     system_prompt: &str,
     conversation_text: &str,
     build_prompt: &dyn Fn(&str) -> String,
-    output_reserve: u64,
+    no_reasoning_max_output_tokens: u64,
 ) -> anyhow::Result<(u64, String)> {
+    let output_budget = crate::session_engine::auxiliary_model::side_call_output_budget(
+        model,
+        no_reasoning_max_output_tokens,
+    );
     let system_reserve =
         refinement_input_token_bound(system_prompt) + REFINEMENT_CONTEXT_OVERHEAD_TOKENS;
-    let input_budget = model.context_window.saturating_sub(
-        model
-            .max_tokens
-            .min(output_reserve)
-            .min(model.context_window / 2),
-    );
+    let input_budget = model
+        .context_window
+        .saturating_sub(output_budget.min(model.context_window / 2));
     let mut user_prompt = build_prompt(conversation_text);
     if system_reserve + refinement_input_token_bound(&user_prompt) > input_budget
         && !conversation_text.is_empty()
@@ -620,7 +623,7 @@ pub fn refinement_request(
         }
         user_prompt = prompt_for_length(low);
     }
-    let max_tokens = model.max_tokens.min(
+    let max_tokens = output_budget.min(
         model
             .context_window
             .saturating_sub(system_reserve + refinement_input_token_bound(&user_prompt)),

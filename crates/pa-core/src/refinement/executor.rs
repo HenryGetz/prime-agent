@@ -3,8 +3,9 @@
 
 use super::planner::{
     apply_refinement_proposal, parse_proposal, refinement_request, rollback_proposal, ApplyOptions,
-    RefinementProposal, AUTO_REFINE_REVIEW_MAX_OUTPUT_TOKENS, AUTO_REFINE_REVIEW_SYSTEM_PROMPT,
-    REFINEMENT_MAX_OUTPUT_TOKENS, REFINEMENT_SYSTEM_PROMPT,
+    RefinementProposal, AUTO_REFINE_REVIEW_NO_REASONING_MAX_OUTPUT_TOKENS,
+    AUTO_REFINE_REVIEW_SYSTEM_PROMPT, REFINEMENT_NO_REASONING_MAX_OUTPUT_TOKENS,
+    REFINEMENT_SYSTEM_PROMPT,
 };
 use super::{
     infer_refinement_result_scope, merge_refinement_history, HarnessScope, HarnessState,
@@ -125,8 +126,8 @@ pub fn history_for_prompt(history: &[RefinementResult]) -> String {
 }
 
 /// Model-call seam (test seam over pa-ai completion): takes the request
-/// model (output budget pre-clamped), the call's system prompt, and the
-/// user prompt; returns the reply text.
+/// model (its `max_tokens` is the call's output budget, to send as is), the
+/// call's system prompt, and the user prompt; returns the reply text.
 pub type RefinerFn = Box<
     dyn FnOnce(
             pa_types::ai::Model,
@@ -252,10 +253,10 @@ pub async fn plan_refinement(
         super::planner::REFINEMENT_SYSTEM_PROMPT,
         &conversation_text,
         &build_prompt,
-        REFINEMENT_MAX_OUTPUT_TOKENS,
+        REFINEMENT_NO_REASONING_MAX_OUTPUT_TOKENS,
     )?;
     let mut request_model = model.clone();
-    request_model.max_tokens = request_max_tokens.min(REFINEMENT_MAX_OUTPUT_TOKENS);
+    request_model.max_tokens = request_max_tokens;
 
     let reply = refine_call(request_model, REFINEMENT_SYSTEM_PROMPT, user_prompt).await?;
     let text = assistant_text(&reply);
@@ -378,10 +379,10 @@ pub async fn review_auto_refine(
         AUTO_REFINE_REVIEW_SYSTEM_PROMPT,
         &conversation_text,
         &build_prompt,
-        AUTO_REFINE_REVIEW_MAX_OUTPUT_TOKENS,
+        AUTO_REFINE_REVIEW_NO_REASONING_MAX_OUTPUT_TOKENS,
     )?;
     let mut request_model = model.clone();
-    request_model.max_tokens = request_max_tokens.min(AUTO_REFINE_REVIEW_MAX_OUTPUT_TOKENS);
+    request_model.max_tokens = request_max_tokens;
     let reply = review_call(request_model, AUTO_REFINE_REVIEW_SYSTEM_PROMPT, user_prompt).await?;
     parse_auto_refine_review(&assistant_text(&reply))
 }

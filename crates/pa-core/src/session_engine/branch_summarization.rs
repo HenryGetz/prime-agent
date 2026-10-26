@@ -308,8 +308,8 @@ pub struct GenerateBranchSummaryOptions<'a> {
 /// The default reserve budget.
 pub const DEFAULT_BRANCH_RESERVE_TOKENS: u64 = 16_384;
 
-/// The summarizer call cap.
-const BRANCH_SUMMARY_MAX_TOKENS: u64 = 2048;
+/// The summarizer's output cap when it runs with reasoning off.
+const BRANCH_SUMMARY_NO_REASONING_MAX_TOKENS: u64 = 2048;
 
 /// Estimate the context window the branch-summary request needs, using the
 /// same entry-slicing budget and prompt builder as the wire call. The larger
@@ -343,7 +343,7 @@ pub fn estimate_branch_summary_request_tokens(
         .count() as u64)
         .div_ceil(4);
     let prompt_tokens = super::compact_session::summarizer_request_tokens(&request);
-    (system_prompt_tokens + prompt_tokens + BRANCH_SUMMARY_MAX_TOKENS)
+    (system_prompt_tokens + prompt_tokens + BRANCH_SUMMARY_NO_REASONING_MAX_TOKENS)
         .max(prompt_tokens.saturating_add(reserve_tokens))
 }
 
@@ -458,7 +458,10 @@ pub async fn generate_branch_summary(
     };
     let mut stream_options =
         pa_ai::types::SimpleStreamOptions::from_base(pa_ai::types::StreamOptions {
-            max_tokens: Some(BRANCH_SUMMARY_MAX_TOKENS),
+            max_tokens: Some(super::auxiliary_model::side_call_output_budget(
+                model,
+                BRANCH_SUMMARY_NO_REASONING_MAX_TOKENS,
+            )),
             api_key,
             session_id: session_id.map(str::to_string),
             // One-off prompts ride SSE: they keep the conversation id (cache key, opencode routing)

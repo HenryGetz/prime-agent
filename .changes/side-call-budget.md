@@ -1,0 +1,1 @@
+- `/refine`, the automatic refine review and branch summaries no longer cut off models that must reason: with reasoning on, these calls now get the model's whole output budget (fitted to the context window), as the TypeScript version did. The 32,000 / 4,096 / 2,048 token caps now apply only when the call runs with reasoning off, and never exceed the model's own output limit.
