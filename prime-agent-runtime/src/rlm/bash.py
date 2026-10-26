@@ -6,6 +6,7 @@ import asyncio
 import atexit
 import functools
 import json
+import math
 import os
 import re
 import secrets
@@ -117,8 +118,14 @@ def _note_degrade(handle: "BashHandle", bound: float) -> None:
 # await the handle inline, so the kernel-side surface teaches at dispatch
 # with a budgeted stderr hint and the command still runs (searches are
 # legitimate, the kernel's own await is already bounded by yield_after).
+# The opted-in auto-timeout applies here too: shipped sessions never register
+# the Rust execute_bash tool (the daemon registers python_repl only), so this
+# dispatch is the incident path — an armed scan's group is killed at the
+# user's bound and the result keeps the partial output plus a timeout status
+# (Rust parity: the execute_bash scan timeout).
 _MAX_SCAN_HINTS = 3
 _scan_hints_written = 0
+_SCAN_TIMEOUT_ENV = "PRIME_AGENT_SCAN_TIMEOUT"
 
 
 def _is_home_scale_root(token: str) -> bool:
@@ -736,18 +743,42 @@ def _is_unbounded_home_scan(command: str) -> bool:
     return False
 
 
-def _note_scan_cost(command: str) -> None:
+def _note_scan_cost(command: str, scan_timeout: float | None = None) -> None:
     """Write the scan-cost hint to the dispatching cell's stderr, within budget."""
     global _scan_hints_written
     if _scan_hints_written >= _MAX_SCAN_HINTS or not _is_unbounded_home_scan(command):
         return
     _scan_hints_written += 1
-    sys.stderr.write(
+    hint = (
         "bash: this recursive scan of home-scale directories is unbounded "
         "in time; output caps (| head) do not bound scan time, and "
         "awaiting it inline can stall the turn. Wrap it in `timeout 60 "
         "...`, add --max-depth / -maxdepth, or background it and end the "
-        "turn.\n"
+        "turn."
+    )
+    if scan_timeout is not None:
+        hint += (
+            f" A {_SCAN_TIMEOUT_ENV} scan timeout of {scan_timeout:g}s "
+            "applies to this command."
+        )
+    sys.stderr.write(hint + "\n")
+
+
+def _scan_timeout_from_env(command: str) -> float | None:
+    """The opted-in auto-timeout for `command` when set and it is an unbounded
+    home scan (Rust parity: scan_timeout_from_env — finite and positive; the
+    scan-shape gate mirrors is_unbounded_home_scan)."""
+    raw = os.environ.get(_SCAN_TIMEOUT_ENV)
+    if raw is None:
+        return None
+    try:
+        secs = float(raw)
+    except ValueError:
+        return None
+    return (
+        secs
+        if math.isfinite(secs) and secs > 0.0 and _is_unbounded_home_scan(command)
+        else None
     )
 
 
@@ -1048,6 +1079,9 @@ class BashHandle:
         self._result_consumed = False
         self._consumed_notice: Callable[[], None] | None = None
         self._callback_lock = threading.Lock()
+        # The armed scan timeout (PRIME_AGENT_SCAN_TIMEOUT), and whether it fired.
+        self._scan_timeout: float | None = None
+        self._scan_fired = False
         # Serializes kill/reap so a pid fallback can never outlive the process handle.
         self._kill_lock = threading.Lock()
         self._started = time.monotonic()
@@ -1212,6 +1246,23 @@ class BashHandle:
     def _force_kill(self) -> None:
         if not self._reaped:
             _signal_group(self._pid, signal.SIGKILL)
+
+    def _arm_scan_timeout(self, secs: float) -> None:
+        """Apply the opted-in scan timeout: at the bound the scan's group is
+        killed (the kill() escalation), so a matching scan cannot stall the
+        turn past the user's bound — the incident fix on this dispatch path."""
+        self._scan_timeout = secs
+        timer = threading.Timer(secs, self._scan_timeout_kill)
+        timer.daemon = True
+        timer.start()
+
+    def _scan_timeout_kill(self) -> None:
+        # The flag precedes the kill so _finalize notes the timeout; a
+        # finished command's group is never signalled.
+        if self._done.is_set() or self._reaped:
+            return
+        self._scan_fired = True
+        self.kill()
 
     def _pump(self) -> None:
         stdout = self._proc.stdout
@@ -1428,9 +1479,18 @@ class BashHandle:
         with self._callback_lock:
             if self._done.is_set():
                 return
+            text = self._buffer.text() if output is None else output
+            if self._scan_fired:
+                status = (
+                    f"Command timed out after {self._scan_timeout:g} seconds "
+                    f"({_SCAN_TIMEOUT_ENV})"
+                )
+                # Rust append_status parity: a blank line separates any
+                # partial output from the status.
+                text = status if not text else f"{text}\n\n{status}"
             self._result = BashResult(
                 exit_code=exit_code,
-                output=self._buffer.text() if output is None else output,
+                output=text,
                 duration=time.monotonic() - self._started,
             )
             self._done.set()
@@ -1842,6 +1902,10 @@ class PersistentBashHandle(BashHandle):
         self._callback_lock = threading.Lock()
         self._reaped = False
         self._kill_lock = threading.Lock()
+        # The dispatch never arms a scan timeout on a persistent shell, so
+        # these stay inert here; _finalize reads them on both classes.
+        self._scan_timeout: float | None = None
+        self._scan_fired = False
         self._started_at = started_at
         self._started = time.monotonic() - max(
             0.0, (datetime.now(timezone.utc) - datetime.fromisoformat(started_at)).total_seconds()
@@ -1993,12 +2057,17 @@ def bash(command: str, yield_after: float | None = None, persistent: bool = Fals
         raise TypeError("command must be a non-empty str")
     if yield_after is not None and yield_after <= 0:
         raise ValueError("yield_after must be a positive number of seconds")
-    _note_scan_cost(command)
+    # A persistent shell ends only on its own exit or an explicit kill(), so
+    # the auto-timeout never arms there; this dispatch is the incident path.
+    scan_timeout = None if persistent else _scan_timeout_from_env(command)
+    _note_scan_cost(command, scan_timeout)
     if persistent:
         handle: BashHandle = _spawn_persistent(command, yield_after)
     else:
         _install_shutdown_hook()
         handle = BashHandle(command, yield_after)
+        if scan_timeout is not None:
+            handle._arm_scan_timeout(scan_timeout)
     from . import repl
 
     repl.emit(

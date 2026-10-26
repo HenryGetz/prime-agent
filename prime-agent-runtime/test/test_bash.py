@@ -1492,7 +1492,7 @@ async def _poll_journal(path: str, pid: int, count: int, timeout: float = 2.0) -
     return records
 
 
-class ScanCostGuardTest(unittest.TestCase):
+class ScanCostGuardTest(unittest.IsolatedAsyncioTestCase):
     """Kernel-side parity of the Rust bash_guard scan-cost warning."""
 
     INCIDENT = (
@@ -1692,6 +1692,48 @@ class ScanCostGuardTest(unittest.TestCase):
             bash("grep -rl needle ~/Documents", persistent=True)
         spawn.assert_called_once()
         self.assertIn("unbounded", err.getvalue())
+
+    async def test_scan_timeout_env_bounds_the_scan(self):
+        # The regression pin: the env var arms the dispatch — a matching
+        # scan's group is killed at the bound and the result keeps the partial
+        # output plus the timeout status. Without the arming this command runs
+        # the full sleep (exit 0, no status line).
+        with mock.patch.dict(os.environ, {bash_module._SCAN_TIMEOUT_ENV: "0.5"}):
+            result = await bash("find ~/prime-agent-scan-pin-no-such-root; sleep 5")
+        self.assertLess(result.duration, 4.0)
+        self.assertNotEqual(result.exit_code, 0)
+        self.assertIn(
+            "Command timed out after 0.5 seconds (PRIME_AGENT_SCAN_TIMEOUT)",
+            result.output,
+        )
+
+    async def test_scan_timeout_env_leaves_bounded_commands_alone(self):
+        with mock.patch.dict(os.environ, {bash_module._SCAN_TIMEOUT_ENV: "0.5"}):
+            result = await bash("sleep 1.2")
+        self.assertEqual(result.exit_code, 0)
+        self.assertGreaterEqual(result.duration, 1.2)
+        self.assertNotIn("PRIME_AGENT_SCAN_TIMEOUT", result.output)
+
+    async def test_scan_timeout_env_rejects_unusable_values(self):
+        for raw in ("garbage", "-1", "0", "1e400"):
+            with (
+                mock.patch.dict(os.environ, {bash_module._SCAN_TIMEOUT_ENV: raw}),
+                self.subTest(raw=raw),
+            ):
+                result = await bash(
+                    "find ~/prime-agent-scan-pin-no-such-root; sleep 1.2"
+                )
+            self.assertEqual(result.exit_code, 0)
+            self.assertGreaterEqual(result.duration, 1.2)
+
+    def test_dispatch_hint_names_an_armed_scan_timeout(self):
+        with (
+            mock.patch.object(bash_module, "_scan_hints_written", 0),
+            mock.patch("sys.stderr", new=io.StringIO()) as err,
+        ):
+            bash_module._note_scan_cost("grep -rl needle ~/Documents", 12.5)
+        self.assertIn("PRIME_AGENT_SCAN_TIMEOUT", err.getvalue())
+        self.assertIn("12.5s", err.getvalue())
 
 @unittest.skipUnless(os.name == "posix", "persistent shells are POSIX-only")
 class PersistentBashTest(unittest.IsolatedAsyncioTestCase):
