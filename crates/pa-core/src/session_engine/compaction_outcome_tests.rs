@@ -683,26 +683,17 @@ fn register_refine_model(
 }
 
 /// A faux step replying with `message` while recording the request model's
-/// output budget (the value a provider resolves the wire budget from).
-fn budget_recording_step(
+/// output budget (the value a provider resolves the wire budget from) and
+/// the request's user prompt (what a real provider would send the refiner).
+fn recording_step(
     budgets: &Arc<std::sync::Mutex<Vec<Option<u64>>>>,
-    message: pa_types::ai::AssistantMessage,
-) -> pa_ai::faux::FauxResponseStep {
-    let budgets = Arc::clone(budgets);
-    pa_ai::faux::FauxResponseStep::Factory(Arc::new(move |_, _options, _, model| {
-        budgets.lock().unwrap().push(Some(model.max_tokens));
-        Ok(message.clone())
-    }))
-}
-
-/// A faux step replying with `message` while recording the request's user
-/// prompt (what a real provider would send the refiner).
-fn prompt_recording_step(
     prompts: &Arc<std::sync::Mutex<Vec<String>>>,
     message: pa_types::ai::AssistantMessage,
 ) -> pa_ai::faux::FauxResponseStep {
+    let budgets = Arc::clone(budgets);
     let prompts = Arc::clone(prompts);
-    pa_ai::faux::FauxResponseStep::Factory(Arc::new(move |context, _options, _, _model| {
+    pa_ai::faux::FauxResponseStep::Factory(Arc::new(move |context, _options, _, model| {
+        budgets.lock().unwrap().push(Some(model.max_tokens));
         let prompt = context
             .messages
             .iter()
@@ -719,36 +710,70 @@ fn prompt_recording_step(
     }))
 }
 
-/// A refiner reply cut by the output budget (the model burned it on
-/// reasoning and stopped at the length limit) retries once through the
-/// session refine path, with the refinement budget capped at the model's
-/// catalog maximum output.
-#[tokio::test]
-async fn a_budget_truncated_refiner_reply_retries_once_and_lands() {
-    let (session, tmp) = refine_test_session().await;
-    let registration = register_refine_model(8_192, 128_000);
+/// A refiner reply cut by the output budget: the model burned it on
+/// reasoning and stopped at the length limit.
+fn length_cut_reply() -> pa_types::ai::AssistantMessage {
+    pa_ai::faux::faux_assistant_text_message(
+        r#"{"summary":"cut","edits":[{"action":"cre"#,
+        pa_ai::faux::FauxAssistantMessageOptions {
+            stop_reason: Some(pa_types::ai::StopReason::Length),
+            ..Default::default()
+        },
+    )
+}
+
+/// A refiner reply that lands a single-edit plan.
+fn landed_reply() -> pa_types::ai::AssistantMessage {
+    pa_ai::faux::faux_assistant_text_message(
+        r#"{"summary":"one edit","edits":[{"action":"create","kind":"memory","id":"m9","title":"t","content":"c"}]}"#,
+        pa_ai::faux::FauxAssistantMessageOptions::default(),
+    )
+}
+
+/// One session-level refine run: the outcome the session refine path
+/// surfaced, what each refiner request carried, and the session for the
+/// audit row trail.
+struct RefineRun {
+    /// The refine outcome (`Err` when the call surfaced the error).
+    result: anyhow::Result<crate::refinement::RefinementResult>,
+    /// Each request's output budget, in call order: the value a provider
+    /// resolves the wire budget from.
+    budgets: Vec<Option<u64>>,
+    /// Each request's user prompt, in call order.
+    prompts: Vec<String>,
+    /// The session, for the audit row trail.
+    session: AgentSession,
+    /// Owns the run's directories while the run is alive.
+    _tmp: tempfile::TempDir,
+}
+
+/// Runs one session-level refine end to end: the seeded session (plus
+/// `extra_rows`) against a freshly registered faux model with the given
+/// catalog output budget and context window, serving `replies` in order
+/// through steps that record each request's output budget and user prompt.
+/// `max_tokens_explicit` marks the registered model's budget as
+/// user-configured before the call; the refine itself uses the default
+/// options on a user-sourced refinement.
+async fn refine_run(
+    extra_rows: Vec<SessionAgentMessage>,
+    max_tokens: u64,
+    context_window: u64,
+    max_tokens_explicit: bool,
+    replies: Vec<pa_types::ai::AssistantMessage>,
+) -> RefineRun {
+    let (session, tmp) = refine_test_session_over(extra_rows).await;
+    let registration = register_refine_model(max_tokens, context_window);
     let budgets: Arc<std::sync::Mutex<Vec<Option<u64>>>> =
         Arc::new(std::sync::Mutex::new(Vec::new()));
-    registration.set_responses(vec![
-        budget_recording_step(
-            &budgets,
-            pa_ai::faux::faux_assistant_text_message(
-                r#"{"summary":"cut","edits":[{"action":"cre"#,
-                pa_ai::faux::FauxAssistantMessageOptions {
-                    stop_reason: Some(pa_types::ai::StopReason::Length),
-                    ..Default::default()
-                },
-            ),
-        ),
-        budget_recording_step(
-            &budgets,
-            pa_ai::faux::faux_assistant_text_message(
-                r#"{"summary":"one edit","edits":[{"action":"create","kind":"memory","id":"m9","title":"t","content":"c"}]}"#,
-                pa_ai::faux::FauxAssistantMessageOptions::default(),
-            ),
-        ),
-    ]);
-    let model = registration.get_model();
+    let prompts: Arc<std::sync::Mutex<Vec<String>>> = Arc::new(std::sync::Mutex::new(Vec::new()));
+    registration.set_responses(
+        replies
+            .into_iter()
+            .map(|reply| recording_step(&budgets, &prompts, reply))
+            .collect(),
+    );
+    let mut model = registration.get_model();
+    model.max_tokens_explicit = max_tokens_explicit;
     let global = tmp.path().join("harness");
     let result = session
         .refine(
@@ -758,12 +783,37 @@ async fn a_budget_truncated_refiner_reply_retries_once_and_lands() {
             None,
             global,
         )
-        .await
-        .unwrap();
+        .await;
+    let recorded_budgets = budgets.lock().unwrap().clone();
+    let recorded_prompts = prompts.lock().unwrap().clone();
+    RefineRun {
+        result,
+        budgets: recorded_budgets,
+        prompts: recorded_prompts,
+        session,
+        _tmp: tmp,
+    }
+}
+
+/// A refiner reply cut by the output budget (the model burned it on
+/// reasoning and stopped at the length limit) retries once through the
+/// session refine path, with the refinement budget capped at the model's
+/// catalog maximum output.
+#[tokio::test]
+async fn a_budget_truncated_refiner_reply_retries_once_and_lands() {
+    let run = refine_run(
+        vec![],
+        8_192,
+        128_000,
+        false,
+        vec![length_cut_reply(), landed_reply()],
+    )
+    .await;
+    let result = run.result.unwrap();
     assert_eq!(result.summary, "one edit");
     assert!(result.applied_edits[0].applied);
     assert_eq!(
-        *budgets.lock().unwrap(),
+        run.budgets,
         vec![Some(8_192), Some(8_192)],
         "both requests stay at the 8k catalog maximum output; the floor never raises past it"
     );
@@ -777,77 +827,48 @@ async fn a_budget_truncated_refiner_reply_retries_once_and_lands() {
 async fn a_length_truncated_reply_retries_with_the_reduced_transcript() {
     let early_filler = "y".repeat(30_000);
     let late_filler = "z".repeat(30_000);
-    let (session, tmp) = refine_test_session_over(vec![
-        SessionAgentMessage::User(pa_types::ai::UserMessage {
-            content: pa_types::ai::UserContent::Text(format!(
-                "RETRY_EARLY_MARKER_7429 {early_filler}"
-            )),
-            timestamp: 0,
-            rest: serde_json::Map::default(),
-        }),
-        SessionAgentMessage::User(pa_types::ai::UserMessage {
-            content: pa_types::ai::UserContent::Text(format!(
-                "{late_filler} RETRY_LATE_MARKER_8643"
-            )),
-            timestamp: 0,
-            rest: serde_json::Map::default(),
-        }),
-    ])
+    let run = refine_run(
+        vec![
+            SessionAgentMessage::User(pa_types::ai::UserMessage {
+                content: pa_types::ai::UserContent::Text(format!(
+                    "RETRY_EARLY_MARKER_7429 {early_filler}"
+                )),
+                timestamp: 0,
+                rest: serde_json::Map::default(),
+            }),
+            SessionAgentMessage::User(pa_types::ai::UserMessage {
+                content: pa_types::ai::UserContent::Text(format!(
+                    "{late_filler} RETRY_LATE_MARKER_8643"
+                )),
+                timestamp: 0,
+                rest: serde_json::Map::default(),
+            }),
+        ],
+        8_192,
+        128_000,
+        false,
+        vec![length_cut_reply(), landed_reply()],
+    )
     .await;
-    let registration = register_refine_model(8_192, 128_000);
-    let prompts: Arc<std::sync::Mutex<Vec<String>>> = Arc::new(std::sync::Mutex::new(Vec::new()));
-    registration.set_responses(vec![
-        prompt_recording_step(
-            &prompts,
-            pa_ai::faux::faux_assistant_text_message(
-                r#"{"summary":"cut","edits":[{"action":"cre"#,
-                pa_ai::faux::FauxAssistantMessageOptions {
-                    stop_reason: Some(pa_types::ai::StopReason::Length),
-                    ..Default::default()
-                },
-            ),
-        ),
-        prompt_recording_step(
-            &prompts,
-            pa_ai::faux::faux_assistant_text_message(
-                r#"{"summary":"one edit","edits":[{"action":"create","kind":"memory","id":"m9","title":"t","content":"c"}]}"#,
-                pa_ai::faux::FauxAssistantMessageOptions::default(),
-            ),
-        ),
-    ]);
-    let model = registration.get_model();
-    let global = tmp.path().join("harness");
-    let result = session
-        .refine(
-            &refine::RefineOptions::default(),
-            refine::RefinementSource::User,
-            &model,
-            None,
-            global,
-        )
-        .await
-        .unwrap();
-    {
-        let prompts = prompts.lock().unwrap();
-        assert_eq!(prompts.len(), 2, "the retry is one bounded extra call");
-        assert!(
-            prompts[0].contains("RETRY_EARLY_MARKER_7429"),
-            "the first attempt carries the full transcript"
-        );
-        assert!(
-            !prompts[1].contains("RETRY_EARLY_MARKER_7429"),
-            "the retry re-sends only the bounded transcript tail"
-        );
-        assert!(
-            prompts[1].contains("RETRY_LATE_MARKER_8643"),
-            "the retry keeps the most recent conversation"
-        );
-    }
+    let result = run.result.unwrap();
+    assert_eq!(run.prompts.len(), 2, "the retry is one bounded extra call");
+    assert!(
+        run.prompts[0].contains("RETRY_EARLY_MARKER_7429"),
+        "the first attempt carries the full transcript"
+    );
+    assert!(
+        !run.prompts[1].contains("RETRY_EARLY_MARKER_7429"),
+        "the retry re-sends only the bounded transcript tail"
+    );
+    assert!(
+        run.prompts[1].contains("RETRY_LATE_MARKER_8643"),
+        "the retry keeps the most recent conversation"
+    );
     assert!(
         result.reduced_context_retry,
         "the result records the reduced-context retry"
     );
-    let recorded = refine::session_refinement_history(&session.entries().await);
+    let recorded = refine::session_refinement_history(&run.session.entries().await);
     let row = recorded
         .iter()
         .find(|row| row.id == result.id)
@@ -863,35 +884,23 @@ async fn a_length_truncated_reply_retries_with_the_reduced_transcript() {
 /// (a partial provider failure rides the same diagnosis).
 #[tokio::test]
 async fn a_mid_json_cut_without_a_length_stop_never_retries() {
-    let (session, tmp) = refine_test_session().await;
-    let registration = register_refine_model(8_192, 128_000);
-    let budgets: Arc<std::sync::Mutex<Vec<Option<u64>>>> =
-        Arc::new(std::sync::Mutex::new(Vec::new()));
-    registration.set_responses(vec![budget_recording_step(
-        &budgets,
-        pa_ai::faux::faux_assistant_text_message(
+    let run = refine_run(
+        vec![],
+        8_192,
+        128_000,
+        false,
+        vec![pa_ai::faux::faux_assistant_text_message(
             r#"{"summary":"cut","edits":[{"action":"cre"#,
             pa_ai::faux::FauxAssistantMessageOptions::default(),
-        ),
-    )]);
-    let model = registration.get_model();
-    let global = tmp.path().join("harness");
-    let error = session
-        .refine(
-            &refine::RefineOptions::default(),
-            refine::RefinementSource::User,
-            &model,
-            None,
-            global,
-        )
-        .await
-        .unwrap_err();
+        )],
+    )
+    .await;
     assert_eq!(
-        error.to_string(),
+        run.result.unwrap_err().to_string(),
         crate::refinement::planner::TRUNCATED_JSON_ERROR
     );
     assert_eq!(
-        budgets.lock().unwrap().len(),
+        run.budgets.len(),
         1,
         "the mid-JSON diagnosis alone never retries"
     );
@@ -902,39 +911,27 @@ async fn a_mid_json_cut_without_a_length_stop_never_retries() {
 /// truncation diagnosis from the partial text the failed stream kept.
 #[tokio::test]
 async fn a_provider_error_reply_surfaces_the_provider_message_without_a_retry() {
-    let (session, tmp) = refine_test_session().await;
-    let registration = register_refine_model(8_192, 128_000);
-    let budgets: Arc<std::sync::Mutex<Vec<Option<u64>>>> =
-        Arc::new(std::sync::Mutex::new(Vec::new()));
-    registration.set_responses(vec![budget_recording_step(
-        &budgets,
-        pa_ai::faux::faux_assistant_text_message(
+    let run = refine_run(
+        vec![],
+        8_192,
+        128_000,
+        false,
+        vec![pa_ai::faux::faux_assistant_text_message(
             r#"{"summary":"cut","edits":[{"action":"cre"#,
             pa_ai::faux::FauxAssistantMessageOptions {
                 stop_reason: Some(pa_types::ai::StopReason::Error),
                 error_message: Some("max_tokens is too large".to_string()),
                 ..Default::default()
             },
-        ),
-    )]);
-    let model = registration.get_model();
-    let global = tmp.path().join("harness");
-    let error = session
-        .refine(
-            &refine::RefineOptions::default(),
-            refine::RefinementSource::User,
-            &model,
-            None,
-            global,
-        )
-        .await
-        .unwrap_err();
+        )],
+    )
+    .await;
     assert_eq!(
-        error.to_string(),
+        run.result.unwrap_err().to_string(),
         "Refinement failed: max_tokens is too large"
     );
     assert_eq!(
-        budgets.lock().unwrap().len(),
+        run.budgets.len(),
         1,
         "a provider error never reaches the reduced-transcript retry"
     );
@@ -944,102 +941,50 @@ async fn a_provider_error_reply_surfaces_the_provider_message_without_a_retry() 
 /// immediately; only the budget-exhausted class retries.
 #[tokio::test]
 async fn a_non_budget_parse_failure_fails_without_a_retry() {
-    let (session, tmp) = refine_test_session().await;
-    let registration = register_refine_model(8_192, 128_000);
-    let budgets: Arc<std::sync::Mutex<Vec<Option<u64>>>> =
-        Arc::new(std::sync::Mutex::new(Vec::new()));
-    registration.set_responses(vec![budget_recording_step(
-        &budgets,
-        pa_ai::faux::faux_assistant_text_message(
+    let run = refine_run(
+        vec![],
+        8_192,
+        128_000,
+        false,
+        vec![pa_ai::faux::faux_assistant_text_message(
             "not json",
             pa_ai::faux::FauxAssistantMessageOptions::default(),
-        ),
-    )]);
-    let model = registration.get_model();
-    let global = tmp.path().join("harness");
-    let error = session
-        .refine(
-            &refine::RefineOptions::default(),
-            refine::RefinementSource::User,
-            &model,
-            None,
-            global,
-        )
-        .await
-        .unwrap_err();
-    assert_eq!(error.to_string(), "Refiner did not return a JSON object");
-    assert_eq!(budgets.lock().unwrap().len(), 1, "garbage never retries");
+        )],
+    )
+    .await;
+    assert_eq!(
+        run.result.unwrap_err().to_string(),
+        "Refiner did not return a JSON object"
+    );
+    assert_eq!(run.budgets.len(), 1, "garbage never retries");
 }
 
 /// A reply truncated on both attempts surfaces the truncation error.
 #[tokio::test]
 async fn a_twice_truncated_reply_surfaces_the_truncation_error() {
-    let (session, tmp) = refine_test_session().await;
-    let registration = register_refine_model(8_192, 128_000);
-    let budgets: Arc<std::sync::Mutex<Vec<Option<u64>>>> =
-        Arc::new(std::sync::Mutex::new(Vec::new()));
-    let truncated = || {
-        pa_ai::faux::faux_assistant_text_message(
-            r#"{"summary":"cut","edits":[{"action":"cre"#,
-            pa_ai::faux::FauxAssistantMessageOptions {
-                stop_reason: Some(pa_types::ai::StopReason::Length),
-                ..Default::default()
-            },
-        )
-    };
-    registration.set_responses(vec![
-        budget_recording_step(&budgets, truncated()),
-        budget_recording_step(&budgets, truncated()),
-    ]);
-    let model = registration.get_model();
-    let global = tmp.path().join("harness");
-    let error = session
-        .refine(
-            &refine::RefineOptions::default(),
-            refine::RefinementSource::User,
-            &model,
-            None,
-            global,
-        )
-        .await
-        .unwrap_err();
+    let run = refine_run(
+        vec![],
+        8_192,
+        128_000,
+        false,
+        vec![length_cut_reply(), length_cut_reply()],
+    )
+    .await;
     assert_eq!(
-        error.to_string(),
+        run.result.unwrap_err().to_string(),
         crate::refinement::planner::TRUNCATED_JSON_ERROR
     );
-    assert_eq!(budgets.lock().unwrap().len(), 2, "the retry fired once");
+    assert_eq!(run.budgets.len(), 2, "the retry fired once");
 }
 
 /// An explicitly configured `maxTokens` is honored, not raised to the
 /// refinement floor.
 #[tokio::test]
 async fn an_explicitly_configured_budget_is_honored_not_raised() {
-    let (session, tmp) = refine_test_session().await;
-    let registration = register_refine_model(8_192, 128_000);
-    let budgets: Arc<std::sync::Mutex<Vec<Option<u64>>>> =
-        Arc::new(std::sync::Mutex::new(Vec::new()));
-    registration.set_responses(vec![budget_recording_step(
-        &budgets,
-        pa_ai::faux::faux_assistant_text_message(
-            r#"{"summary":"one edit","edits":[{"action":"create","kind":"memory","id":"m9","title":"t","content":"c"}]}"#,
-            pa_ai::faux::FauxAssistantMessageOptions::default(),
-        ),
-    )]);
-    let mut model = registration.get_model();
-    model.max_tokens_explicit = true;
-    let global = tmp.path().join("harness");
-    let result = session
-        .refine(
-            &refine::RefineOptions::default(),
-            refine::RefinementSource::User,
-            &model,
-            None,
-            global,
-        )
-        .await
-        .unwrap();
+    let run = refine_run(vec![], 8_192, 128_000, true, vec![landed_reply()]).await;
+    let result = run.result.unwrap();
     assert_eq!(
-        *budgets.lock().unwrap(),
+        run.budgets,
         vec![Some(8_192)],
         "the explicit budget stays as configured"
     );
@@ -1052,31 +997,10 @@ async fn an_explicitly_configured_budget_is_honored_not_raised() {
 /// A roomy catalog model still gets the 32k refinement ceiling.
 #[tokio::test]
 async fn a_roomy_catalog_model_keeps_the_ceiling_capped_budget() {
-    let (session, tmp) = refine_test_session().await;
-    let registration = register_refine_model(131_072, 400_000);
-    let budgets: Arc<std::sync::Mutex<Vec<Option<u64>>>> =
-        Arc::new(std::sync::Mutex::new(Vec::new()));
-    registration.set_responses(vec![budget_recording_step(
-        &budgets,
-        pa_ai::faux::faux_assistant_text_message(
-            r#"{"summary":"one edit","edits":[{"action":"create","kind":"memory","id":"m9","title":"t","content":"c"}]}"#,
-            pa_ai::faux::FauxAssistantMessageOptions::default(),
-        ),
-    )]);
-    let model = registration.get_model();
-    let global = tmp.path().join("harness");
-    session
-        .refine(
-            &refine::RefineOptions::default(),
-            refine::RefinementSource::User,
-            &model,
-            None,
-            global,
-        )
-        .await
-        .unwrap();
+    let run = refine_run(vec![], 131_072, 400_000, false, vec![landed_reply()]).await;
+    run.result.unwrap();
     assert_eq!(
-        *budgets.lock().unwrap(),
+        run.budgets,
         vec![Some(
             crate::refinement::planner::REFINEMENT_MAX_OUTPUT_TOKENS
         )],
