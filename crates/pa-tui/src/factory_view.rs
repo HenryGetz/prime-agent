@@ -397,9 +397,11 @@ pub struct FactoryView {
     /// repaint spam — one marker per notice-worthy change).
     recent_change: Vec<bool>,
     selected: Option<RowId>,
-    /// The row a first stop press armed: the next stop press on the same
-    /// row stops it, any other key disarms.
-    armed: Option<RowId>,
+    /// The row a first stop press armed, with the stop it armed: the next
+    /// stop press on the same row confirms exactly that stop (a child a
+    /// retry replaced in between is a different stop), any other key
+    /// disarms.
+    armed: Option<(RowId, FactoryViewAction)>,
     error: Option<String>,
     viewport_rows: usize,
 }
@@ -517,12 +519,13 @@ impl FactoryView {
             }
             _ => rows.into_iter().next(),
         };
-        // An armed row that can no longer be stopped (the run left the
-        // batch, stopped offering stop, or the child settled) disarms.
+        // An armed stop the row no longer offers (the run left the batch
+        // or stopped offering stop, the child settled or a retry replaced
+        // it) disarms.
         if self
             .armed
             .as_ref()
-            .is_some_and(|row| self.stop_action(row).is_none())
+            .is_some_and(|(row, stop)| self.stop_action(row).as_ref() != Some(stop))
         {
             self.armed = None;
         }
@@ -562,10 +565,13 @@ impl FactoryView {
             let Some(stop) = self.stop_action(&row) else {
                 return FactoryViewAction::None;
             };
-            if armed.as_ref() == Some(&row) {
+            if armed
+                .as_ref()
+                .is_some_and(|(armed_row, armed_stop)| *armed_row == row && *armed_stop == stop)
+            {
                 return stop;
             }
-            self.armed = Some(row);
+            self.armed = Some((row, stop));
             return FactoryViewAction::None;
         }
         if armed.is_some() {
@@ -674,10 +680,10 @@ impl FactoryView {
     /// trailing key hint.
     #[must_use]
     pub fn render(&self, theme: &Theme, width: usize, kb: &KeybindingsManager) -> Vec<Line> {
-        // The panel area: one panel per run, each panel's row range
-        // recorded for the budget window below.
+        // The panel area: one panel per run; the selected row's line (and
+        // its panel's start) is recorded for the budget window below.
         let mut panels: Vec<Line> = Vec::new();
-        let mut panel_ranges: Vec<(usize, usize)> = Vec::new();
+        let mut focus: Option<(usize, usize)> = None;
         if self.runs.is_empty() {
             panels.push(vec![Span::raw("")]);
             panels.push(vec![
@@ -697,8 +703,9 @@ impl FactoryView {
                 panels.push(vec![Span::raw("")]);
             }
             let panel_start = panels.len();
-            self.render_panel(theme, width, run, index, &mut panels);
-            panel_ranges.push((panel_start, panels.len()));
+            if let Some(line) = self.render_panel(theme, width, run, index, &mut panels) {
+                focus = Some((panel_start, line));
+            }
         }
         // The chrome area: the error line from the last failed refresh
         // and the trailing key hint (the view's only key legend).
@@ -710,29 +717,25 @@ impl FactoryView {
         // renders more rows than the viewport asked for. A tall view
         // windows over the panel area: the leading window keeps the top
         // of the feed (the newest panels — the oldest panels drop
-        // first), and when the panel owning the selection falls below it
-        // the window slides to it (a stop/resume target never hides
-        // behind the budget); the chrome stays pinned at the end.
-        let focus = self
-            .selected_run()
-            .and_then(|selected| {
-                self.runs
-                    .iter()
-                    .position(|run| run.run_id == selected.run_id)
-            })
-            .unwrap_or(0);
+        // first), and when the selected row falls below it the window
+        // slides: to the row's panel header when the row fits under it,
+        // else just far enough to show the row (an open or stop target
+        // never hides behind the budget); the chrome stays pinned at the
+        // end.
         let budget = self.viewport_rows.max(1);
         let panel_budget = budget.saturating_sub(chrome_rows);
         if panels.len() > panel_budget {
-            let mut start = 0;
-            if let Some((focus_start, _)) = panel_ranges.get(focus) {
-                if *focus_start >= panel_budget {
-                    start = *focus_start;
+            let start = match focus {
+                Some((panel_start, line)) if line >= panel_budget => {
+                    if line - panel_start < panel_budget {
+                        panel_start
+                    } else {
+                        line + 1 - panel_budget
+                    }
                 }
-            }
-            if start > 0 {
-                panels.drain(..start);
-            }
+                _ => 0,
+            };
+            panels.drain(..start);
             panels.truncate(panel_budget);
         }
         let mut rows = panels;
@@ -765,7 +768,7 @@ impl FactoryView {
                 .map_or_else(|| fallback.to_string(), |key| format_key_text(&key))
         };
         let stop_key = key("app.agents.delete", "ctrl+x");
-        if let Some(armed) = &self.armed {
+        if let Some((armed, _)) = &self.armed {
             return (
                 format!(
                     "stop {}? {stop_key} again to confirm, any other key cancels",
@@ -801,7 +804,8 @@ impl FactoryView {
 
     /// One run panel: the header (name, state, changed marker), the stats
     /// line (budget consumed, parallel, instances), the machine diagram,
-    /// and the milestone tail.
+    /// and the milestone tail. Returns the selected row's line in `rows`
+    /// when the selection is in this panel.
     fn render_panel(
         &self,
         theme: &Theme,
@@ -809,7 +813,7 @@ impl FactoryView {
         run: &FactoryRunSnapshot,
         index: usize,
         rows: &mut Vec<Line>,
-    ) {
+    ) -> Option<usize> {
         let selected = self
             .selected
             .as_ref()
@@ -839,10 +843,11 @@ impl FactoryView {
             Span::raw("  "),
             theme.fg_span(ThemeColor::Muted, Self::stats_line(run, running)),
         ];
+        let header_line = rows.len();
         rows.push(header);
         rows.push(truncate_line(&stats, width, ""));
         rows.push(vec![Span::raw("")]);
-        Self::render_diagram(theme, run, selected_state, rows);
+        let state_line = Self::render_diagram(theme, run, selected_state, rows);
         if !run.milestones.is_empty() {
             let tail = run
                 .milestones
@@ -858,6 +863,11 @@ impl FactoryView {
                 theme.fg_span(ThemeColor::MdQuote, "milestones: "),
                 theme.fg_span(ThemeColor::Muted, tail),
             ]);
+        }
+        if header_selected {
+            Some(header_line)
+        } else {
+            state_line
         }
     }
 
@@ -889,13 +899,15 @@ impl FactoryView {
     /// The machine diagram: every state in the machine's declared order as
     /// a status-glyphed row (the selected state marked), its outgoing
     /// transitions as connector rows (joins once, back edges marked, the
-    /// last-fired edges marked and colored).
+    /// last-fired edges marked and colored). Returns the selected state's
+    /// line in `rows`.
     fn render_diagram(
         theme: &Theme,
         run: &FactoryRunSnapshot,
         selected_state: Option<&str>,
         rows: &mut Vec<Line>,
-    ) {
+    ) -> Option<usize> {
+        let mut selected_line = None;
         let order: Vec<&str> = run.states.iter().map(|state| state.id.as_str()).collect();
         let position = |id: &str| order.iter().position(|candidate| *candidate == id);
         for state in &run.states {
@@ -916,6 +928,7 @@ impl FactoryView {
                 None => ("○", ThemeColor::Dim),
             };
             let marker = if selected_state == Some(state.id.as_str()) {
+                selected_line = Some(rows.len());
                 " ▸ "
             } else {
                 "   "
@@ -993,6 +1006,7 @@ impl FactoryView {
                 rows.push(row);
             }
         }
+        selected_line
     }
 }
 

@@ -805,6 +805,20 @@ fn the_stop_key_arms_then_stops_the_selected_row() {
             label: "review-loop/reviewing".to_string()
         }
     );
+    // A retry that replaces the armed child disarms: the next press arms
+    // the new child, never stops it unconfirmed.
+    let _ = view.handle_key("ctrl+x", &kb());
+    let mut retried = scripted_snapshot();
+    retried["nodes"][1]["instances"][0]["child"] = json!("child-9");
+    view.apply_runs(parse_factory_runs(&runs_response(&retried)));
+    assert_eq!(view.handle_key("ctrl+x", &kb()), FactoryViewAction::None);
+    assert_eq!(
+        view.handle_key("ctrl+x", &kb()),
+        FactoryViewAction::StopChild {
+            child_id: "child-9".to_string(),
+            label: "review-loop/reviewing".to_string()
+        }
+    );
     // A fold that settles the armed child disarms it.
     let _ = view.handle_key("ctrl+x", &kb());
     let mut settled = scripted_snapshot();
@@ -1678,6 +1692,21 @@ fn fifteen_panels_window_to_the_focus_on_a_small_viewport() {
     assert!(
         rows.last().is_some_and(|row| row.contains("back")),
         "the hint still paints after the slide"
+    );
+    // A selected state deep inside a tall panel: the window slides to
+    // the row itself, so the open/stop target stays visible.
+    let mut short = FactoryView::new(parse_factory_runs(&world_response()), 10);
+    short.selected = Some(RowId {
+        run_id: "run-w07".to_string(),
+        state_id: Some("watchdog".to_string()),
+    });
+    let rows = frame_text(&mut short);
+    assert!(rows.len() <= 10);
+    assert!(
+        rows.iter()
+            .any(|row| row.contains("▸") && row.contains("watchdog")),
+        "the selected state paints: {}",
+        rows.join("\n")
     );
     // Degenerate budgets honor the viewport exactly.
     let mut one_row = FactoryView::new(parse_factory_runs(&world_response()), 1);
