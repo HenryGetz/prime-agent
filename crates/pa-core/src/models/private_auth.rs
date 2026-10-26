@@ -155,9 +155,7 @@ fn build_authorized_private_models(items: &[Value]) -> Result<Vec<Model>, String
                 })
         })
         .collect::<Vec<_>>();
-    // Private routes are never listed by other providers: no catalog to take
-    // missing limits from.
-    Ok(build_prime_inference_models(&bundled, &entries, true, Some(0), &[]).unwrap_or_default())
+    Ok(build_prime_inference_models(&bundled, &entries, true, Some(0)).unwrap_or_default())
 }
 
 /// A cached authorization: fingerprint-scoped models with a refresh timestamp.
