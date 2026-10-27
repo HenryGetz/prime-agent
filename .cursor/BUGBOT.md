@@ -44,7 +44,7 @@ either changes.
 
 - Flag scripts and tools that no CI workflow, Makefile target, or other code runs, such as one-off review, parity, evidence, or reproduction scripts (for example a 520-line TS-vs-Rust shutdown comparison script added in a feature PR). Nothing keeps them working; their results belong in the PR body, not in the repo.
 - Flag test files that no runner discovers. A new test must match a discovery pattern in `.github/workflows/` or the Makefile, or be named there; for example, a new `scripts/test_*.py` runs only if a workflow lists it. Otherwise CI never runs it and it only looks like coverage.
-- Flag committed artifacts: evidence logs, reports, generated outputs, and local venvs or caches. The data files under Generated files are the exception.
+- Flag committed artifacts that no code or test reads: evidence logs, reports, generated outputs, and local venvs or caches.
 - Flag a PR body that presents a script or run that CI does not run as lasting proof (for example "covered by `scripts/foo.py`"). One-off evidence such as parity-diff evidence belongs in the body, but it must read as a one-off run with its command and result, not as coverage.
 
 ## Tests

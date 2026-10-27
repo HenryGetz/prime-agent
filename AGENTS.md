@@ -67,8 +67,8 @@ Every contributor (human or agent) must read this before working on this repo.
 - Do not commit scripts or tools that no workflow, Makefile target, or other code runs (one-off
   review, parity, or reproduction scripts). Put their results in the PR body as a one-off run with
   its command and result, not as coverage.
-- Do not commit evidence logs, reports, generated outputs, or local venvs and caches. The catalog
-  data files under Merge gates are the exception.
+- Do not commit evidence logs, reports, generated outputs, or local venvs and caches that no code
+  or test reads.
 
 ## Tests
 
