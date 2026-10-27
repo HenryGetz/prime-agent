@@ -1316,6 +1316,39 @@ pub(crate) fn format_scan_cost_warning(auto_timeout: Option<f64>) -> String {
 mod tests {
     use super::*;
 
+    /// Process env is process-wide; the tests that read or mutate
+    /// `PRIME_AGENT_SCAN_TIMEOUT` serialize on one lock (the `env_lock`
+    /// convention from `agent_traces/tests.rs`), so the transient deadline a
+    /// test sets across an await cannot reach a parallel `execute_bash`
+    /// test in the same binary.
+    fn env_lock() -> std::sync::MutexGuard<'static, ()> {
+        static LOCK: std::sync::Mutex<()> = std::sync::Mutex::new(());
+        LOCK.lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
+    }
+
+    /// `PRIME_AGENT_SCAN_TIMEOUT` set for the held scope, with the prior
+    /// value (or its absence) restored on drop — including on assertion
+    /// panics, which would otherwise skip a trailing remove.
+    struct ScanTimeoutEnv(Option<std::ffi::OsString>);
+
+    impl ScanTimeoutEnv {
+        fn set(value: &str) -> Self {
+            let guard = Self(std::env::var_os(SCAN_TIMEOUT_ENV));
+            std::env::set_var(SCAN_TIMEOUT_ENV, value);
+            guard
+        }
+    }
+
+    impl Drop for ScanTimeoutEnv {
+        fn drop(&mut self) {
+            match self.0.take() {
+                Some(value) => std::env::set_var(SCAN_TIMEOUT_ENV, value),
+                None => std::env::remove_var(SCAN_TIMEOUT_ENV),
+            }
+        }
+    }
+
     /// The incident command (session 01a15735): a recursive grep over six
     /// home-scale trees piped to `head`, held a turn for 13 minutes.
     const INCIDENT: &str = r"grep -rli -e 'training metrics' -e 'advanced dashboard' ~/Documents ~/Desktop ~/Claude ~/environments ~/outputs ~/Downloads 2>/dev/null | grep -viE '\.(pdf|jsonl|log|txt)$' | head -10; echo done";
@@ -2034,11 +2067,15 @@ mod tests {
 
     /// Runs the real tool: the incident shape carries the warning on the
     /// model-facing text, project-local scans do not, and the opted-in
-    /// `PRIME_AGENT_SCAN_TIMEOUT` bounds the command. Mutates process env, so
-    /// it runs as one sequential test (the golden env-bypass convention).
+    /// `PRIME_AGENT_SCAN_TIMEOUT` bounds the command. Mutates process env
+    /// under the module's env lock, so the transient deadline never
+    /// reaches a parallel `execute_bash` test in this binary.
     #[tokio::test]
+    // The env lock is held across awaits by design (env must stay stable).
+    #[allow(clippy::await_holding_lock)]
     async fn execute_bash_warns_on_unbounded_scans_and_env_timeouts_them() {
         use crate::tools::bash::{execute_bash, BashToolOptions};
+        let _env = env_lock();
         let cwd = tempfile::tempdir().expect("tempdir");
         let cwd_path = cwd.path().to_string_lossy().into_owned();
 
@@ -2082,7 +2119,7 @@ mod tests {
 
         // The opt-in env applies its timeout to the matching command and the
         // warning names it.
-        std::env::set_var(SCAN_TIMEOUT_ENV, "0.5");
+        let _scan_timeout = ScanTimeoutEnv::set("0.5");
         let result = execute_bash(
             &cwd_path,
             &BashToolOptions::default(),
@@ -2093,7 +2130,6 @@ mod tests {
             None,
         )
         .await;
-        std::env::remove_var(SCAN_TIMEOUT_ENV);
         let err = result.expect_err("the scan timeout must fire");
         assert!(
             err.to_string().contains("scan timeout of 0.5s"),
@@ -2106,15 +2142,51 @@ mod tests {
         );
     }
 
+    /// `PRRT_kwDOSXZbXs6u6Jas`: the env test sets its transient deadline on
+    /// the process env across an await; a failed assertion unwinds through
+    /// the guard, so the prior value (or its absence) is restored even
+    /// though the panic escaped with the deadline live — the unwind cannot
+    /// leave the binary's other `execute_bash` tests racing a deadline no
+    /// test asked for.
+    #[test]
+    fn a_failed_assertion_restores_the_scan_timeout_env() {
+        let _env = env_lock();
+        let before = std::env::var_os(SCAN_TIMEOUT_ENV);
+        let unwind = std::panic::catch_unwind(|| {
+            // Creation order mirrors the env test: the guard, then the
+            // transient deadline, so the unwind restores what the panic
+            // left live.
+            let _scan_timeout = ScanTimeoutEnv::set("0.5");
+            assert_eq!(
+                std::env::var(SCAN_TIMEOUT_ENV).as_deref(),
+                Ok("0.5"),
+                "the guard must hold the transient deadline"
+            );
+            panic!("simulate a failed assertion while the deadline is live");
+        });
+        assert!(unwind.is_err(), "the simulated assertion must unwind");
+        assert_eq!(
+            std::env::var_os(SCAN_TIMEOUT_ENV),
+            before,
+            "the guard must restore the prior value after the unwind"
+        );
+    }
+
     /// `PRRT_kwDOSXZbXs6u6JaU`: the scan-cost warning rides the dispatch
     /// `ToolUpdate` (kernel parity: `_note_scan_cost` before the shell runs),
     /// not only the result text after the command finishes — an unbounded
     /// scan holds the turn, so the warning must be visible while it runs.
     #[tokio::test]
+    // The env lock is held across awaits by design (env must stay stable).
+    #[allow(clippy::await_holding_lock)]
     async fn execute_bash_delivers_scan_warning_at_dispatch() {
         use crate::tools::bash::{execute_bash, BashToolOptions};
         use crate::tools::tool_definition::{OnUpdate, ToolUpdate};
         use std::sync::{Arc, Mutex};
+
+        // execute_bash reads the process env; the shared lock keeps the
+        // env-mutating scan test's transient deadline out of this command.
+        let _env = env_lock();
 
         let cwd = tempfile::tempdir().expect("tempdir");
         let cwd_path = cwd.path().to_string_lossy().into_owned();
