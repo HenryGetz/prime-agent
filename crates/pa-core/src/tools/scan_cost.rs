@@ -710,7 +710,10 @@ fn segments_contain_unbounded_scan(masked: &str) -> bool {
         // not count as a home root (a masked pattern leaves a placeholder
         // in its position). Pattern options (`-e`, `--regexp`, `-f`,
         // `--file`) supply the pattern instead: their operands are skipped,
-        // not roots. rg's `--files` listing mode takes no pattern at all, so
+        // not roots. Count bounds (`-m`, `--max-count`) take their numeric
+        // operand the same way, so `grep -rl -m 1 "$HOME" src/` skips `1`,
+        // takes "$HOME" as the pattern, and leaves src/ the only root.
+        // rg's `--files` listing mode takes no pattern at all, so
         // every positional is a path.
         // Pattern options belong to grep-family and rg only: BSD find's
         // `-f` supplies the hierarchy to walk, not a pattern file.
@@ -749,6 +752,10 @@ fn segments_contain_unbounded_scan(masked: &str) -> bool {
                 && (*t == "-e" || *t == "--regexp" || *t == "-f" || *t == "--file")
             {
                 skip_next = true;
+                continue;
+            }
+            if !seen_ddash && takes_pattern_options && (*t == "-m" || *t == "--max-count") {
+                skip_next = true; // the count bound's operand, not the pattern
                 continue;
             }
             if takes_pattern_options && (t.starts_with("--regexp=") || t.starts_with("--file=")) {
@@ -1571,6 +1578,41 @@ mod tests {
         ));
         assert!(is_unbounded_home_scan(
             "grep -R -e -error ~/Documents",
+            None
+        ));
+    }
+
+    /// Regression pin for the review round on count bounds: `-m`/`--max-count`
+    /// take a numeric operand before the pattern, so the operand is consumed
+    /// and never displaces the pattern onto "$HOME" as a scan root.
+    #[test]
+    fn max_count_operand_does_not_displace_the_pattern() {
+        assert!(!is_unbounded_home_scan(
+            "grep -rl -m 1 \"$HOME\" src/",
+            None
+        ));
+        assert!(!is_unbounded_home_scan(
+            "grep -rl --max-count 1 \"$HOME\" src/",
+            None
+        ));
+        assert!(!is_unbounded_home_scan("rg -m 1 \"$HOME\" src/", None));
+        // Self-contained spellings never displaced the pattern.
+        assert!(!is_unbounded_home_scan("grep -rl -m1 \"$HOME\" src/", None));
+        assert!(!is_unbounded_home_scan(
+            "grep -rl --max-count=1 \"$HOME\" src/",
+            None
+        ));
+        // The bound never hides a real home root nor ends option parsing.
+        assert!(is_unbounded_home_scan(
+            "grep -rl -m 1 needle \"$HOME\"",
+            None
+        ));
+        assert!(is_unbounded_home_scan(
+            "grep -rl -m 1 needle \"$HOME/Documents\"",
+            None
+        ));
+        assert!(!is_unbounded_home_scan(
+            "grep -rl -m 1 -- \"$HOME\" src/",
             None
         ));
     }

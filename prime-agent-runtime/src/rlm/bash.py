@@ -575,8 +575,11 @@ def _segments_contain_unbounded_scan(masked: str) -> bool:
         # a pattern option (-e/--regexp/-f/--file), every non-option
         # argument is a root and none is skipped.
         # Pattern options (-e/--regexp/-f/--file) supply the pattern: their
-        # operands are skipped, not roots. rg's --files listing mode takes
-        # no pattern at all, so every positional is a path.
+        # operands are skipped, not roots. Count bounds (-m/--max-count) take
+        # their numeric operand the same way, so `grep -rl -m 1 "$HOME" src/`
+        # skips `1`, takes "$HOME" as the pattern, and leaves src/ the only
+        # root. rg's --files listing mode takes no pattern at all, so every
+        # positional is a path.
         # Pattern options belong to grep-family and rg only: BSD find's
         # `-f` supplies the hierarchy to walk, not a pattern file.
         if tokens[0] == "find":
@@ -645,6 +648,9 @@ def _segments_contain_unbounded_scan(masked: str) -> bool:
                 "--file",
             ):
                 skip_next = True
+                continue
+            if not seen_ddash and takes_pattern_options and t in ("-m", "--max-count"):
+                skip_next = True  # the count bound's operand, not the pattern
                 continue
             if takes_pattern_options and t.startswith(("--regexp=", "--file=")):
                 continue

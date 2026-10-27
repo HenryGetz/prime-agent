@@ -1693,6 +1693,22 @@ class ScanCostGuardTest(unittest.IsolatedAsyncioTestCase):
         self.assertTrue(is_scan("grep -rl -e -error ~/Documents"))
         self.assertTrue(is_scan("grep -R -e -error ~/Documents"))
 
+    def test_max_count_operand_does_not_displace_the_pattern(self):
+        # A count bound takes a numeric operand before the pattern: the
+        # operand is consumed, so the quoted "$HOME" stays pattern text and
+        # src/ is the only root — no spurious home-scan warning.
+        is_scan = bash_module._is_unbounded_home_scan
+        self.assertFalse(is_scan('grep -rl -m 1 "$HOME" src/'))
+        self.assertFalse(is_scan('grep -rl --max-count 1 "$HOME" src/'))
+        self.assertFalse(is_scan('rg -m 1 "$HOME" src/'))
+        # Self-contained spellings never displaced the pattern.
+        self.assertFalse(is_scan('grep -rl -m1 "$HOME" src/'))
+        self.assertFalse(is_scan('grep -rl --max-count=1 "$HOME" src/'))
+        # The bound never hides a real home root nor ends option parsing.
+        self.assertTrue(is_scan('grep -rl -m 1 needle "$HOME"'))
+        self.assertTrue(is_scan('grep -rl -m 1 needle "$HOME/Documents"'))
+        self.assertFalse(is_scan('grep -rl -m 1 -- "$HOME" src/'))
+
     def test_home_span_separators_do_not_split_scan_roots(self):
         # Kernel parity for the Rust pin: a quoted separator inside a
         # home-prefixed span is data, so a real scan keeps its root and
