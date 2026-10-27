@@ -182,18 +182,19 @@ impl Inner {
                     result = Some(clipped);
                 }
             }
-            if execution
+            let user_aborted = execution
                 .opts
                 .signal
                 .as_ref()
-                .is_some_and(AbortSignal::is_aborted)
-            {
+                .is_some_and(AbortSignal::is_aborted);
+            if user_aborted {
                 status = ExecuteStatus::Aborted;
             }
-            // A cell that completed ok as its limit fired keeps its ok outcome.
+            // A user abort wins over the limit (plain Ctrl+C: no timeout text, no
+            // kill), and a cell that completed ok as its limit fired keeps its ok outcome.
             let timed_out_after_ms = buffers
                 .timed_out_after_ms
-                .filter(|_| status != ExecuteStatus::Ok);
+                .filter(|_| !user_aborted && status != ExecuteStatus::Ok);
 
             let mut background_output = std::mem::take(&mut buffers.background_output);
             buffers.background_output_chars = 0;
