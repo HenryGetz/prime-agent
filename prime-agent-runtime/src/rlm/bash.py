@@ -516,7 +516,11 @@ def _mask_scan_literals(command: str) -> str:
 
 def _segments_contain_unbounded_scan(masked: str) -> bool:
     """True when any segment of the masked command is an unbounded scan."""
-    for segment in re.split(r"&&|\|\||;|\||\n", masked):
+    # A standalone `&` backgrounds the left side and starts a new command,
+    # so `sleep 1 & find "$HOME"` segments like its `&&` form. The
+    # lookarounds keep redirection spellings (`2>&1`, `<&`, `&>`, `&>>`)
+    # inside the segment: their `&` is not a separator.
+    for segment in re.split(r"&&|\|\||;|\||\n|(?<![<>])&(?!>)", masked):
         tokens = segment.split()
         # Leading grouping operators: `(find ...)` and `{ ...; }` run the
         # same command, so the shape must survive grouping. Walk by index

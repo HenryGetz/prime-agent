@@ -1702,6 +1702,25 @@ class ScanCostGuardTest(unittest.IsolatedAsyncioTestCase):
         self.assertTrue(is_scan('rg "$HOME/a;$HOME/b" ~/Documents'))
         self.assertTrue(is_scan('rg "$HOME/a&&$HOME/b" ~/Documents'))
 
+    def test_standalone_background_ampersand_is_a_segment_separator(self):
+        # A lone `&` backgrounds the left side and starts a new command, so
+        # `sleep 1 & find "$HOME"` must warn like its `&&` form; the `&` in
+        # redirection spellings (`2>&1`, `<&`, `&>`, `&>>`) is not a
+        # separator and must not break the segment.
+        is_scan = bash_module._is_unbounded_home_scan
+        self.assertTrue(is_scan('sleep 1 & find "$HOME"'))
+        self.assertTrue(is_scan('sleep 1 & grep -rl needle ~/Documents'))
+        self.assertTrue(is_scan('sleep 120 & find "$HOME" -name "*.pdf"'))
+        self.assertFalse(is_scan('sleep 120 & grep -rl needle .'))
+        # Redirection spellings keep the segment whole.
+        self.assertTrue(is_scan('grep -rl needle "$HOME" 2>&1'))
+        self.assertTrue(is_scan('grep -rl needle 2>&1 "$HOME"'))
+        self.assertTrue(is_scan('grep -rl needle "$HOME" &> ~/out.txt'))
+        self.assertTrue(is_scan('grep -rl needle "$HOME" &>> ~/out.txt'))
+        self.assertFalse(is_scan('grep -rl needle . 2>&1'))
+        self.assertFalse(is_scan('grep -rl needle . &> ~/out.txt'))
+        self.assertFalse(is_scan('rg pattern . <&0'))
+
     def test_dispatch_hint_is_budgeted_and_names_the_fix(self):
         with (
             mock.patch.object(bash_module, "_scan_hints_written", 0),
