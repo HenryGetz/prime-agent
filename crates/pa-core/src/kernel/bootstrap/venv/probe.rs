@@ -1,57 +1,127 @@
 //! The runtime-ready probe concern: the two-layer memo (in-process map + the cross-process on-disk
 //! verdict) that skips re-probing a venv nobody damaged.
 
-use super::{
-    collect_python_files, Digest, HashMap, KernelPythonSkill, Mutex, Path, PathBuf, Stdio,
-    DEFAULT_RLM_EXTRA_PACKAGES,
-};
+use super::{collect_python_files, Digest, HashMap, Mutex, Path, PathBuf, Stdio};
 
-fn python_imports(python: &str, module_name: &str) -> bool {
-    run_quiet(python, &["-c", &format!("import {module_name}")])
+/// What probing an interpreter found: whether the runtime-ready check passed, and which of the
+/// requested modules failed to import.
+pub(crate) struct PythonProbe {
+    pub(crate) runtime_ready: bool,
+    pub(crate) missing_imports: Vec<String>,
 }
 
-fn run_quiet(command: &str, args: &[&str]) -> bool {
-    let mut child = std::process::Command::new(command);
-    child
-        .args(args)
-        .stdin(Stdio::null())
-        .stdout(Stdio::null())
+/// Read from stdin, so every argument stays one line (Windows batch-file interpreters reject
+/// line breaks in arguments). Runs the runtime-ready check (`argv[1]`, skipped when empty), then
+/// imports each module named in the remaining arguments, announcing each step on its own
+/// flushed marker line before taking it.
+const PROBE_SCRIPT: &str = r#"import importlib, os, sys
+# Markers go to a private copy of stdout, so an import that redirects stdout can't hide them.
+out = os.fdopen(os.dup(1), "w")
+def say(*words):
+    out.write("\n" + " ".join(("pa-probe",) + words) + "\n")
+    out.flush()
+if sys.argv[1]:
+    try:
+        exec(sys.argv[1], {})
+        say("ready")
+    except BaseException:
+        say("not-ready")
+for name in sys.argv[2:]:
+    say("import", name)
+    try:
+        importlib.import_module(name)
+    except BaseException:
+        say("missing", name)
+say("done")
+"#;
+
+/// Probe `python` with as few interpreter starts as possible: one, unless an import kills the
+/// interpreter. That import counts as missing and the probe resumes after it. Blocking: callers
+/// on an async runtime run it on the blocking pool.
+pub(crate) fn probe_python(python: &str, check_runtime: bool, imports: &[&str]) -> PythonProbe {
+    let mut probe = PythonProbe {
+        runtime_ready: !check_runtime,
+        missing_imports: Vec::new(),
+    };
+    let mut check = if check_runtime {
+        RUNTIME_READY_CHECK
+    } else {
+        ""
+    };
+    let mut pending = imports;
+    loop {
+        let markers = run_probe_script(python, check, pending);
+        let marker = |kind: &str| markers.iter().any(|(seen, _)| seen == kind);
+        if !check.is_empty() {
+            probe.runtime_ready = marker("ready");
+        }
+        probe.missing_imports.extend(
+            markers
+                .iter()
+                .filter(|(kind, _)| kind == "missing")
+                .map(|(_, name)| name.clone()),
+        );
+        if marker("done") {
+            return probe;
+        }
+        // The interpreter died. Charge the import it was taking and resume after it; one that
+        // died before any import (or never started) fails every import still pending.
+        let started = markers.iter().filter(|(kind, _)| kind == "import").count();
+        if started == 0 {
+            probe
+                .missing_imports
+                .extend(pending.iter().map(ToString::to_string));
+            return probe;
+        }
+        probe.missing_imports.push(pending[started - 1].to_string());
+        pending = &pending[started..];
+        check = "";
+        if pending.is_empty() {
+            return probe;
+        }
+    }
+}
+
+/// One run of [`PROBE_SCRIPT`]: its marker lines as `(kind, argument)`.
+fn run_probe_script(python: &str, check: &str, imports: &[&str]) -> Vec<(String, String)> {
+    let mut command = std::process::Command::new(python);
+    command
+        .arg("-")
+        .arg(check)
+        .args(imports)
+        .stdin(Stdio::piped())
+        .stdout(Stdio::piped())
         .stderr(Stdio::null());
     // Hidden window on Windows (TS `spawnHidden`).
-    crate::platform::process::set_no_window(&mut child);
+    crate::platform::process::set_no_window(&mut command);
     if cfg!(windows) {
-        child.env("PYTHONUTF8", "1");
+        command.env("PYTHONUTF8", "1");
     }
-    matches!(child.status(), Ok(status) if status.success())
+    let Ok(mut child) = command.spawn() else {
+        return Vec::new();
+    };
+    if let Some(mut stdin) = child.stdin.take() {
+        use std::io::Write as _;
+        // A failed write leaves the interpreter without a script: no markers, every check fails.
+        let _ = stdin.write_all(PROBE_SCRIPT.as_bytes());
+    }
+    let Ok(output) = child.wait_with_output() else {
+        return Vec::new();
+    };
+    String::from_utf8_lossy(&output.stdout)
+        .lines()
+        .filter_map(|line| line.strip_prefix("pa-probe "))
+        .map(|rest| {
+            let (kind, argument) = rest.split_once(' ').unwrap_or((rest, ""));
+            (kind.to_string(), argument.to_string())
+        })
+        .collect()
 }
 
 /// The runtime-ready assertion from the TS product: a current
 /// prime-agent-runtime with the callable RLM surface, harness CRUD, bash
 /// handles, and protocol version 3.
 const RUNTIME_READY_CHECK: &str = "import inspect; import rlm; from rlm import McpIntegration; import rlm.mcp as mcp; from rlm.harness import HarnessEntry; _harness_methods = ['create_memory', 'update_memory', 'delete_memory', 'create_skill', 'update_skill', 'delete_skill', 'create_subagent', 'update_subagent', 'delete_subagent', 'create_prompt_note', 'update_prompt_note', 'delete_prompt_note', 'record_refinement']; _mcp_discovery_methods = ['list_plugins', 'search_plugins', 'list_connections', 'search_tools', 'describe_tool']; assert callable(mcp.list_tools); assert callable(mcp.call_tool); assert all(callable(getattr(mcp, _m, None)) for _m in _mcp_discovery_methods), \"rlm.mcp is missing MCP discovery methods (list_plugins, search_plugins, list_connections, search_tools, describe_tool); the kernel venv needs a current prime-agent-runtime\"; assert callable(rlm.spawn); assert hasattr(rlm, 'rlm'); assert callable(rlm.rlm.spawn); assert inspect.signature(rlm.spawn).parameters['name'].default is inspect.Parameter.empty; assert not hasattr(rlm, 'run'); assert not hasattr(rlm.rlm, 'run'); assert callable(rlm.host_request); assert callable(rlm.find_models); assert callable(rlm.rlm.find_models); assert callable(rlm.create_session); assert callable(rlm.rlm.create_session); assert callable(rlm.progress_note); assert callable(rlm.rlm.progress_note); assert callable(rlm.rename); assert callable(rlm.rlm.rename); assert hasattr(rlm, 'harness'); assert hasattr(rlm, 'get_harness_state'); assert hasattr(rlm.rlm, 'harness'); assert hasattr(rlm.rlm, 'get_harness_state'); assert all(callable(getattr(_harness, _method, None)) for _harness in (rlm.harness, rlm.rlm.harness) for _method in _harness_methods); assert 'reference' in HarnessEntry.__dataclass_fields__; assert 'scope' in HarnessEntry.__dataclass_fields__; assert 'reference' in inspect.signature(rlm.harness.create_skill).parameters; assert 'reference' in inspect.signature(rlm.harness.update_skill).parameters; assert 'global_' in inspect.signature(rlm.harness.create_memory).parameters; assert 'global_' in inspect.signature(rlm.get_harness_state).parameters; assert not hasattr(rlm, 'background'); assert not hasattr(rlm.rlm, 'background'); from rlm.bash import BashHandle, BashResult; assert callable(rlm.bash); assert {'persistent', 'yield_after'} <= set(inspect.signature(rlm.bash).parameters); assert callable(rlm.persistent_shells); assert callable(rlm._set_completion_notices_wired); assert all(callable(getattr(BashHandle, _m, None)) for _m in ('tail', 'output', 'poll', 'kill')); assert {'exit_code', 'output', 'duration'} <= set(BashResult.__dataclass_fields__); import rlm.repl as _repl; assert callable(_repl.main); assert callable(_repl.emit); assert callable(_repl.host_request); assert callable(_repl.is_active); assert _repl.PROTOCOL_VERSION == 3; assert callable(rlm.emit); assert not hasattr(rlm, 'HOST_COMM_TARGET'); assert not hasattr(mcp, 'install_shutdown_hook')";
-
-pub(crate) fn has_prime_agent_runtime(python: &str) -> bool {
-    run_quiet(python, &["-c", RUNTIME_READY_CHECK])
-}
-
-pub(crate) fn missing_rlm_extra_import_labels(python: &str) -> Vec<&'static str> {
-    DEFAULT_RLM_EXTRA_PACKAGES
-        .iter()
-        .filter(|(_, import, _)| !python_imports(python, import))
-        .map(|(_, _, label)| *label)
-        .collect()
-}
-
-pub(crate) fn missing_python_skill_import_labels(
-    python: &str,
-    python_skills: &[KernelPythonSkill],
-) -> Vec<String> {
-    python_skills
-        .iter()
-        .filter(|skill| !python_imports(python, &skill.import_name))
-        .map(|skill| format!("{} ({})", skill.name, skill.import_name))
-        .collect()
-}
 
 /// Process-global memo of a successful runtime-ready probe, tiered above the cross-process on-disk
 /// memo ([`super::super::disk_memo`]): the probe is a full interpreter start. Memoized on success
@@ -180,7 +250,8 @@ pub(super) fn has_prime_agent_runtime_memoized(
         entries.insert(key, memo_path);
         return true;
     }
-    if !has_prime_agent_runtime(python) || !python_imports(python, "dill") {
+    let probe = probe_python(python, true, &["dill"]);
+    if !probe.runtime_ready || !probe.missing_imports.is_empty() {
         return false;
     }
     let mut memo = lock_probe_memo();
