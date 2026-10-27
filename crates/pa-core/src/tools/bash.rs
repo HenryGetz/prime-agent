@@ -12,11 +12,13 @@ use std::time::Duration;
 use serde_json::json;
 
 use crate::tools::bash_guard::{
-    find_destructive_git_discard_commands, format_dirty_tree_refusal, format_scan_cost_warning,
-    is_truthy_env_value, is_unbounded_home_scan, resolve_discard_probe_target,
-    scan_timeout_from_env, DiscardProbeResolution, BASH_DESTRUCTIVE_GIT_BYPASS_ENV,
+    find_destructive_git_discard_commands, format_dirty_tree_refusal, is_truthy_env_value,
+    resolve_discard_probe_target, DiscardProbeResolution, BASH_DESTRUCTIVE_GIT_BYPASS_ENV,
 };
 use crate::tools::output_accumulator::{OutputAccumulator, OutputAccumulatorOptions};
+use crate::tools::scan_cost::{
+    format_scan_cost_warning, is_unbounded_home_scan, scan_timeout_from_env,
+};
 use crate::tools::shell_utils::get_shell_env;
 use crate::tools::tool_definition::{
     AbortSignal, OnUpdate, ToolContentBlock, ToolDefinition, ToolExecutionResult, ToolUpdate,
