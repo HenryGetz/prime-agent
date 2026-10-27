@@ -802,7 +802,7 @@ impl Supervisor {
         resident: &Arc<ResidentWorker>,
         keep_interrupted_work: bool,
     ) -> bool {
-        let (pid, start_id, journal_path, no_session) = {
+        let (pid, start_id, recovery_journal_path, no_session) = {
             let descriptor = resident.descriptor.lock().await;
             (
                 descriptor.pid as u32,
@@ -833,13 +833,14 @@ impl Supervisor {
                 false
             }
             _ => {
-                // Reap only the dead worker's identity-verified orphan groups;
-                // the reaper owns its separate journal and retains failed retries.
+                // The worker is provably gone, so its kernels can no longer
+                // run their teardown reap: kill the `bash()` groups they
+                // journaled before the descriptor dies with its files.
                 self.reap_dead_worker_orphans(resident).await;
                 if keep_interrupted_work
                     && !no_session
                     && crate::journal::WorkerRecoveryJournal::read_interrupted(Path::new(
-                        &journal_path,
+                        &recovery_journal_path,
                     ))
                 {
                     // A shutdown-continued worker keeps descriptor and journal so
@@ -859,7 +860,7 @@ impl Supervisor {
                     start_id.as_deref(),
                     crate::lease::get_process_start_id(pid).as_deref(),
                 ) {
-                    let _ = std::fs::remove_file(&journal_path);
+                    let _ = std::fs::remove_file(&recovery_journal_path);
                 }
                 match std::fs::remove_file(&resident.descriptor_path) {
                     Err(error) if error.kind() != std::io::ErrorKind::NotFound => {
@@ -874,6 +875,8 @@ impl Supervisor {
                 // The identity-pending side record dies with the descriptor it shadows
                 // (an orphaned pending would shadow the next identity).
                 let _ = crate::descriptor::clear_identity_pending(&resident.descriptor_path);
+                // The reaper alone owns orphan-journal removal. A read or
+                // identity-verified kill failure must preserve its retry records.
                 true
             }
         }

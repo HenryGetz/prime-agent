@@ -848,10 +848,8 @@ impl Worker {
     /// no destructors, so the caller must have settled the close first).
     async fn exit_after_close(&self) -> ! {
         // Shutdown keeps the resume entry and exits the process (TS
-        // `closeKeepsResumeEntry("shutdown")`). The recovery verdict was
-        // recorded by `handle_shutdown` before its reply: the supervisor may
-        // escalate the stop as soon as the reply lands, so an exit-path write
-        // would race the boot's revival decision.
+        // `closeKeepsResumeEntry("shutdown")`); `handle_shutdown` already
+        // recorded the recovery verdict.
         self.close_listener_then_cleanup_socket().await;
         std::process::exit(0)
     }

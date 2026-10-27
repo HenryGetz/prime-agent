@@ -284,7 +284,7 @@ pub(crate) fn checkpoint_queue_recovery(
     };
     // The verdict never publishes over a snapshot that did not
     // persist: the pair rides ONE durable append.
-    if let Err(error) = journal.record_queue_checkpoint(
+    let _ = journal.record_queue_checkpoint(
         &active_session_id,
         &session_id,
         session_file.as_deref(),
@@ -293,9 +293,7 @@ pub(crate) fn checkpoint_queue_recovery(
         &lanes.steering,
         &lanes.follow_up,
         suspended,
-    ) {
-        eprintln!("pa-daemon: queue recovery checkpoint {operation} failed: {error:#}");
-    }
+    );
 }
 
 pub(crate) fn queue_lanes(core: &SessionCore) -> QueueLanes {
@@ -417,19 +415,12 @@ pub(crate) fn restore_queue_snapshot(
             .collect()
     }
 
-    let mut steering = VecDeque::new();
-    let mut follow_up = VecDeque::new();
-    let mut suspended = false;
-    // The snapshot carries the suspension bit with the lanes: a user-aborted
-    // queue revives still parked instead of auto-running its prompts.
-    if let Some((steering_lanes, follow_up_lanes, snapshot_suspended)) =
-        journal.latest_queue_snapshot(active_session_id)
-    {
-        steering = pending(steering_lanes);
-        follow_up = pending(follow_up_lanes);
-        suspended = snapshot_suspended;
+    match journal.latest_queue_snapshot(active_session_id) {
+        Some((steering, follow_up, suspended)) => {
+            (pending(steering), pending(follow_up), suspended)
+        }
+        None => (VecDeque::new(), VecDeque::new(), false),
     }
-    (steering, follow_up, suspended)
 }
 
 /// Admit one held autonomous continuation through the follow-up lane:

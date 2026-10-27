@@ -1062,11 +1062,8 @@ impl TurnRunner {
                 engine.set_prompt_context_boundary(prompt_context_leaf);
             }
             engine.run_prompt(prompt_index, request, &aborted_probe, &mut emit);
-            accepted_rows
         });
-        if let Err(error) = turn.await {
-            eprintln!("pa-daemon: turn engine task failed: {error}");
-        }
+        let _ = turn.await;
         let accepted_rows = accepted_prefix.load(std::sync::atomic::Ordering::SeqCst);
         // The emit path is joined: a stale parked partial must not
         // surface after the settle events.
@@ -1076,15 +1073,9 @@ impl TurnRunner {
         let engine_reported_run_end = engine_agent_end.load(std::sync::atomic::Ordering::SeqCst);
         let more_queued = {
             let mut core = self.core.lock().unwrap();
-            // The note clear and idle transition stay atomic to roster readers.
-            // Recheck after returning unaccepted input to its lane.
-            core.busy = false;
-            core.active_action = None;
-            core.running_admission_ids.clear();
             // A shutdown never loses admitted input: the batch items whose
             // transcript row never persisted exist nowhere else, so they
-            // return to the front of their lane, in order, for the settle
-            // snapshot.
+            // return to the front of their lane, in order.
             if core.shutdown_requested && !core.turn_cancelled {
                 let lane_items = match lane {
                     Lane::Steering => &mut core.steering,
@@ -1095,9 +1086,18 @@ impl TurnRunner {
                 }
             }
             let more_queued = !core.steering.is_empty() || !core.follow_up.is_empty();
+            // Publish the note clear and idle transition atomically to
+            // roster readers, which capture core then the engine note.
+            // An abort-gated run may emit no later event to repair a
+            // roster push that observes idle with its old note.
+            // AgentEnd may have retained the note for work withdrawn before
+            // this settle. Recheck the lanes even when that frame was observed.
             if !more_queued {
                 settle_engine.clear_progress_note();
             }
+            core.busy = false;
+            core.active_action = None;
+            core.running_admission_ids.clear();
             more_queued
         };
         self.push_roster_delta();

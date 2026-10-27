@@ -77,8 +77,8 @@ impl Worker {
             .await;
         let interrupted_turn = {
             let mut core = self.core.lock().unwrap();
-            let interrupted_turn =
-                core.busy && !core.abort_requested && !core.turn_cancelled && !core.turn_completed;
+            // Every explicit cancellation also sets `abort_requested`.
+            let interrupted_turn = core.busy && !core.abort_requested && !core.turn_completed;
             // The shutdown gate closes FIRST: a racing execute_bash must see the
             // stop before the abort runs — a claim that slipped in after the
             // abort would register a controller nothing later cancels, and the
@@ -102,35 +102,33 @@ impl Worker {
         self.compaction.abort();
         self.tree_navigation.abort();
         self.await_session_work_settled().await;
-        if daemon_wide && interrupted_turn {
-            let continued = {
-                let mut core = self.core.lock().unwrap();
-                if core.turn_cancelled || core.turn_completed {
-                    false
-                } else {
-                    core.steering.push_front(QueuedItem {
-                        priority: QueuePriority::Human,
-                        preview: None,
-                        message: crate::update_restore::UPDATE_RESTART_CONTINUATION_PROMPT
-                            .to_string(),
-                        custom_message: None,
-                        agent_message: None,
-                        queue_key: None,
-                        admission_id: None,
-                        images: Vec::new(),
-                        done: None,
-                        queue_visible: false,
-                        policy: TurnPolicy::Direct,
-                        forced_batch: false,
-                    });
-                    true
-                }
-            };
-            if continued {
-                self.checkpoint_queue(QueueCheckpoint::Admitted {
-                    operation: "prompt_accepted",
+        // A daemon-wide shutdown that interrupted a running turn queues the
+        // continuation prompt so the next boot resumes the turn.
+        let continue_turn = daemon_wide && interrupted_turn && {
+            let mut core = self.core.lock().unwrap();
+            let still_interrupted = !core.turn_cancelled && !core.turn_completed;
+            if still_interrupted {
+                core.steering.push_front(QueuedItem {
+                    priority: QueuePriority::Human,
+                    preview: None,
+                    message: crate::update_restore::UPDATE_RESTART_CONTINUATION_PROMPT.to_string(),
+                    custom_message: None,
+                    agent_message: None,
+                    queue_key: None,
+                    admission_id: None,
+                    images: Vec::new(),
+                    done: None,
+                    queue_visible: false,
+                    policy: TurnPolicy::Direct,
+                    forced_batch: false,
                 });
             }
+            still_interrupted
+        };
+        if continue_turn {
+            self.checkpoint_queue(QueueCheckpoint::Admitted {
+                operation: "prompt_accepted",
+            });
         }
         // The children close before the exit (an unreachable child must not
         // block the worker's own exit); their resume entries and scheduled
@@ -152,20 +150,14 @@ impl Worker {
         // the process exit, and no late report reclaims the pane.
         let reporter = self.herdr.lock().unwrap().clone();
         reporter.release().await;
-        // The shutdown verdict must be durable BEFORE the acknowledgement:
-        // the supervisor acts on this reply at once, and a verdict written on
-        // the exit path can be lost to the stop escalation — leaving a stale
-        // journal row to decide the next boot's revival. A user abort parks
-        // visible input until an explicit resume, so suspended lanes are not
-        // busy.
+        // The verdict is durable BEFORE the reply: the supervisor may escalate
+        // the stop as soon as the reply lands. Parked (suspended) lanes are not
+        // busy: they wait for an explicit resume.
         let busy = {
             let core = self.core.lock().unwrap();
             !core.queued_input_suspended
                 && (!core.steering.is_empty() || !core.follow_up.is_empty())
         };
-        // A failed write leaves the journal's previous row to decide the
-        // revival, exactly as main does — the close must still complete and
-        // the stop must still be acknowledged.
         let _ = self.record_recovery(busy, "shutdown");
         response_success(None, "shutdown", None)
     }
