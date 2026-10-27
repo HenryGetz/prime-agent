@@ -30,7 +30,7 @@ use std::sync::Arc;
 use std::time::{Duration, Instant};
 
 use pa_core::session_engine::rlm_host::{
-    RlmCreateSessionRequest, RlmFactoryTag, RlmSpawnRequest, RlmSubagentHost,
+    RlmCreateSessionRequest, RlmSpawnRequest, RlmSubagentHost,
 };
 use pa_daemon::rlm_children::{ParentIdentity, SupervisorChildSessions};
 use pa_daemon::supervisor_link::SupervisorLink;
@@ -256,6 +256,9 @@ async fn rlm_children_spawn_roster_collect_delete_end_to_end() {
         .spawn(spawn_request("worker-a", "ship the lane"))
         .await
         .expect("spawn");
+    // The registry sits outside a live worker turn here: release the
+    // detached task prompt at the boundary the worker would signal.
+    children.notify_turn_done();
     assert_eq!(handle.name, "worker-a");
     assert!(handle.rlm_child_id.starts_with("sub-"), "{handle:?}");
     assert_eq!(handle.model, "scripted/faux-1");
@@ -495,6 +498,7 @@ async fn rlm_children_spawn_roster_collect_delete_end_to_end() {
         .spawn(spawn_request("worker-a", "second shard"))
         .await
         .expect("respawn under the freed name");
+    children.notify_turn_done();
     let live = children
         .collect(vec!["worker-a".to_string()], 0)
         .await
@@ -577,64 +581,6 @@ async fn rlm_create_session_spawns_a_prompted_depth_zero_session() {
             .filter(|sessions| sessions.is_empty())
             .map(|_| ())
     });
-}
-
-/// Only a spawn from the parent's running turn waits for that turn to end: a plain spawn
-/// while the parent is idle, and a factory spawn while an unrelated parent turn runs on,
-/// both send their task prompt at once (no turn ever ends here).
-#[tokio::test]
-async fn idle_and_factory_spawns_prompt_without_waiting_for_a_turn_end() {
-    let dir = tempfile::TempDir::new().expect("temp dir");
-    let socket = dir.path().join("daemon.sock");
-    let agent_dir = dir.path().join("agent");
-    std::fs::create_dir_all(&agent_dir).expect("agent dir");
-    let _daemon = spawn_daemon(&socket, &agent_dir);
-    let script = write_script(dir.path(), "child answer");
-    let children = children(&socket, &agent_dir, &script, 0);
-
-    let idle = children
-        .spawn(spawn_request("idle-worker", "idle task"))
-        .await
-        .expect("spawn while idle");
-    children.notify_turn_started();
-    let factory = children
-        .spawn(RlmSpawnRequest {
-            factory: Some(RlmFactoryTag {
-                run_id: "run-1".to_string(),
-                spec_id: "spec-1".to_string(),
-                state_id: "grade".to_string(),
-            }),
-            ..spawn_request("factory-worker", "factory task")
-        })
-        .await
-        .expect("factory spawn mid-turn");
-
-    // Both settle far below the 60 s bound a held task prompt waits for a turn end.
-    let targets = vec![idle.rlm_child_id.clone(), factory.rlm_child_id.clone()];
-    let deadline = Instant::now() + Duration::from_secs(15);
-    let results = loop {
-        let results = children.collect(targets.clone(), 0).await.expect("collect");
-        if results.iter().all(|result| result.settled) {
-            break results;
-        }
-        assert!(
-            Instant::now() < deadline,
-            "the task prompts never ran: {results:?}"
-        );
-        tokio::time::sleep(Duration::from_millis(50)).await;
-    };
-    let outcomes: Vec<(String, &str, Option<String>)> = results
-        .into_iter()
-        .map(|result| (result.rlm_child_id, result.status, result.answer_preview))
-        .collect();
-    let answer = Some("child answer".to_string());
-    assert_eq!(
-        outcomes,
-        vec![
-            (idle.rlm_child_id, "done", answer.clone()),
-            (factory.rlm_child_id, "done", answer),
-        ]
-    );
 }
 
 #[tokio::test]

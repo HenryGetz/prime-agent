@@ -80,16 +80,6 @@ fn create_session_launch_env(model: &str) -> std::collections::BTreeMap<String, 
 impl RlmSubagentHost for SupervisorChildSessions {
     fn spawn(&self, request: RlmSpawnRequest) -> RlmHostFuture<RlmSpawnHandle> {
         let this = Arc::clone(&self.inner);
-        // An `rlm.spawn` cell runs inside the parent's turn: its task prompt
-        // holds until that turn ends, so the parent's continuation request
-        // reaches the provider first (see `wait_turn_done`). The turn is read
-        // at the request, so a turn that ends during admission releases it.
-        // A factory spawn comes from a background kernel task, not from the
-        // running turn, and an idle parent has no turn to wait for: both
-        // prompt at once.
-        let parent_turn = *this.parent_turn.borrow();
-        let hold_until_turn_done =
-            (parent_turn.in_flight && request.factory.is_none()).then_some(parent_turn.finished);
         Box::pin(async move {
             let identity = this.identity.lock().expect("identity lock").clone();
             if identity.rlm_depth >= identity.rlm_max_depth {
@@ -210,7 +200,8 @@ impl RlmSubagentHost for SupervisorChildSessions {
             .await;
             let (record, created, model) = admission?;
             // The task prompt runs detached from the spawn admission: the
-            // handle returns at registration.
+            // handle returns at registration and the child's first turn
+            // starts after the parent's continuation request is in flight.
             let watcher_this = Arc::clone(&this);
             let watcher_record = Arc::clone(&record);
             // TS `spawnMessage`: the kickoff rides prompt admission as
@@ -252,9 +243,18 @@ impl RlmSubagentHost for SupervisorChildSessions {
             let child_active_session_id = created.active_session_id.clone();
             let child_session_file = created.session_file.clone();
             let child_log_id = child_id.clone();
+            // Capture the current turn boundary before detaching: spawn
+            // admission happens mid-turn, so the parent's continuation
+            // request reaches the provider first (see `wait_turn_done`).
+            // A factory spawn comes from a background kernel task, not
+            // from the parent's running turn: its prompt goes out at once.
+            let turn_generation = request
+                .factory
+                .is_none()
+                .then(|| *this.turn_done.subscribe().borrow());
             tokio::spawn(async move {
-                if let Some(finished) = hold_until_turn_done {
-                    watcher_this.wait_turn_done(finished).await;
+                if let Some(generation) = turn_generation {
+                    watcher_this.wait_turn_done(generation).await;
                 }
                 // The parent closed before the prompt admitted: the
                 // child is closed with it, so the detached task prompt

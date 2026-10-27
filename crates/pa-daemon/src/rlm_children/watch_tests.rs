@@ -421,9 +421,7 @@ async fn sessions_with_fake_child_subagents(
     (sessions, kill_rx)
 }
 
-/// An `rlm.spawn` cell: the spawn lands inside a running parent turn.
 async fn spawn_child(sessions: &SupervisorChildSessions) -> RlmSpawnHandle {
-    sessions.notify_turn_started();
     sessions
         .spawn(RlmSpawnRequest {
             prompt: "f20 child task".to_string(),
@@ -798,6 +796,40 @@ async fn a_settled_child_without_a_reply_delivers_the_terminal_notice() {
     let extra =
         tokio::time::timeout(std::time::Duration::from_millis(300), follow_up_rx.recv()).await;
     assert!(extra.is_err(), "no second notice may arrive");
+}
+
+/// A factory spawn comes from a background kernel task, not from the
+/// parent's running turn: its task prompt goes out with no turn boundary
+/// and the run settles.
+#[tokio::test]
+async fn a_factory_spawn_runs_without_a_turn_boundary() {
+    let (follow_up_tx, mut follow_up_rx) = mpsc::unbounded_channel();
+    let (sessions, _kill_rx) =
+        sessions_with_fake_supervisor(follow_up_tx, 0, FakeKill::Success, FakeChild::Healthy).await;
+    sessions
+        .spawn(RlmSpawnRequest {
+            prompt: "f20 child task".to_string(),
+            name: Some("f20-worker".to_string()),
+            model: None,
+            thinking: None,
+            spawned_by_request_id: None,
+            factory: Some(pa_core::session_engine::rlm_host::RlmFactoryTag {
+                run_id: "run-1".to_string(),
+                spec_id: "spec-1".to_string(),
+                state_id: "grade".to_string(),
+            }),
+        })
+        .await
+        .expect("spawn must succeed against the fake supervisor");
+
+    let notice = tokio::time::timeout(Duration::from_secs(10), follow_up_rx.recv())
+        .await
+        .expect("a factory child must not wait for a parent turn boundary")
+        .expect("the follow_up channel stays open");
+    assert_eq!(
+        notice["customMessage"]["customType"],
+        "rlm_child_terminal_notice"
+    );
 }
 
 /// A `collect` that lands while the task prompt is still in flight reads

@@ -63,15 +63,6 @@ impl ChildCloseReason {
 /// before prompting anyway; a stuck turn must not orphan the child's task.
 const TURN_DONE_WAIT_SECS: u64 = 60;
 
-/// The parent worker's turn state as the spawn path reads it.
-#[derive(Debug, Clone, Copy, Default)]
-struct ParentTurn {
-    /// Parent turns finished so far.
-    finished: u64,
-    /// Whether a parent turn is running now.
-    in_flight: bool,
-}
-
 /// Grace between the first idle observation and the settle decision.
 const WATCH_SETTLE_GRACE_MS: u64 = 250;
 const CREATE_TIMEOUT_MS: u64 = 120_000;
@@ -404,9 +395,9 @@ struct SupervisorChildSessionsInner {
     /// Delete-receipt tombstones: a deleted child's identity stays behind
     /// the registry so `collect` answers a just-deleted selector.
     deleted_children: std::sync::Mutex<std::collections::HashMap<String, DeletedChild>>,
-    /// The parent worker's turn state: a spawn admitted mid-turn holds its task prompt until the
-    /// turn finishes (the continuation is in flight before the child's first model turn).
-    parent_turn: tokio::sync::watch::Sender<ParentTurn>,
+    /// Bumped once per completed parent turn: mid-turn prompt tasks wait for the next bump (the
+    /// continuation is in flight before the child's first model turn).
+    turn_done: tokio::sync::watch::Sender<u64>,
     /// The parent engine's child-settle hook (goal continuation resume).
     settle_hook: std::sync::Mutex<Option<Arc<dyn Fn() + Send + Sync>>>,
     /// Whether any tracked child run is unsettled (the `any_running`
@@ -473,7 +464,7 @@ impl SupervisorChildSessions {
                 retired_usage: std::sync::Mutex::new(Vec::new()),
                 pending_spawn_names: std::sync::Mutex::new(std::collections::HashSet::new()),
                 deleted_children: std::sync::Mutex::new(std::collections::HashMap::new()),
-                parent_turn: tokio::sync::watch::Sender::new(ParentTurn::default()),
+                turn_done: tokio::sync::watch::Sender::new(0),
                 settle_hook: std::sync::Mutex::new(None),
                 running: tokio::sync::watch::Sender::new(false),
                 settle_notify: tokio::sync::Notify::new(),
@@ -507,21 +498,10 @@ impl SupervisorChildSessions {
             .unwrap_or_else(std::sync::PoisonError::into_inner) = Some(sink);
     }
 
-    /// The worker started a parent turn: spawns admitted from now on hold
-    /// their task prompt until the turn ends.
-    pub fn notify_turn_started(&self) {
-        self.inner
-            .parent_turn
-            .send_modify(|turn| turn.in_flight = true);
-    }
-
     /// The worker saw the parent's turn end: release prompt tasks waiting
     /// on the boundary (called once per `EngineEvent::Done`).
     pub fn notify_turn_done(&self) {
-        self.inner.parent_turn.send_modify(|turn| {
-            turn.finished += 1;
-            turn.in_flight = false;
-        });
+        self.inner.turn_done.send_modify(|value| *value += 1);
     }
 
     /// Register the child-settle hook: fired once per settled child run
@@ -1055,14 +1035,14 @@ impl SupervisorChildSessionsInner {
         sink(row);
     }
 
-    /// Wait for the parent turn that spawned a task to complete (more
-    /// finished turns than captured at the spawn request). Bounded: a turn
-    /// that never settles releases the child anyway.
-    pub async fn wait_turn_done(&self, finished: u64) {
-        let mut receiver = self.parent_turn.subscribe();
+    /// Wait for the parent turn that spawned a task to complete (generation
+    /// strictly greater than the one captured at spawn admission). Bounded:
+    /// a turn that never settles releases the child anyway.
+    pub async fn wait_turn_done(&self, generation: u64) {
+        let mut receiver = self.turn_done.subscribe();
         let _ = tokio::time::timeout(
             std::time::Duration::from_secs(TURN_DONE_WAIT_SECS),
-            receiver.wait_for(|turn| turn.finished > finished),
+            receiver.wait_for(|value| *value > generation),
         )
         .await;
     }

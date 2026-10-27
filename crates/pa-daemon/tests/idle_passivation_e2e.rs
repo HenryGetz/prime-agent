@@ -301,6 +301,10 @@ async fn a_settled_child_passivates_stays_listable_and_revives_by_agent_message(
         .expect("spawn the child");
     assert_eq!(handle.name, "parked-kid");
 
+    // The detached task prompt admits at the parent's turn boundary: this harness
+    // owns the children registry, so the boundary bump is simulated here.
+    children.notify_turn_done();
+
     // The child settles done with a resident worker.
     let deadline = Instant::now() + Duration::from_secs(30);
     let child_active_session_id = loop {
@@ -613,6 +617,7 @@ async fn a_parent_rename_after_a_revival_and_second_passivation_reaches_the_chil
         })
         .await
         .expect("spawn the child");
+    children.notify_turn_done();
 
     // The child settles done with a resident worker.
     let deadline = Instant::now() + Duration::from_secs(30);
