@@ -143,8 +143,12 @@ impl RlmSubagentHost for SupervisorChildSessions {
                 assert_thinking_supported(&this.agent_dir, request.thinking.as_deref(), &model)?;
                 let thinking = request.thinking.as_deref().or(identity.thinking.as_deref());
                 let child_dir = this.child_session_dir(&child_id, &identity)?;
+                // Every spawned child — a decision child included —
+                // presents the subagent runtime identity; the decision
+                // flag's one durable home is the create command's
+                // `decisionChild` key.
                 let runtime_metadata = json!({
-                    "kind": if request.decision_child { "decision" } else { "subagent" },
+                    "kind": "subagent",
                     "rlmChildId": child_id,
                     "parentActiveSessionId": this.parent_active_session_id,
                     "rlmDepth": identity.rlm_depth + 1,
@@ -158,6 +162,7 @@ impl RlmSubagentHost for SupervisorChildSessions {
                         identity.rlm_depth + 1,
                         &model,
                         thinking,
+                        request.decision_child,
                         &cwd,
                         &child_dir,
                         request.spawned_by_request_id.as_deref(),
