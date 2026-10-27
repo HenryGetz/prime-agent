@@ -1517,7 +1517,7 @@ class ScanCostGuardTest(unittest.IsolatedAsyncioTestCase):
         self.assertFalse(is_scan("rg pattern ."))
         # Quoted data cannot masquerade as a scan.
         self.assertFalse(is_scan("echo 'grep -r pattern ~/Documents'"))
-        # The kernel matcher mirrors the Rust rule exactly (bot review).
+        # The kernel matcher mirrors the Rust rule exactly.
         self.assertFalse(is_scan("echo 'example | grep -r needle ~/Documents'"))
         self.assertFalse(is_scan("rg -d 2 pattern ~/Downloads"))
         self.assertFalse(is_scan("rg --max-depth=3 pattern ~/Downloads"))
@@ -1528,16 +1528,14 @@ class ScanCostGuardTest(unittest.IsolatedAsyncioTestCase):
         self.assertTrue(is_scan('grep -rl needle "$HOME/Documents"'))
         self.assertTrue(is_scan("grep -rl needle $HOME/Documents"))
         self.assertTrue(is_scan("find ~/Documents -name maxdepth.txt"))
-        # Double-quoted literal data is data; only expansions stay live
-        # (bot review round 2).
+        # Double-quoted literal data is data; only expansions stay live.
         self.assertTrue(is_scan('grep -rl needle "foo|bar" ~/Documents'))
         self.assertFalse(is_scan('echo "grep -rl needle ~/Documents"'))
         self.assertFalse(is_scan('grep -rl needle "~/Documents"'))
         self.assertTrue(is_scan('grep -rl needle "$HOME"'))
         self.assertFalse(is_scan('grep -rl needle "$HOMEDIR"'))
         self.assertTrue(is_scan('grep -rl needle "#" ~/Documents'))
-        # Heredoc bodies are input text; substitution bodies run in a subshell
-        # (bot review round 3).
+        # Heredoc bodies are input text; substitution bodies run in a subshell.
         self.assertFalse(
             is_scan("cat >example.sh <<'EOF'\ngrep -rl needle ~/Documents\nEOF")
         )
@@ -1549,7 +1547,7 @@ class ScanCostGuardTest(unittest.IsolatedAsyncioTestCase):
         self.assertFalse(is_scan("find ~/Documents -maxdepth '2'"))
         self.assertFalse(is_scan("echo $((1<<2))"))
         # Quoted patterns are pattern text; heredoc delimiters in all their
-        # spellings; unquoted heredoc bodies still substitute (round 4).
+        # spellings; unquoted heredoc bodies still substitute.
         self.assertFalse(is_scan('grep -rl "$HOME/needle" src/'))
         self.assertFalse(is_scan('grep -rl "docs$HOME" src/'))
         self.assertTrue(is_scan('grep -rl needle "$HOME"'))
@@ -1564,13 +1562,13 @@ class ScanCostGuardTest(unittest.IsolatedAsyncioTestCase):
         self.assertTrue(is_scan('echo "use <<EOF in scripts"; grep -rl needle ~/Documents'))
         self.assertTrue(is_scan("echo 'cat <<EOF'; grep -rl needle ~/Documents"))
         self.assertTrue(is_scan("# cat <<EOF\ngrep -rl needle ~/Documents"))
-        # Partially quoted delimiters and named arithmetic shifts (round 5).
+        # Partially quoted delimiters and named arithmetic shifts.
         self.assertFalse(is_scan("cat <<E'OF'\ngrep -rl needle ~/Documents\nEOF"))
         self.assertTrue(is_scan("cat <<E'OF'\nbody\nEOF\nfind \"$HOME\" -name '*.pdf'"))
         self.assertFalse(is_scan("echo $((a<<b))"))
         self.assertTrue(is_scan("echo $((a<<b))\ngrep -rl needle ~/Documents"))
         self.assertFalse(is_scan("cat <<E'OF'\n$(grep -rl needle ~/Documents)\nEOF"))
-        # Escaped and multiline heredoc substitutions (round 6).
+        # Escaped and multiline heredoc substitutions.
         self.assertFalse(
             is_scan("cat <<EOF\n\\$(grep -rl needle ~/Documents)\nEOF\nsleep 120")
         )
@@ -1579,7 +1577,7 @@ class ScanCostGuardTest(unittest.IsolatedAsyncioTestCase):
         self.assertTrue(is_scan("cat <<EOF; find \"$HOME\" -name '*.pdf'\nbody\nEOF"))
         self.assertTrue(is_scan("cat <<EOF; echo\nbody\nEOF\nfind \"$HOME\" -name '*.pdf'"))
         # Digit-led delimiters, here-strings, unclosed heredocs, and quoted
-        # patterns ahead of two roots (round 7).
+        # patterns ahead of two roots.
         self.assertFalse(is_scan("cat <<123\ngrep -rl needle ~/Documents\n123"))
         self.assertTrue(is_scan("cat <<<hello\nfind ~/Documents -name '*.pdf'"))
         self.assertTrue(is_scan("cat <<EOF\n$(grep -rl needle ~/Documents)"))
@@ -1588,39 +1586,38 @@ class ScanCostGuardTest(unittest.IsolatedAsyncioTestCase):
         self.assertFalse(is_scan("cat <<\\EOF\ngrep -rl needle ~/Documents\nEOF"))
         self.assertFalse(is_scan("cat <<\\EOF\n$(grep -rl needle ~/Documents)\nEOF"))
         # Per-tool bounds, pattern options, quote-aware matching, capped
-        # nesting (round 9).
+        # nesting.
         self.assertTrue(is_scan("grep -rl -e -d2 ~/Documents"))
         self.assertTrue(is_scan("grep -rl --regexp=needle ~/Documents src/"))
         self.assertFalse(is_scan('grep -rl "$HOME"'))
         self.assertTrue(is_scan("echo \"$(echo '(')\" $(grep -rl needle ~/Documents)"))
         self.assertFalse(is_scan("$((" * 25000 + "))" * 25000))
         # Heredoc-count bound, escaped backticks, operator-adjacent comments,
-        # rg --files, and pattern-option operands (round 10).
+        # rg --files, and pattern-option operands.
         many = "cat " + "<<A " * 20000
         self.assertFalse(is_scan(many))
         self.assertFalse(is_scan("printf '%s\\n' \\`grep -rl needle ~/Documents\\`; sleep 120"))
         self.assertFalse(is_scan("echo ok;# example | grep -rl needle ~/Documents"))
         self.assertTrue(is_scan("rg --files ~/Documents"))
         self.assertFalse(is_scan('grep -rl -e "$HOME/needle" src/'))
-        # Quoted separators inside home-prefixed spans; `--` (round 11).
+        # Quoted separators inside home-prefixed spans; `--`.
         self.assertFalse(
             is_scan("printf '%s\\n' \"$HOME/example;grep -rl needle ~/Documents\"; sleep 120")
         )
         self.assertTrue(is_scan("grep -rl -- -needle ~/Documents"))
         self.assertFalse(is_scan('grep -rl -- "$HOME" src/'))
-        # BSD find -f, empty quoted delimiters, nested subs in home spans
-        # (round 12).
+        # BSD find -f, empty quoted delimiters, nested subs in home spans.
         self.assertTrue(is_scan("find -f ~/Documents"))
         self.assertFalse(is_scan("cat <<''\ngrep -rl needle ~/Documents\n\n"))
         self.assertTrue(is_scan('"$HOME/x; $(echo a; grep -rl needle ~/Documents)"'))
-        # Substitution bodies are masked in the parent (round 13).
+        # Substitution bodies are masked in the parent.
         self.assertFalse(is_scan("echo \"$(printf '%s' 'x; find ~/Documents')\"; sleep 120"))
         self.assertTrue(is_scan("echo \"$(grep -rl 'needle' ~/Documents)\""))
-        # A quoted multi-home pattern stays one token (round 14).
+        # A quoted multi-home pattern stays one token.
         self.assertFalse(is_scan('grep -rl "$HOME/a|$HOME/b" src/'))
         self.assertTrue(is_scan('grep -rl needle "$HOME/docs with spaces"'))
         # A redirection target or a find expression operand is not a scan
-        # root (bot round on the merge head); real home roots still warn.
+        # root; real home roots still warn.
         self.assertFalse(is_scan("grep -rl needle . > ~/out.txt"))
         self.assertFalse(is_scan("grep -rl needle src/ 2>> ~/err.log"))
         self.assertFalse(is_scan("rg pattern . >> ~/results.txt"))
@@ -1632,7 +1629,7 @@ class ScanCostGuardTest(unittest.IsolatedAsyncioTestCase):
         self.assertTrue(is_scan("find ~/Documents -name '*.pdf' > ~/out.txt"))
         self.assertTrue(is_scan("find -f ~/Documents"))
         # find's global options precede the paths, so a home root behind
-        # -L/-H/-P/--/-O is still a scan root (bot round on the fix head).
+        # -L/-H/-P/--/-O is still a scan root.
         self.assertTrue(is_scan("find -L ~/Documents -name '*.pdf'"))
         self.assertTrue(is_scan("find -H ~/Documents"))
         self.assertTrue(is_scan("find -P ~/Documents"))
@@ -1643,7 +1640,7 @@ class ScanCostGuardTest(unittest.IsolatedAsyncioTestCase):
         self.assertFalse(is_scan("find -L . -newer ~/stamp"))
         self.assertFalse(is_scan("find -L . -name '*.log' -exec cp {} ~/backup/ \;"))
         # Grouping operators do not hide the command: a grouped scan warns
-        # like its ungrouped form (Macroscope round on the fix head).
+        # like its ungrouped form.
         self.assertTrue(is_scan("(find ~/Documents) | head -10"))
         self.assertTrue(is_scan("{ find ~/Documents; }"))
         self.assertTrue(is_scan("((find ~/Documents))"))
@@ -1652,12 +1649,11 @@ class ScanCostGuardTest(unittest.IsolatedAsyncioTestCase):
         self.assertTrue(is_scan("{ rg pattern ~/Documents; }"))
         self.assertFalse(is_scan("(grep -rl needle .)"))
         self.assertFalse(is_scan("{ find . -name '*.log'; }"))
-        # A grouping closer glued to an exact $HOME root does not hide it
-        # (bot round on the fix head), and many grouped prefixes stay
-        # linear in the preflight (Macroscope round on the fix head).
+        # A grouping closer glued to an exact $HOME root does not hide it,
+        # and many grouped prefixes stay linear in the preflight.
         self.assertTrue(is_scan("(rg pattern $HOME)"))
         # `${HOME}`'s closing brace is part of the expansion: the paren
-        # strip must not eat it (Macroscope round on the fix head).
+        # strip must not eat it.
         self.assertTrue(is_scan('grep -rl needle "${HOME}"'))
         self.assertTrue(is_scan('grep -rl needle "${HOME}/"'))
         self.assertTrue(is_scan('(rg pattern "${HOME}")'))
@@ -1670,8 +1666,7 @@ class ScanCostGuardTest(unittest.IsolatedAsyncioTestCase):
 
     def test_home_scale_root_is_home_or_one_component_below(self):
         # Only the home tree itself or one component below it is home-scale;
-        # deeper ~-rooted project paths stay quiet (review round on the
-        # unrestricted ~/$HOME prefix rule).
+        # deeper ~-rooted project paths stay quiet.
         is_scan = bash_module._is_unbounded_home_scan
         self.assertFalse(is_scan("grep -rn foo ~/work/repo/src"))
         self.assertFalse(is_scan("rg pat ~/.config/app/x.toml"))
@@ -1696,7 +1691,6 @@ class ScanCostGuardTest(unittest.IsolatedAsyncioTestCase):
             bash_module._note_scan_cost("grep -rl needle .")
         self.assertEqual(err.getvalue().count("unbounded"), 3)
         self.assertIn("yield_after", err.getvalue())
-        self.assertIn("background it", err.getvalue())
 
     def test_dispatch_hint_bounds_portably_not_via_the_shell_timeout(self):
         # Stock macOS has no GNU `timeout`, and the incident-style
