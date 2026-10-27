@@ -78,8 +78,9 @@ Every contributor (human or agent) must read this before working on this repo.
 - Bug fixes need a regression test that fails without the fix.
 - Keep test code in proportion to the change: one discriminating test per behavior change, not
   several that pin the same behavior or re-check behavior the PR does not change.
-- A new test file must match a runner's discovery pattern or be listed in a workflow or the
-  Makefile; otherwise CI never runs it.
+- A new test file must be run by something: a runner, glob, loop, or run-time path in
+  `.github/workflows/` or the Makefile. A name missing from those files can still be reached by a
+  glob or a built path, so check those before calling a test unrun.
 - Verifiers over self-assessment: tmux user-level tests, differential tests against the TS binary
   on PATH, golden corpora replayed against real captured data. No lane merges without its verifier
   passing, rerun by the reviewer where feasible.
