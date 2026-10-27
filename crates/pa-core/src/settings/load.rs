@@ -47,6 +47,7 @@ const KNOWN_FIELDS: &[&str] = &[
     "enableSkillCommands",
     "bundledSkills",
     "enableBuiltinSkills",
+    "skillsInPrompt",
     "terminal",
     "images",
     "enabledModels",

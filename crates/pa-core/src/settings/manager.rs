@@ -648,6 +648,12 @@ impl SettingsManager {
         self.merged.recent_models.clone().unwrap_or_default()
     }
 
+    /// Whether the system prompt lists the available skills (default true).
+    #[must_use]
+    pub fn get_skills_in_prompt(&self) -> bool {
+        self.merged.skills_in_prompt.unwrap_or(true)
+    }
+
     /// The per-cell watchdog budget for user `python_repl` cells, in
     /// milliseconds (`0` disables; the default is 60s). Daemonless
     /// sessions never arm the watchdog.

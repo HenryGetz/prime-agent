@@ -99,6 +99,7 @@ fn assemble_breakdown(
         .collect::<std::collections::HashMap<String, pa_core::mcp::McpServerConfig>>();
     let (skill_overrides, generic_servers, _manager) =
         pa_core::mcp::McpManager::prompt_gating(user_servers, &agent_dir);
+    let skills_in_prompt = settings.get_skills_in_prompt();
     let resources = load_resources(ResourceLoaderOptions {
         extra_builtin_skill_overrides: skill_overrides,
         system_prompt: None,
@@ -115,7 +116,11 @@ fn assemble_breakdown(
                 .iter()
                 .map(|file| (file.path.display().to_string(), file.content.clone()))
                 .collect(),
-            skills: resources.skills.clone(),
+            skills: if skills_in_prompt {
+                resources.skills.clone()
+            } else {
+                Vec::new()
+            },
             // The shipped model-tool surface: `python_repl` only; bash/edit are kernel-resident
             // programmatic tools.
             selected_tools: Some(vec![pa_types::ai::PYTHON_TOOL_NAME]),
@@ -243,5 +248,21 @@ mod tests {
                 segment.name
             );
         }
+    }
+
+    #[test]
+    fn skills_in_prompt_false_leaves_the_inventory_out() {
+        let dir = tempfile::tempdir().unwrap();
+        let (listed, _) = assemble_breakdown(dir.path(), Some("mock/mock-1")).unwrap();
+        assert!(listed.assembled.contains("<available_skills>"));
+        let settings = dir.path().join(pa_core::settings::CONFIG_DIR_NAME);
+        std::fs::create_dir_all(&settings).unwrap();
+        std::fs::write(
+            settings.join("settings.json"),
+            r#"{"skillsInPrompt": false}"#,
+        )
+        .unwrap();
+        let (unlisted, _) = assemble_breakdown(dir.path(), Some("mock/mock-1")).unwrap();
+        assert!(!unlisted.assembled.contains("<available_skills>"));
     }
 }
