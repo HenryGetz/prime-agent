@@ -20,8 +20,7 @@ pub use runtime_code::{
     PYTHON_SKILL_IMPORT_ERROR_REPORT_MARKER,
 };
 use venv::{
-    bootstrap_venv, ensure_uv, expand_home, has_prime_agent_runtime,
-    missing_python_skill_import_labels, missing_rlm_extra_import_labels, normalize_python_skills,
+    bootstrap_venv, ensure_uv, expand_home, normalize_python_skills, probe_python,
     resolve_writable_kernel_venv_dir, sync_python_skills, BootstrapPythonSkill,
 };
 pub use venv::{invalidate_runtime_probe_cache, kernel_venv_dir, kernel_venv_python};
@@ -181,30 +180,15 @@ async fn ensure_kernel_python_uncached(
         if !override_python.is_empty() {
             let python = expand_home(&override_python);
             let python_str = python.to_string_lossy().to_string();
-            let mut missing = Vec::new();
-            if !has_prime_agent_runtime(&python_str) {
-                missing.push(
-                    "a current prime-agent-runtime with callable rlm.spawn, rlm.create_session, rlm.host_request, rlm.progress_note, rlm.rename, rlm._set_completion_notices_wired, and explicit harness CRUD methods".to_string(),
-                );
-            }
-            if missing.is_empty() {
-                let missing_extras = missing_rlm_extra_import_labels(&python_str);
-                if !missing_extras.is_empty() {
-                    missing.push(format!(
-                        "default Python packages ({})",
-                        missing_extras.join(", ")
-                    ));
-                }
-            }
-            if missing.is_empty() && !options.python_skills.is_empty() {
-                let missing_skills =
-                    missing_python_skill_import_labels(&python_str, &options.python_skills);
-                if !missing_skills.is_empty() {
-                    options.report(&format!(
-                        "Warning: Python skills unavailable in PRIME_AGENT_KERNEL_PYTHON and will be disabled: {}",
-                        missing_skills.join(", ")
-                    ));
-                }
+            let skills = options.python_skills.clone();
+            let (missing, missing_skills) =
+                tokio::task::spawn_blocking(move || check_override_python(&python_str, &skills))
+                    .await?;
+            if !missing_skills.is_empty() {
+                options.report(&format!(
+                    "Warning: Python skills unavailable in PRIME_AGENT_KERNEL_PYTHON and will be disabled: {}",
+                    missing_skills.join(", ")
+                ));
             }
             if missing.is_empty() {
                 return Ok(python);
@@ -229,27 +213,47 @@ async fn ensure_kernel_venv(
     let python = kernel_venv_python(&venv);
     let python_str = python.to_string_lossy().to_string();
     // Validate the local source before probing any installed runtime or
-    // removing an existing venv. Missing payloads must fail closed.
-    let source_dir =
-        venv::require_runtime_source_dir().map_err(|error| format_bootstrap_failure(&error))?;
-    let runtime_identity =
-        venv::hash_runtime_source(&source_dir).map_err(|error| format_bootstrap_failure(&error))?;
-    if kernel_ready(&python_str, &venv, &runtime_identity, python_skills) {
+    // removing an existing venv. Missing payloads must fail closed. The source hash and the
+    // readiness checks read files and may start the interpreter, so they run off the async
+    // workers.
+    let (source_dir, runtime_identity) = tokio::task::spawn_blocking(|| {
+        let source_dir = venv::require_runtime_source_dir()?;
+        let runtime_identity = venv::hash_runtime_source(&source_dir)?;
+        anyhow::Ok((source_dir, runtime_identity))
+    })
+    .await?
+    .map_err(|error| format_bootstrap_failure(&error))?;
+    let readiness = |base_only: bool| {
+        let (python, venv, identity, skills) = (
+            python_str.clone(),
+            venv.clone(),
+            runtime_identity.clone(),
+            python_skills.to_vec(),
+        );
+        tokio::task::spawn_blocking(move || {
+            if base_only {
+                kernel_base_ready(&python, &venv, &identity)
+            } else {
+                kernel_ready(&python, &venv, &identity, &skills)
+            }
+        })
+    };
+    if readiness(false).await? {
         return Ok(python);
     }
 
     let release_lock = match acquire_bootstrap_lock(&venv).await {
         Ok(release_lock) => release_lock,
         Err(error) if dir_lock::lock_creation_denied(&error) => {
-            return unwritable_venv(options, &python, &venv, &runtime_identity, &error);
+            return unwritable_venv(options, &python, &venv, &runtime_identity, &error).await;
         }
         Err(error) => return Err(error),
     };
     let result = async {
-        if kernel_ready(&python_str, &venv, &runtime_identity, python_skills) {
+        if readiness(false).await? {
             return Ok(python);
         }
-        if kernel_base_ready(&python_str, &venv, &runtime_identity) {
+        if readiness(true).await? {
             let uv = ensure_uv()?;
             sync_python_skills(
                 &uv,
@@ -290,15 +294,35 @@ async fn ensure_kernel_venv(
 /// created: a base-ready venv degrades the way a `PRIME_AGENT_KERNEL_PYTHON` override
 /// does (uncovered skills disabled with a warning, nothing installed), and anything
 /// less is a setup error naming the venv and both env overrides.
-fn unwritable_venv(
+async fn unwritable_venv(
     options: &EnsureKernelPythonOptions,
     python: &std::path::Path,
     venv: &std::path::Path,
     runtime_identity: &str,
     lock_error: &anyhow::Error,
 ) -> anyhow::Result<PathBuf> {
-    let python_str = python.to_string_lossy().to_string();
-    if !kernel_base_ready(&python_str, venv, runtime_identity) {
+    let (python_str, venv_dir, identity, skills) = (
+        python.to_string_lossy().to_string(),
+        venv.to_path_buf(),
+        runtime_identity.to_string(),
+        options.python_skills.clone(),
+    );
+    let checked = tokio::task::spawn_blocking(move || {
+        if !kernel_base_ready(&python_str, &venv_dir, &identity) {
+            return None;
+        }
+        if skills.is_empty() {
+            return Some(Vec::new());
+        }
+        let imports: Vec<&str> = skills
+            .iter()
+            .map(|skill| skill.import_name.as_str())
+            .collect();
+        let probe = probe_python(&python_str, false, &imports);
+        Some(missing_skill_labels(&skills, &probe.missing_imports))
+    })
+    .await?;
+    let Some(missing) = checked else {
         return Err(anyhow!(
             "cannot set up the Python kernel runtime: the kernel venv at {} is not writable by \
              this user and does not hold a current runtime. Set PRIME_AGENT_KERNEL_VENV to a \
@@ -306,8 +330,7 @@ fn unwritable_venv(
              prime-agent-runtime and the default Python packages installed. ({lock_error:#})",
             venv.display()
         ));
-    }
-    let missing = missing_python_skill_import_labels(&python_str, &options.python_skills);
+    };
     if !missing.is_empty() {
         options.report(&format!(
             "Warning: Python skills unavailable in {} and will be disabled: {}",
@@ -316,6 +339,56 @@ fn unwritable_venv(
         ));
     }
     Ok(python.to_path_buf())
+}
+
+/// Check a caller-owned `PRIME_AGENT_KERNEL_PYTHON` with one interpreter start: what it lacks
+/// (the runtime, then the default packages), and which Python skills it can't import. Skills are
+/// reported only for an otherwise usable interpreter.
+fn check_override_python(
+    python: &str,
+    python_skills: &[KernelPythonSkill],
+) -> (Vec<String>, Vec<String>) {
+    let imports: Vec<&str> = DEFAULT_RLM_EXTRA_PACKAGES
+        .iter()
+        .map(|(_, import, _)| *import)
+        .chain(python_skills.iter().map(|skill| skill.import_name.as_str()))
+        .collect();
+    let probe = probe_python(python, true, &imports);
+    if !probe.runtime_ready {
+        return (vec![
+            "a current prime-agent-runtime with callable rlm.spawn, rlm.create_session, rlm.host_request, rlm.progress_note, rlm.rename, rlm._set_completion_notices_wired, and explicit harness CRUD methods".to_string(),
+        ], Vec::new());
+    }
+    let missing_extras: Vec<&str> = DEFAULT_RLM_EXTRA_PACKAGES
+        .iter()
+        .filter(|(_, import, _)| probe.missing_imports.iter().any(|name| name == import))
+        .map(|(_, _, label)| *label)
+        .collect();
+    if !missing_extras.is_empty() {
+        return (
+            vec![format!(
+                "default Python packages ({})",
+                missing_extras.join(", ")
+            )],
+            Vec::new(),
+        );
+    }
+    (
+        Vec::new(),
+        missing_skill_labels(python_skills, &probe.missing_imports),
+    )
+}
+
+/// The skills among `python_skills` whose import is in `missing_imports`, as `name (import)`.
+fn missing_skill_labels(
+    python_skills: &[KernelPythonSkill],
+    missing_imports: &[String],
+) -> Vec<String> {
+    python_skills
+        .iter()
+        .filter(|skill| missing_imports.contains(&skill.import_name))
+        .map(|skill| format!("{} ({})", skill.name, skill.import_name))
+        .collect()
 }
 
 #[cfg(test)]

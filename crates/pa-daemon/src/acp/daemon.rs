@@ -181,7 +181,8 @@ impl DaemonLink {
     /// Send one command envelope with no fixed cap: the response or the
     /// link close ends the wait (turn-long commands — declared
     /// divergence, TS caps them at 24 h; the link-close signal is the
-    /// liveness bound here, not a timer).
+    /// liveness bound here, not a timer — and commands the supervisor
+    /// bounds itself).
     async fn request_until_close(&self, command: DaemonCommand) -> anyhow::Result<DaemonResponse> {
         self.exchange(command, None).await
     }
@@ -573,7 +574,12 @@ async fn bind_daemon_session(
             ..
         }
     );
-    let created = link.request(create).await?;
+    // The supervisor bounds the create itself: the worker-connect deadline (whose failure carries
+    // the worker's stderr tail), the worker exiting, and a get_state that falls back to the create
+    // summary; a live worker that never answers the create is left to the 24 h worker-request
+    // budget. A 30 s client timer started first and always pre-empted those errors, so the create
+    // waits for the supervisor's answer or the link closing.
+    let created = link.request_until_close(create).await?;
     if !created.success {
         anyhow::bail!(created.error.unwrap_or_else(|| "unknown error".to_string()));
     }
