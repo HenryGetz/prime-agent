@@ -1138,7 +1138,19 @@ fn segments_contain_unbounded_scan(masked: &str) -> bool {
         }
         let rest: &[&str] = match *first {
             "grep" | "egrep" | "fgrep" => {
+                // Recursive classification is option tokens only: a pattern
+                // option's operand (`-e -error`: the pattern) is not an
+                // option, so it must not count as the `-r` flag.
+                let mut skip_next = false;
                 let recursive = rest.iter().any(|t| {
+                    if skip_next {
+                        skip_next = false; // the operand of a pattern option
+                        return false;
+                    }
+                    if *t == "-e" || *t == "--regexp" || *t == "-f" || *t == "--file" {
+                        skip_next = true;
+                        return false;
+                    }
                     t.starts_with("--recursive")
                         || (t.starts_with('-')
                             && !t.starts_with("--")
@@ -2038,6 +2050,33 @@ mod tests {
         ));
         assert!(is_unbounded_home_scan("grep -rn foo ~/Documents/", None));
         assert!(is_unbounded_home_scan("find ~/proj -name '*.py'", None));
+    }
+
+    /// A pattern option's operand is pattern text, not an option token, so
+    /// it must not classify the grep family as recursive: `-e -error`
+    /// supplies the pattern, it is not the `-r` flag.
+    #[test]
+    fn pattern_option_operands_do_not_classify_as_recursive() {
+        assert!(!is_unbounded_home_scan("grep -e -error ~/Documents", None));
+        assert!(!is_unbounded_home_scan("grep -e -r ~/Documents", None));
+        assert!(!is_unbounded_home_scan(
+            "grep --regexp -r ~/Documents",
+            None
+        ));
+        assert!(!is_unbounded_home_scan("grep -f -rfile ~/Documents", None));
+        assert!(!is_unbounded_home_scan(
+            "grep -e -error -e foo ~/Documents",
+            None
+        ));
+        // A real recursive flag still classifies, operand or not.
+        assert!(is_unbounded_home_scan(
+            "grep -rl -e -error ~/Documents",
+            None
+        ));
+        assert!(is_unbounded_home_scan(
+            "grep -R -e -error ~/Documents",
+            None
+        ));
     }
 
     #[test]

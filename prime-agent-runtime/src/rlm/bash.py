@@ -531,11 +531,24 @@ def _segments_contain_unbounded_scan(masked: str) -> bool:
         if not tokens or tokens[0] == "timeout":
             continue
         if tokens[0] in ("grep", "egrep", "fgrep"):
-            if not any(
-                t.startswith("--recursive")
-                or (t.startswith("-") and not t.startswith("--") and "r" in t.lower())
-                for t in tokens[1:]
-            ):
+            # Recursive classification is option tokens only: a pattern
+            # option's operand (`-e -error`: the pattern) is not an option,
+            # so it must not count as the `-r` flag.
+            recursive = False
+            skip_next = False
+            for t in tokens[1:]:
+                if skip_next:
+                    skip_next = False  # the operand of a pattern option
+                    continue
+                if t in ("-e", "--regexp", "-f", "--file"):
+                    skip_next = True
+                    continue
+                if t.startswith("--recursive") or (
+                    t.startswith("-") and not t.startswith("--") and "r" in t.lower()
+                ):
+                    recursive = True
+                    break
+            if not recursive:
                 continue
         elif tokens[0] not in ("rg", "find"):
             continue
