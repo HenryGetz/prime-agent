@@ -713,6 +713,9 @@ fn segments_contain_unbounded_scan(masked: &str) -> bool {
         // not roots. Count bounds (`-m`, `--max-count`) take their numeric
         // operand the same way, so `grep -rl -m 1 "$HOME" src/` skips `1`,
         // takes "$HOME" as the pattern, and leaves src/ the only root.
+        // rg's glob filters (`-g`, `--glob`) take their glob operand the
+        // same way, so `rg -g '*.rs' "$HOME/needle" src/` skips the glob
+        // and takes "$HOME/needle" as the pattern.
         // rg's `--files` listing mode takes no pattern at all, so
         // every positional is a path.
         // Pattern options belong to grep-family and rg only: BSD find's
@@ -749,7 +752,11 @@ fn segments_contain_unbounded_scan(masked: &str) -> bool {
             }
             if !seen_ddash
                 && takes_pattern_options
-                && (*t == "-e" || *t == "--regexp" || *t == "-f" || *t == "--file")
+                && (*t == "-e"
+                    || *t == "--regexp"
+                    || *t == "-f"
+                    || *t == "--file"
+                    || (*first == "rg" && (*t == "-g" || *t == "--glob")))
             {
                 skip_next = true;
                 continue;
@@ -1613,6 +1620,40 @@ mod tests {
         ));
         assert!(!is_unbounded_home_scan(
             "grep -rl -m 1 -- \"$HOME\" src/",
+            None
+        ));
+    }
+
+    /// Regression pin for the review round on glob filters: rg's `-g`/`--glob`
+    /// take a glob operand before the pattern, so the operand is consumed and
+    /// never displaces the pattern onto "$HOME" as a scan root.
+    #[test]
+    fn glob_operand_does_not_displace_the_pattern() {
+        assert!(!is_unbounded_home_scan(
+            "rg -g '*.rs' \"$HOME/needle\" src/",
+            None
+        ));
+        assert!(!is_unbounded_home_scan(
+            "rg --glob '*.rs' \"$HOME/needle\" src/",
+            None
+        ));
+        // Self-contained spellings never displaced the pattern.
+        assert!(!is_unbounded_home_scan(
+            "rg -g'*.rs' \"$HOME/needle\" src/",
+            None
+        ));
+        assert!(!is_unbounded_home_scan(
+            "rg --glob='*.rs' \"$HOME/needle\" src/",
+            None
+        ));
+        // The glob never hides a real home root nor ends option parsing.
+        assert!(is_unbounded_home_scan("rg -g '*.rs' needle $HOME", None));
+        assert!(is_unbounded_home_scan(
+            "rg -g '*.rs' needle \"$HOME/Documents\"",
+            None
+        ));
+        assert!(!is_unbounded_home_scan(
+            "rg -g '*.rs' -- \"$HOME/needle\" src/",
             None
         ));
     }

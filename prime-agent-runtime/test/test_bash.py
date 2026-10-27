@@ -1709,6 +1709,21 @@ class ScanCostGuardTest(unittest.IsolatedAsyncioTestCase):
         self.assertTrue(is_scan('grep -rl -m 1 needle "$HOME/Documents"'))
         self.assertFalse(is_scan('grep -rl -m 1 -- "$HOME" src/'))
 
+    def test_glob_operand_does_not_displace_the_pattern(self):
+        # A glob filter takes its operand before the pattern: the operand is
+        # consumed, so the quoted "$HOME/needle" stays pattern text and src/
+        # is the only root — no spurious home-scan warning.
+        is_scan = bash_module._is_unbounded_home_scan
+        self.assertFalse(is_scan("rg -g '*.rs' \"$HOME/needle\" src/"))
+        self.assertFalse(is_scan("rg --glob '*.rs' \"$HOME/needle\" src/"))
+        # Self-contained spellings never displaced the pattern.
+        self.assertFalse(is_scan("rg -g'*.rs' \"$HOME/needle\" src/"))
+        self.assertFalse(is_scan("rg --glob='*.rs' \"$HOME/needle\" src/"))
+        # The glob never hides a real home root nor ends option parsing.
+        self.assertTrue(is_scan("rg -g '*.rs' needle $HOME"))
+        self.assertTrue(is_scan("rg -g '*.rs' needle \"$HOME/Documents\""))
+        self.assertFalse(is_scan("rg -g '*.rs' -- \"$HOME/needle\" src/"))
+
     def test_home_span_separators_do_not_split_scan_roots(self):
         # Kernel parity for the Rust pin: a quoted separator inside a
         # home-prefixed span is data, so a real scan keeps its root and
