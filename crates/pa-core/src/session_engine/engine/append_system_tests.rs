@@ -177,3 +177,45 @@ async fn append_system_preserves_default_system_layers() {
     })
     .await;
 }
+
+#[tokio::test]
+async fn skills_in_prompt_false_unlists_skills_but_keeps_them_loaded() {
+    for (setting, listed) in [(None, true), (Some(false), false)] {
+        let tmp = tempfile::tempdir().unwrap();
+        let cwd = tmp.path().join("project");
+        let agent_dir = tmp.path().join("agent");
+        std::fs::create_dir_all(&cwd).unwrap();
+        std::fs::create_dir_all(&agent_dir).unwrap();
+        std::fs::write(agent_dir.join("SYSTEM.md"), "CUSTOM_SYSTEM_SENTINEL").unwrap();
+        if let Some(value) = setting {
+            let settings = serde_json::json!({ "skillsInPrompt": value }).to_string();
+            std::fs::write(agent_dir.join("settings.json"), settings).unwrap();
+        }
+        let model = Model {
+            id: "m".into(),
+            name: "m".into(),
+            api: "test".into(),
+            provider: "test".into(),
+            base_url: "http://localhost".into(),
+            reasoning: false,
+            cost: pa_agent::types::UsageCost::default(),
+            context_window: 100_000,
+            max_tokens: 100,
+            max_tokens_explicit: false,
+        };
+        let provider = Arc::new(ScriptedProvider::new(model.clone()));
+        let engine = create_session(SessionEngineConfig {
+            cwd,
+            agent_dir,
+            model: Some(model),
+            stream_fn: Some(provider.stream_fn()),
+            daemonless: true,
+            prewarm_ipython_kernel: Some(false),
+            ..Default::default()
+        })
+        .await
+        .unwrap();
+        assert_eq!(engine.system_prompt.contains("<available_skills>"), listed);
+        assert!(engine.skills.iter().any(|skill| skill.name == "compact"));
+    }
+}

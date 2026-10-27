@@ -273,6 +273,7 @@ pub async fn create_session(mut config: SessionEngineConfig) -> anyhow::Result<S
     // Captured before `settings` moves into the resource loader: the
     // per-cell watchdog budget (default 60s, `0` disables).
     let python_cell_timeout_ms = settings.get_python_cell_timeout_ms();
+    let skills_in_prompt = settings.get_skills_in_prompt();
     let (mcp_skill_overrides, mcp_generic_servers, built_manager) =
         mcp_gating(&settings, config.agent_dir.clone()).await?;
     let mcp_manager = config
@@ -584,7 +585,11 @@ pub async fn create_session(mut config: SessionEngineConfig) -> anyhow::Result<S
                 .iter()
                 .map(|file| (file.path.display().to_string(), file.content.clone()))
                 .collect(),
-            skills: model_visible_skills.clone(),
+            skills: if skills_in_prompt {
+                model_visible_skills.clone()
+            } else {
+                Vec::new()
+            },
             selected_tools: Some(
                 active_tool_names
                     .iter()

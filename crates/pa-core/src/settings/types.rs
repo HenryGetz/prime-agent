@@ -320,6 +320,10 @@ pub struct Settings {
     pub enable_skill_commands: Option<bool>,
     pub bundled_skills: Option<BundledSkillsSettings>,
     pub enable_builtin_skills: Option<bool>,
+    /// Whether the system prompt lists the available skills; unset lists them. Skills stay
+    /// loaded and their Python imports prepared either way. Meant for a custom system prompt
+    /// that documents skills elsewhere: the default layers say the list follows.
+    pub skills_in_prompt: Option<bool>,
     pub terminal: Option<TerminalSettings>,
     pub images: Option<ImageSettings>,
     pub enabled_models: Option<Vec<String>>,

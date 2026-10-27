@@ -1,0 +1,1 @@
+- New `skillsInPrompt` setting: `false` leaves the available-skills list out of the system prompt while skills stay loaded and their Python imports prepared, for custom system prompts that document skills elsewhere.
