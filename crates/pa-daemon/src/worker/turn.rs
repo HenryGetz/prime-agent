@@ -492,6 +492,11 @@ impl TurnRunner {
                 if agent_end && !more_queued {
                     engine.clear_progress_note();
                 }
+                // The turn boundary releases RLM child prompt tasks waiting on
+                // it, also when the abort gate below swallows the frame.
+                if matches!(event, EngineEvent::Done(_) | EngineEvent::DoneAborted) {
+                    engine.on_turn_done();
+                }
                 // Durable model cleanup is independent of visual abort-row
                 // suppression and emits no client-facing frame.
                 if core.abort_requested && !matches!(&event, EngineEvent::ModelChange(_)) {
@@ -684,9 +689,6 @@ impl TurnRunner {
                 }
                 let done_result = match &event {
                     EngineEvent::Done(result) => {
-                        // The turn boundary releases RLM child prompt
-                        // tasks waiting on it.
-                        engine.on_turn_done();
                         pa_core::session_engine::compaction_trace::trace(
                             "turn.done_emitted",
                             &serde_json::json!({
@@ -700,10 +702,7 @@ impl TurnRunner {
                     }
                     // The aborted settle carries its classification
                     // structurally, not through the error text.
-                    EngineEvent::DoneAborted => {
-                        engine.on_turn_done();
-                        Some(TurnSettle::Aborted)
-                    }
+                    EngineEvent::DoneAborted => Some(TurnSettle::Aborted),
                     _ => None,
                 };
                 // One event may map to several wire frames (a custom row
