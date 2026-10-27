@@ -634,7 +634,7 @@ async fn run_bash(run: RunBash<'_>) -> BashEnd {
             let mut buffer = [0u8; 8192];
             // A read can end inside a multi-byte character; the decoder holds its leading
             // bytes for the next read (TS `TextDecoder`, `stream: true`).
-            let mut decoder = pa_core::StreamingUtf8::default();
+            let mut decoder = crate::streaming_utf8::StreamingUtf8::default();
             loop {
                 match reader.read(&mut buffer).await {
                     Ok(0) | Err(_) => break,
