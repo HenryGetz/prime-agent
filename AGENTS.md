@@ -64,6 +64,11 @@ Every contributor (human or agent) must read this before working on this repo.
   A new dependency is an architectural change: state in the PR why the existing crates cannot
   host the functionality, and `make deny` must stay clean for it.
 - If a change starts forcing edits across many crate internals, stop and fix the boundary instead.
+- Do not commit scripts or tools that no workflow, Makefile target, or other code runs (one-off
+  review, parity, or reproduction scripts). Put their results in the PR body as a one-off run with
+  its command and result, not as coverage.
+- Do not commit evidence logs, reports, generated outputs, or local venvs and caches. The catalog
+  data files under Merge gates are the exception.
 
 ## Tests
 
@@ -71,6 +76,10 @@ Every contributor (human or agent) must read this before working on this repo.
 - Do not add tests for statically defined values.
 - Do not add negative tests for logic that was removed.
 - Bug fixes need a regression test that fails without the fix.
+- Keep test code in proportion to the change: one discriminating test per behavior change, not
+  several that pin the same behavior or re-check behavior the PR does not change.
+- A new test file must match a runner's discovery pattern or be listed in a workflow or the
+  Makefile; otherwise CI never runs it.
 - Verifiers over self-assessment: tmux user-level tests, differential tests against the TS binary
   on PATH, golden corpora replayed against real captured data. No lane merges without its verifier
   passing, rerun by the reviewer where feasible.
