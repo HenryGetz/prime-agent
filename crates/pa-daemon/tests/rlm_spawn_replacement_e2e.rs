@@ -283,6 +283,9 @@ async fn concurrent_spawns_prompt_exactly_once_across_a_worker_replacement() {
     let script = write_script(dir.path(), "replacement kid answer");
     let children = children(&socket, &agent_dir, &script);
 
+    // The spawns land inside a running parent turn: each task prompt holds
+    // until the turn ends.
+    children.notify_turn_started();
     let (a, b, c, d) = tokio::join!(
         children.spawn(spawn_request(
             "kid-a",

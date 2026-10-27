@@ -421,7 +421,9 @@ async fn sessions_with_fake_child_subagents(
     (sessions, kill_rx)
 }
 
+/// An `rlm.spawn` cell: the spawn lands inside a running parent turn.
 async fn spawn_child(sessions: &SupervisorChildSessions) -> RlmSpawnHandle {
+    sessions.notify_turn_started();
     sessions
         .spawn(RlmSpawnRequest {
             prompt: "f20 child task".to_string(),

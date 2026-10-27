@@ -1,0 +1,1 @@
+- Factory children now get their task prompt as soon as they are spawned, instead of up to 60 s later. A subagent spawned while the parent is idle also starts at once; an `rlm.spawn` from a cell still sends its task prompt after the parent's turn ends.

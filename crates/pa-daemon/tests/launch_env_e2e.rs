@@ -581,11 +581,7 @@ async fn an_rlm_spawn_child_inherits_the_parent_worker_env() {
         !environ.contains("RLM_DEPTH="),
         "the spawned child inherited the supervisor's RLM_DEPTH:\n{environ}"
     );
-    // The registry sits outside a live worker turn here: release the
-    // detached task prompt at the boundary the worker would signal (the
-    // existing rlm-children e2e's contract), wait for the settle, and
-    // clean the child up.
-    children.notify_turn_done();
+    // Wait for the settle and clean the child up.
     let _ = children
         .collect(vec![handle.rlm_child_id.clone()], 5_000)
         .await;

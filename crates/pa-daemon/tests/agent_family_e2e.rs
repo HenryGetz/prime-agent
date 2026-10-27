@@ -430,9 +430,6 @@ async fn parent_child_agent_message_round_trip_end_to_end() {
     assert_eq!(handle.name, "kid");
     let child_id = handle.rlm_child_id.clone();
 
-    // This harness owns its own children registry, so the turn boundary the real
-    // parent's turn would bump is simulated here; without it the spawn prompt never fires.
-    children.notify_turn_done();
     // Wait for the spawn turn to settle before delivering: the first delivered message
     // would otherwise consume the spawn response and lose its reply cell.
     let settle_deadline = Instant::now() + Duration::from_secs(60);
@@ -758,7 +755,6 @@ async fn family_edges_never_cross_families_end_to_end() {
             .await
             .expect("spawn the child");
         assert_eq!(handle.name, kid_name);
-        children.notify_turn_done();
         // The spawn turn settles once the child goes idle with an answer (bounded).
         let settle_deadline = Instant::now() + Duration::from_secs(60);
         loop {
@@ -899,7 +895,6 @@ async fn family_edges_never_cross_families_end_to_end() {
         .await
         .expect("spawn the grandchild");
     assert_eq!(grandkid_handle.name, "grandkid");
-    kid_children.notify_turn_done();
     let grandkid_settle_deadline = Instant::now() + Duration::from_secs(60);
     let grandkid_active = loop {
         let roster = kid_children.list_subagents().await.expect("roster");
@@ -1218,7 +1213,6 @@ async fn parent_renames_a_child_end_to_end() {
         .await
         .expect("spawn the child");
     assert_eq!(handle.name, "kid");
-    children.notify_turn_done();
     // Wait for the spawn turn to settle (bounded), then read the roster's
     // live/persisted child ids.
     let settle_deadline = Instant::now() + Duration::from_secs(60);

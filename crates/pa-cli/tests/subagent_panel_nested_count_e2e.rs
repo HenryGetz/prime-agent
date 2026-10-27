@@ -286,7 +286,6 @@ async fn a_two_level_spawn_counts_the_whole_tree() {
         .spawn(spawn_request("worker-b", "ship the lane"))
         .await
         .expect("spawn child");
-    root_host.notify_turn_done();
 
     // The child's roster row carries the live ids its own spawns key by.
     let child_row = wait_until(Duration::from_secs(15), || {
@@ -316,7 +315,6 @@ async fn a_two_level_spawn_counts_the_whole_tree() {
         .spawn(spawn_request("worker-c", "audit the lane"))
         .await
         .expect("spawn grandchild");
-    child_host.notify_turn_done();
 
     let grandchild_row = wait_until(Duration::from_secs(15), || {
         let roster = client.roster("rs2");
