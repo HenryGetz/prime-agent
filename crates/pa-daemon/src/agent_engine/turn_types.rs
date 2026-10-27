@@ -2,10 +2,11 @@
 //! types and the retry/abort message helpers that shape them.
 use super::{EngineEvent, Model, StopReason};
 
-/// The empty-of-substance retry's admitted instruction (Oscar's silent-stop
-/// trace: a clean-stopped reply with only thinking content ends the turn
-/// silently). The row is user-visible in the transcript and persists like
-/// any admitted prompt; the retried turn re-issues over it.
+/// The empty-of-substance retry's admitted instruction (the silent-stop bug
+/// class: a reasoning model that burns its output budget on thinking ends
+/// its reply clean with no visible text). The row is user-visible in the
+/// transcript and persists like any admitted prompt; the retried turn
+/// re-issues over it.
 pub(crate) const EMPTY_REPLY_RETRY_INSTRUCTION: &str = "Your previous reply ended with no visible answer — it stopped after reasoning without any text. Reply again now with your complete answer as ordinary text so the user can read it.";
 
 /// The visible error when both the reply and its one retry ended with no

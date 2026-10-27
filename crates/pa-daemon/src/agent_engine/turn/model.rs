@@ -2,9 +2,9 @@
 //! the retry/failover policy application, and the quota-park mid-run arm.
 use super::{
     aborted_message, drop_trailing_assistant, json_round_trip, map_thinking_level,
-    retry_event_to_engine_event, AgentSessionEngine, EngineEvent, ProviderTarget, StopReason,
-    TurnAdmission, TurnOnce, TurnPrompt, TurnResult, EMPTY_REPLY_RETRY_INSTRUCTION,
-    EMPTY_REPLY_TURN_ERROR,
+    model_thinking_level, retry_event_to_engine_event, AgentSessionEngine, EngineEvent,
+    ProviderTarget, StopReason, TurnAdmission, TurnOnce, TurnPrompt, TurnResult,
+    EMPTY_REPLY_RETRY_INSTRUCTION, EMPTY_REPLY_TURN_ERROR,
 };
 use pa_core::session_engine::empty_reply::{is_empty_of_substance, thinking_step_lower};
 
@@ -13,15 +13,17 @@ impl AgentSessionEngine {
     /// emit the turn outcome (provider-failure retries + final-row
     /// surfacing). The trailing `Done` is owned by the caller.
     ///
-    /// The empty-of-substance contract (Oscar's silent-stop trace) rides on
-    /// top: a clean-stopped reply whose entire visible content is missing —
-    /// or a degenerate stub with thinking present — ends the turn silently;
-    /// the user sees nothing, nothing retries, nothing errors. One bounded
-    /// retry re-issues the turn with an explicit instruction to emit the
-    /// answer as text and, where the model supports the step, the thinking
-    /// level one rung lower (a lower effort level burns less of the output
-    /// budget on thinking, leaving the text room the starvation ate). A
-    /// second empty reply surfaces a visible error — never silence.
+    /// The empty-of-substance contract rides on top: a clean-stopped reply
+    /// whose entire visible content is missing — or a degenerate stub with
+    /// thinking present — ends the turn silently (the silent-stop bug class:
+    /// a reasoning model that burns its output budget on thinking ends its
+    /// reply clean with no visible text); the user sees nothing, nothing
+    /// retries, nothing errors. One bounded retry re-issues the turn with an
+    /// explicit instruction to emit the answer as text and, where the model
+    /// supports the step, the thinking level one rung lower (a lower effort
+    /// level burns less of the output budget on thinking, leaving the text
+    /// room the starvation ate). A second empty reply surfaces a visible
+    /// error — never silence.
     pub(super) fn run_model_turn(
         &self,
         admission: TurnAdmission,
@@ -49,28 +51,76 @@ impl AgentSessionEngine {
         // Where the model supports the step, the retry runs one thinking
         // rung lower — a lower effort level burns less of the output budget
         // on thinking, leaving the text room the starvation ate. The
-        // step-down is retry-scoped: the session's own level survives the
-        // turn.
+        // step-down is retry-scoped: a routed episode serves the armed
+        // image route's model and level (the agent override wins the loop
+        // config, so the step-down lowers the override), an ordinary one
+        // the session model and its level. The restore re-reads the
+        // session's own level, so a /thinking change made while the retry
+        // ran wins over the pre-retry capture.
         let current_thinking = self.effective_thinking();
-        let lowered = self.resolve_model().and_then(|model| {
-            let lowered_thinking = thinking_step_lower(&model, current_thinking);
-            Ok((self.session_agent(&model)?, lowered_thinking))
-        });
-        let retried = match lowered {
-            Ok((agent, lowered_thinking)) if lowered_thinking != current_thinking => {
-                self.runtime
-                    .block_on(agent.set_thinking_level(map_thinking_level(lowered_thinking)));
-                let retried = self.run_model_turn_episode(
-                    TurnAdmission::FreshPrompt,
-                    &retry_prompt,
-                    boundary_passed,
-                    aborted,
-                    emit,
-                );
-                self.runtime
-                    .block_on(agent.set_thinking_level(map_thinking_level(current_thinking)));
-                retried
+        let step_down = match self.armed_image_route() {
+            Some(route) => {
+                let level = model_thinking_level(route.agent_override.thinking_level);
+                let model = route.target.model.clone();
+                self.session_agent(&model)
+                    .ok()
+                    .map(|agent| (agent, Some(route), model, level))
             }
+            None => self.resolve_model().ok().and_then(|model| {
+                self.session_agent(&model)
+                    .ok()
+                    .map(|agent| (agent, None, model, current_thinking))
+            }),
+        };
+        if step_down.is_none() {
+            // No resolvable serving model at the retry boundary: the
+            // reasoning relief is lost (the retry episode surfaces the same
+            // resolution failure itself) — never silently in the daemon
+            // log.
+            eprintln!(
+                "pa-daemon: empty-reply retry could not resolve the serving model for the thinking step-down"
+            );
+        }
+        let retried = match step_down {
+            Some((agent, route, model, level)) if thinking_step_lower(&model, level) != level => {
+                let lowered_thinking = thinking_step_lower(&model, level);
+                if let Some(route) = route {
+                    // A routed episode serves the armed image route: the
+                    // agent override wins the loop config, so the step-down
+                    // lowers the override and restores it after.
+                    agent.set_model_override(Some(pa_agent::agent::AgentModelOverride {
+                        thinking_level: map_thinking_level(lowered_thinking),
+                        ..route.agent_override.clone()
+                    }));
+                    let retried = self.run_model_turn_episode(
+                        TurnAdmission::FreshPrompt,
+                        &retry_prompt,
+                        boundary_passed,
+                        aborted,
+                        emit,
+                    );
+                    agent.set_model_override(Some(route.agent_override));
+                    retried
+                } else {
+                    self.runtime
+                        .block_on(agent.set_thinking_level(map_thinking_level(lowered_thinking)));
+                    let retried = self.run_model_turn_episode(
+                        TurnAdmission::FreshPrompt,
+                        &retry_prompt,
+                        boundary_passed,
+                        aborted,
+                        emit,
+                    );
+                    // The restore re-reads the session's level: a
+                    // /thinking change made during the retry survives.
+                    let restored = self.effective_thinking();
+                    self.runtime
+                        .block_on(agent.set_thinking_level(map_thinking_level(restored)));
+                    retried
+                }
+            }
+            // No supported step, or no resolvable serving model: the
+            // instruction-only retry still fires.
             _ => self.run_model_turn_episode(
                 TurnAdmission::FreshPrompt,
                 &retry_prompt,
@@ -583,6 +633,7 @@ impl AgentSessionEngine {
                     let agent = agent.clone();
                     let persistence = persistence.clone();
                     let core = core.clone();
+                    let primary_state = primary_state.clone();
                     {
                         let mut primary = primary_state
                             .lock()
@@ -606,11 +657,25 @@ impl AgentSessionEngine {
                     async move {
                         let agent_model = json_round_trip(&next)
                             .ok_or_else(|| anyhow::anyhow!("model conversion failed"))?;
-                        // Clamp the level to the switched-to model (TS
-                        // `clampThinkingLevel`); the primary restores with
-                        // the primary.
-                        let clamped =
-                            pa_ai::models::clamp_thinking_level(&next, self.effective_thinking());
+                        // Clamp the AGENT'S LIVE level to the switched-to
+                        // model (TS `clampThinkingLevel`), not the session's
+                        // cached one: a mid-episode level change (the
+                        // empty-reply retry's step-down, or a /thinking that
+                        // landed mid-turn) survives the failover chain, and
+                        // the captured primary below follows it, so the
+                        // restore returns to the live level too.
+                        let live_level = agent.state().await.thinking_level;
+                        let clamped = pa_ai::models::clamp_thinking_level(
+                            &next,
+                            model_thinking_level(live_level),
+                        );
+                        if let Some(primary) = primary_state
+                            .lock()
+                            .unwrap_or_else(std::sync::PoisonError::into_inner)
+                            .as_mut()
+                        {
+                            primary.thinking_level = live_level;
+                        }
                         // The stream's provider target follows the switch (the same slot
                         // `set_model` swaps).
                         {

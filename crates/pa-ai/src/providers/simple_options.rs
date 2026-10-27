@@ -18,9 +18,12 @@ pub const MIN_OUTPUT_TOKENS: u64 = 1_024;
 /// `REFINEMENT_MIN_OUTPUT_TOKENS` pattern, applied to the turn): a reasoning model burns part of
 /// the output budget on thinking before the answer starts — at high/max effort roughly 4k tokens
 /// per call — and a small budget starves the text remainder (a clean-stopped reply with only
-/// thinking content). The floor never lifts the budget past the model's catalog maximum output
-/// (providers reject a larger request with a 400), and an explicitly configured `maxTokens` or a
-/// caller-set per-request budget is never raised.
+/// thinking content). The floor is capped at the model's catalog maximum output — providers
+/// reject a larger request with a 400, and 85 live catalog models sit below 16k, so for those
+/// models the catalog maximum is the whole budget and the starved-reply class stays owned by the
+/// turn runner's empty-of-substance retry. An explicitly configured `maxTokens` or a caller-set
+/// per-request budget is never raised. The facade's room clamp still guards the combined
+/// input+output ceiling downstream.
 pub const TURN_MIN_OUTPUT_TOKENS: u64 = 16_000;
 
 /// The default per-request output budget for a model (TS `resolveMaxTokens`):
@@ -45,7 +48,12 @@ pub fn default_request_max_tokens(model: &Model) -> Option<u64> {
 /// no maximum output — those requests keep the provider's server-side default.
 #[must_use]
 pub fn turn_request_max_tokens(model: &Model, requested: Option<u64>) -> Option<u64> {
-    let requested = requested.or_else(|| default_request_max_tokens(model))?;
+    // A caller-set per-request budget is explicit configuration: honored as
+    // configured, never raised or lowered.
+    if requested.is_some() {
+        return requested;
+    }
+    let requested = default_request_max_tokens(model)?;
     if model.max_tokens_explicit {
         return Some(requested);
     }
@@ -261,24 +269,31 @@ mod tests {
 
     #[test]
     fn the_turn_floor_never_exceeds_a_catalog_maximum_output() {
-        // The #3807 composition on the session turn request: a sub-floor
-        // input (the room-clamped or derived shape) rises to the floor, the
-        // floor never lifts a budget past the model's catalog maximum
-        // output, and an explicitly configured `maxTokens` is honored.
+        // The #3807 composition on the session turn request: the floor never
+        // lifts the implicit budget past the model's catalog maximum output,
+        // and every explicit configuration — a caller-set per-request
+        // budget, an explicitly configured `maxTokens` — is honored as
+        // configured.
         let mut catalog = model("openai-completions", "gpt-x", 131_072);
-        assert_eq!(turn_request_max_tokens(&catalog, Some(8_000)), Some(16_000));
+        // A caller-set budget passes through untouched, on either side of
+        // the floor.
+        assert_eq!(turn_request_max_tokens(&catalog, Some(8_000)), Some(8_000));
+        assert_eq!(
+            turn_request_max_tokens(&catalog, Some(40_000)),
+            Some(40_000)
+        );
         // The catalog maximum output binds below the floor (gpt-4-turbo and
-        // gpt-4o-2024-05-13: 4,096; Vertex gemini-2.0-flash: 8,192).
+        // gpt-4o-2024-05-13: 4,096; Vertex gemini-2.0-flash: 8,192): the
+        // floor is capped at it, never past it.
         catalog.max_tokens = 4_096;
-        assert_eq!(turn_request_max_tokens(&catalog, Some(3_000)), Some(4_096));
         assert_eq!(turn_request_max_tokens(&catalog, None), Some(4_096));
         catalog.max_tokens = 8_192;
-        assert_eq!(turn_request_max_tokens(&catalog, Some(8_192)), Some(8_192));
+        assert_eq!(turn_request_max_tokens(&catalog, None), Some(8_192));
         // An explicitly configured `maxTokens` is never raised.
         catalog.max_tokens = 4_096;
         catalog.max_tokens_explicit = true;
-        assert_eq!(turn_request_max_tokens(&catalog, Some(3_000)), Some(3_000));
         assert_eq!(turn_request_max_tokens(&catalog, None), Some(4_096));
+        assert_eq!(turn_request_max_tokens(&catalog, Some(3_000)), Some(3_000));
         // The default request ceiling still caps the implicit budget.
         let roomy = model("openai-completions", "gpt-x", 131_072);
         assert_eq!(turn_request_max_tokens(&roomy, None), Some(32_000));

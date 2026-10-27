@@ -1,7 +1,7 @@
 //! The empty-of-substance reply contract: a clean-stopped assistant reply
 //! whose entire visible content is missing or a degenerate stub is a silent
 //! turn end — the user sees nothing, nothing retries, nothing errors. The
-//! shape (Oscar's silent-stop trace): a reasoning model burns part of the
+//! shape (the silent-stop bug class): a reasoning model burns part of the
 //! output budget on thinking before the answer starts, the provider then
 //! concludes normally (`stop`, not `length`) with thinking-only content, and
 //! the turn-completion accept path takes it as a valid turn end. The
