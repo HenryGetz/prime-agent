@@ -189,6 +189,7 @@ mod tests {
         let cwd = cwd.path().to_str().expect("utf-8 tempdir");
         for (command, code) in [("kill -KILL $$", 137), ("kill -SEGV $$", 139)] {
             let err = execute_bash(
+                "signal-death",
                 cwd,
                 &BashToolOptions::default(),
                 command,

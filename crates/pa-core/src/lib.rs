@@ -35,6 +35,14 @@ pub use tools::path_utils::resolve_read_path;
 // elision consumes alongside the tool renderers (narrow re-export).
 pub use tools::render_utils::{get_image_dimensions_prefix, IMAGE_DIMENSIONS_PREFIX_BYTES};
 
+// bash tool: definition + local/remote execution seam. The
+// auto-background promotion lane keeps the built-in bash tool compiled
+// in; the facade re-export is its public surface.
+pub use tools::bash::{
+    create_bash_tool_definition, create_bash_tool_definition_with_options, BashOperations,
+    BashSpawnContext, BashSpawnHook, BashToolOptions, LocalBashOperations,
+};
+
 // ipython tool: definition + kernel lifecycle seam (RLM bootstrap included).
 pub use tools::ipython::{
     create_ipython_tool_definition, sent_agent_message_json, ExecuteResult, ExecuteStatus,
