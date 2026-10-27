@@ -70,8 +70,7 @@ impl Editor {
         kind: Option<crate::autocomplete::SuggestionKind>,
     ) -> crate::autocomplete::CompletionResult {
         if kind == Some(crate::autocomplete::SuggestionKind::Emoji) {
-            let start = self.cursor_col - prefix.chars().count();
-            return self.replace_before_cursor(start, &item.value);
+            return self.apply_emoji_completion(&item.value);
         }
         match self.autocomplete_provider.as_ref() {
             Some(provider) => provider.apply_completion(
