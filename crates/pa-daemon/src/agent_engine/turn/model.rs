@@ -3,14 +3,96 @@
 use super::{
     aborted_message, drop_trailing_assistant, json_round_trip, map_thinking_level,
     retry_event_to_engine_event, AgentSessionEngine, EngineEvent, ProviderTarget, StopReason,
-    TurnAdmission, TurnOnce, TurnPrompt, TurnResult,
+    TurnAdmission, TurnOnce, TurnPrompt, TurnResult, EMPTY_REPLY_RETRY_INSTRUCTION,
+    EMPTY_REPLY_TURN_ERROR,
 };
+use pa_core::session_engine::empty_reply::{is_empty_of_substance, thinking_step_lower};
 
 impl AgentSessionEngine {
     /// Drive one admitted prompt through the retry-driver model loop and
     /// emit the turn outcome (provider-failure retries + final-row
     /// surfacing). The trailing `Done` is owned by the caller.
+    ///
+    /// The empty-of-substance contract (Oscar's silent-stop trace) rides on
+    /// top: a clean-stopped reply whose entire visible content is missing —
+    /// or a degenerate stub with thinking present — ends the turn silently;
+    /// the user sees nothing, nothing retries, nothing errors. One bounded
+    /// retry re-issues the turn with an explicit instruction to emit the
+    /// answer as text and, where the model supports the step, the thinking
+    /// level one rung lower (a lower effort level burns less of the output
+    /// budget on thinking, leaving the text room the starvation ate). A
+    /// second empty reply surfaces a visible error — never silence.
     pub(super) fn run_model_turn(
+        &self,
+        admission: TurnAdmission,
+        prompt: &TurnPrompt,
+        boundary_passed: &std::sync::Arc<std::sync::atomic::AtomicBool>,
+        aborted: &dyn Fn() -> bool,
+        emit: &mut dyn FnMut(EngineEvent) -> bool,
+    ) -> TurnResult {
+        let result = self.run_model_turn_episode(admission, prompt, boundary_passed, aborted, emit);
+        let is_empty = match &result {
+            TurnResult::Message(message) => is_empty_of_substance(message),
+            _ => false,
+        };
+        if !is_empty || aborted() {
+            return result;
+        }
+        // The retry's prompt: an explicit instruction to emit the answer as
+        // text, admitted fresh over the settled context (the original prompt
+        // and the empty reply stay as context rows).
+        let retry_prompt = TurnPrompt::User {
+            text: EMPTY_REPLY_RETRY_INSTRUCTION.to_string(),
+            images: Vec::new(),
+            batch: Vec::new(),
+        };
+        // Where the model supports the step, the retry runs one thinking
+        // rung lower — a lower effort level burns less of the output budget
+        // on thinking, leaving the text room the starvation ate. The
+        // step-down is retry-scoped: the session's own level survives the
+        // turn.
+        let current_thinking = self.effective_thinking();
+        let lowered = self.resolve_model().and_then(|model| {
+            let lowered_thinking = thinking_step_lower(&model, current_thinking);
+            Ok((self.session_agent(&model)?, lowered_thinking))
+        });
+        let retried = match lowered {
+            Ok((agent, lowered_thinking)) if lowered_thinking != current_thinking => {
+                self.runtime
+                    .block_on(agent.set_thinking_level(map_thinking_level(lowered_thinking)));
+                let retried = self.run_model_turn_episode(
+                    TurnAdmission::FreshPrompt,
+                    &retry_prompt,
+                    boundary_passed,
+                    aborted,
+                    emit,
+                );
+                self.runtime
+                    .block_on(agent.set_thinking_level(map_thinking_level(current_thinking)));
+                retried
+            }
+            _ => self.run_model_turn_episode(
+                TurnAdmission::FreshPrompt,
+                &retry_prompt,
+                boundary_passed,
+                aborted,
+                emit,
+            ),
+        };
+        match retried {
+            TurnResult::Message(retried) if is_empty_of_substance(&retried) => TurnResult::Error {
+                error: EMPTY_REPLY_TURN_ERROR.to_string(),
+                assistant: Some(retried),
+            },
+            other => other,
+        }
+    }
+
+    /// One failover-driven episode of the model turn: the provider-retry
+    /// loop over the attempt/emit/wait/switch callbacks, the final-row
+    /// surfacing, and the primary-restore cleanup. [`Self::run_model_turn`]
+    /// drives the empty-of-substance retry over whole episodes of this.
+    fn run_model_turn_episode(
         &self,
         admission: TurnAdmission,
         prompt: &TurnPrompt,
