@@ -449,8 +449,10 @@ def _mask_scan_literals(command: str) -> str:
                     else:
                         # Quoted separators and spaces are data: replace them
                         # with the non-whitespace placeholder so the span
-                        # stays ONE token.
-                        if c.isspace():
+                        # stays ONE token. `|;&` are the segment-splitting
+                        # separators: left live, they split the parent command
+                        # and hide the scan root.
+                        if c.isspace() or c in "|;&":
                             chars[k] = MASK_PLACEHOLDER
                         k += 1
                 chars[i] = " "

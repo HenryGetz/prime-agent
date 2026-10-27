@@ -1693,6 +1693,15 @@ class ScanCostGuardTest(unittest.IsolatedAsyncioTestCase):
         self.assertTrue(is_scan("grep -rl -e -error ~/Documents"))
         self.assertTrue(is_scan("grep -R -e -error ~/Documents"))
 
+    def test_home_span_separators_do_not_split_scan_roots(self):
+        # Kernel parity for the Rust pin: a quoted separator inside a
+        # home-prefixed span is data, so a real scan keeps its root and
+        # warns instead of being split into root-less segments.
+        is_scan = bash_module._is_unbounded_home_scan
+        self.assertTrue(is_scan('rg "$HOME/a|$HOME/b" ~/Documents'))
+        self.assertTrue(is_scan('rg "$HOME/a;$HOME/b" ~/Documents'))
+        self.assertTrue(is_scan('rg "$HOME/a&&$HOME/b" ~/Documents'))
+
     def test_dispatch_hint_is_budgeted_and_names_the_fix(self):
         with (
             mock.patch.object(bash_module, "_scan_hints_written", 0),

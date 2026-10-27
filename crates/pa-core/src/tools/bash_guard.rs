@@ -888,8 +888,10 @@ fn mask_scan_literals(command: &str) -> String {
                         // Quoted separators and spaces are data: replace them
                         // with the non-whitespace placeholder so the span
                         // stays ONE token (`"$HOME/a|$HOME/b"` never splits
-                        // into a root-looking fragment).
-                        if c.is_whitespace() {
+                        // into a root-looking fragment). `|;&` are the
+                        // segment-splitting separators: left live, they
+                        // split the parent command and hide the scan root.
+                        if c.is_whitespace() || matches!(c, '|' | ';' | '&') {
                             chars[k] = MASK_PLACEHOLDER;
                         }
                         k += 1;
@@ -2009,6 +2011,26 @@ mod tests {
         ));
         assert!(is_unbounded_home_scan(
             "grep -rl needle \"$HOME/docs with spaces\"",
+            None
+        ));
+    }
+
+    /// Regression pin for the review round on quoted separators inside
+    /// home spans: the masker replaces separator characters too, so a live
+    /// `|`/`;`/`&&` inside a quoted multi-home pattern cannot split the
+    /// command into root-less segments and hide the home root.
+    #[test]
+    fn home_span_separators_do_not_split_scan_roots() {
+        assert!(is_unbounded_home_scan(
+            "rg \"$HOME/a|$HOME/b\" ~/Documents",
+            None
+        ));
+        assert!(is_unbounded_home_scan(
+            "rg \"$HOME/a;$HOME/b\" ~/Documents",
+            None
+        ));
+        assert!(is_unbounded_home_scan(
+            "rg \"$HOME/a&&$HOME/b\" ~/Documents",
             None
         ));
     }
