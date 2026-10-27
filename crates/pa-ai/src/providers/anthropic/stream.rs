@@ -231,7 +231,13 @@ async fn run_stream(
         }
     }
 
-    let url = format!("{}/v1/messages", model.base_url.trim_end_matches('/'));
+    let base = model.base_url.trim_end_matches('/');
+    let path = if model.provider == "opencode-go" {
+        crate::opencode_go_spec_generated::MESSAGES_PATH
+    } else {
+        "/v1/messages"
+    };
+    let url = format!("{base}{path}");
     let mut response: HttpResponse = send(RequestOptions {
         method: reqwest::Method::POST,
         url,

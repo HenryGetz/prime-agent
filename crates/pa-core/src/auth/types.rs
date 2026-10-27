@@ -111,6 +111,22 @@ pub enum AuthCredential {
             skip_serializing_if = "Option::is_none"
         )]
         audience_mode: Option<String>,
+        /// The `OpenCode` Console workspace the token is bound to; the request
+        /// path attributes each request to the SERVING account's own org (a
+        /// cross-paired org gets "Workspace access denied").
+        #[serde(rename = "orgId", default, skip_serializing_if = "Option::is_none")]
+        org_id: Option<String>,
+        /// The Console base the login ran against (refreshes reuse it).
+        #[serde(
+            rename = "apiEndpoint",
+            default,
+            skip_serializing_if = "Option::is_none"
+        )]
+        api_endpoint: Option<String>,
+        /// The Console account's email (the `/login` and usage surfaces name
+        /// the stacked accounts).
+        #[serde(rename = "email", default, skip_serializing_if = "Option::is_none")]
+        email: Option<String>,
     },
 }
 

@@ -454,3 +454,251 @@ async fn scope_readiness_timeout_keeps_models_available_before_refresh() {
         vec![existing]
     );
 }
+
+#[test]
+fn a_stacked_opencode_go_slot_configures_the_provider() {
+    let dir = tempfile::tempdir().unwrap();
+    let auth = auth_without_env(&serde_json::json!({
+        "opencode-go#2": {
+            "type": "oauth", "access": "access-b", "refresh": "refresh-b",
+            "expires": i64::MAX, "accountId": "usr_b", "orgId": "org_b",
+            "apiEndpoint": "https://opencode.ai",
+        }
+    }));
+    let registry = ModelRegistry::create(auth, dir.path().join("models.json"));
+    let model = model("deepseek-v4.1-flash", "opencode-go");
+    assert!(
+        registry.has_configured_auth(&model),
+        "the base key is absent but the stacked slot is configured"
+    );
+    assert!(
+        registry.get_provider_auth_status("opencode-go").configured,
+        "the provider status resolves the first stored slot"
+    );
+}
+
+#[test]
+fn all_exhausted_opencode_slots_answer_with_an_actionable_error() {
+    let dir = tempfile::tempdir().unwrap();
+    let agent_dir = dir.path();
+    let auth = auth_without_env(&serde_json::json!({
+        "opencode-go": {
+            "type": "oauth", "access": "access-a", "refresh": "refresh-a",
+            "expires": i64::MAX, "accountId": "usr_a", "orgId": "org_a",
+            "apiEndpoint": "https://opencode.ai",
+        },
+        "opencode-go#2": {
+            "type": "oauth", "access": "access-b", "refresh": "refresh-b",
+            "expires": i64::MAX, "accountId": "usr_b", "orgId": "org_b",
+            "apiEndpoint": "https://opencode.ai",
+        }
+    }));
+    let now = crate::auth::opencode_accounts::epoch_ms();
+    std::fs::write(
+        agent_dir.join(crate::auth::opencode_accounts::ROUTING_FILE),
+        serde_json::json!({
+            "accounts": {
+                "opencode-go": {
+                    "usedPct": 1.0, "usedPctAtMs": now, "primeAttemptAtMs": now
+                },
+                "opencode-go#2": {
+                    "usedPctAtMs": now,
+                    "primeAttemptAtMs": now,
+                    "verdict": {"status": 402, "message": "out of funds", "at": now},
+                },
+            },
+            "pins": {},
+        })
+        .to_string(),
+    )
+    .unwrap();
+    let mut registry = ModelRegistry::create(auth, agent_dir.join("models.json"));
+    let resolved =
+        registry.get_api_key_and_headers(&model("deepseek-v4.1-flash", "opencode-go"), None);
+    assert!(
+        !resolved.ok,
+        "the exhausted stack never serves the base key"
+    );
+    assert!(resolved.api_key.is_none());
+    let error = resolved.error.expect("the exhausted stack explains itself");
+    assert!(error.contains("All OpenCode Go accounts"), "{error}");
+    assert!(error.contains("/login"), "{error}");
+}
+
+/// An expired grant that cannot refresh (`NoOAuth`) resolves to no token. The
+/// request must fail with the actionable `/login` message instead of answering
+/// `ok: true` and letting the gateway 401. The dead slot is demoted with a
+/// fresh 401 verdict (which drops the pin `resolve` just wrote), so the same
+/// session's next request rotates to the healthy sibling.
+#[test]
+fn a_dead_opencode_slot_fails_with_an_actionable_error() {
+    let dir = tempfile::tempdir().unwrap();
+    let agent_dir = dir.path();
+    let auth = auth_without_env(&serde_json::json!({
+        "opencode-go": {
+            "type": "oauth", "access": "expired-access", "refresh": "refresh-a",
+            "expires": 1, "accountId": "usr_a",
+            "apiEndpoint": "https://opencode.ai",
+        },
+        "opencode-go#2": {
+            "type": "oauth", "access": "live-access", "refresh": "refresh-b",
+            "expires": i64::MAX, "accountId": "usr_b",
+            "apiEndpoint": "https://opencode.ai",
+        }
+    }));
+    // A fresh usage record keeps the background prime from polling (no
+    // network, no state write) so the dead token is the only variable; the
+    // credential carries no `orgId`, so `seed_org_ids` writes nothing either.
+    let now = crate::auth::opencode_accounts::epoch_ms();
+    let routing_path = agent_dir.join(crate::auth::opencode_accounts::ROUTING_FILE);
+    let seeded = serde_json::json!({
+        "accounts": {
+            "opencode-go": {"usedPct": 0.0, "usedPctAtMs": now, "primeAttemptAtMs": now},
+            "opencode-go#2": {"usedPct": 0.0, "usedPctAtMs": now, "primeAttemptAtMs": now},
+        },
+        "pins": {},
+    })
+    .to_string();
+    std::fs::write(&routing_path, &seeded).unwrap();
+    let mut registry = ModelRegistry::create(auth, agent_dir.join("models.json"));
+    let resolved = registry.get_api_key_and_headers_for_session(
+        &model("deepseek-v4.1-flash", "opencode-go"),
+        None,
+        Some("session-dead"),
+    );
+    assert!(!resolved.ok, "a dead grant never answers ok: true");
+    assert!(resolved.api_key.is_none());
+    assert!(resolved.headers.is_none());
+    let error = resolved.error.expect("the dead slot explains itself");
+    assert!(error.contains("opencode-go"), "{error}");
+    assert!(error.contains("/login"), "{error}");
+    // The dead token records a 401 verdict: the pin `resolve` just wrote is
+    // dropped (the next turn rotates) and the slot is demoted.
+    let state: serde_json::Value =
+        serde_json::from_str(&std::fs::read_to_string(&routing_path).unwrap()).unwrap();
+    assert!(
+        state["pins"].get("session-dead").is_none(),
+        "the 401 verdict drops the dead slot's pin: {state}"
+    );
+    let verdict = &state["accounts"]["opencode-go"]["verdict"];
+    assert_eq!(verdict["status"], 401, "{state}");
+    assert!(
+        verdict["at"].as_i64().unwrap_or(0) >= now,
+        "the verdict is fresh: {state}"
+    );
+    // The same session's next request rotates to the healthy sibling instead
+    // of retrying the demoted slot.
+    let resolved = registry.get_api_key_and_headers_for_session(
+        &model("deepseek-v4.1-flash", "opencode-go"),
+        None,
+        Some("session-dead"),
+    );
+    assert!(resolved.ok, "the healthy sibling answers");
+    assert_eq!(resolved.api_key.as_deref(), Some("live-access"));
+    let state: serde_json::Value =
+        serde_json::from_str(&std::fs::read_to_string(&routing_path).unwrap()).unwrap();
+    assert_eq!(
+        state["pins"]["session-dead"]["slot"], "opencode-go#2",
+        "the session rotates to the healthy sibling: {state}"
+    );
+}
+
+#[test]
+fn the_live_catalog_cache_supplies_opencode_go_models() {
+    let dir = tempfile::tempdir().unwrap();
+    let agent_dir = dir.path();
+    let artifact = serde_json::json!({
+        "opencode-go": {
+            "id": "opencode-go",
+            "models": {
+                "catalog-only": {
+                    "id": "catalog-only",
+                    "name": "Catalog Only",
+                    "reasoning": true,
+                    "reasoning_options": [{"type": "effort", "values": ["low", "high"]}],
+                    "modalities": {"input": ["text"], "output": ["text"]},
+                    "limit": {"context": 200_000, "output": 32_000},
+                    "cost": {"input": 0.2, "output": 0.8, "cache_read": 0.02, "cache_write": 0.0},
+                    "provider": {"npm": "@ai-sdk/openai", "api": "https://opencode.ai/inference/go/openai/v1"}
+                }
+            }
+        }
+    })
+    .to_string();
+    let parsed = pa_ai::opencode_go_catalog::parse_catalog(&artifact).unwrap();
+    pa_ai::opencode_go_catalog::save_cache(agent_dir, &parsed);
+
+    let registry = ModelRegistry::create(
+        auth_without_env(&serde_json::json!({})),
+        agent_dir.join("models.json"),
+    );
+    let go_models: Vec<&Model> = registry
+        .get_all()
+        .iter()
+        .filter(|model| model.provider == "opencode-go")
+        .collect();
+    assert_eq!(
+        go_models
+            .iter()
+            .map(|model| model.id.as_str())
+            .collect::<Vec<_>>(),
+        vec!["catalog-only"],
+        "the fresh cache replaces the embedded roster"
+    );
+    assert_eq!(go_models[0].api, "openai-responses");
+    assert_eq!(go_models[0].base_url, "https://opencode.ai/zen/go/v1");
+}
+
+#[test]
+fn a_custom_models_json_entry_still_wins_the_catalog_cache() {
+    let dir = tempfile::tempdir().unwrap();
+    let agent_dir = dir.path();
+    let artifact = serde_json::json!({
+        "opencode-go": {
+            "id": "opencode-go",
+            "models": {
+                "catalog-only": {
+                    "id": "catalog-only",
+                    "name": "Catalog Only",
+                    "limit": {"context": 200_000, "output": 32_000},
+                    "cost": {"input": 0.2, "output": 0.8, "cache_read": 0.02},
+                    "provider": {"api": "https://opencode.ai/inference/go/openai/v1"}
+                }
+            }
+        }
+    })
+    .to_string();
+    pa_ai::opencode_go_catalog::save_cache(
+        agent_dir,
+        &pa_ai::opencode_go_catalog::parse_catalog(&artifact).unwrap(),
+    );
+    std::fs::write(
+        agent_dir.join("models.json"),
+        serde_json::json!({
+            "providers": {
+                "opencode-go": {
+                    "models": [
+                        {"id": "catalog-only", "name": "Operator Name", "maxTokens": 4096}
+                    ]
+                }
+            }
+        })
+        .to_string(),
+    )
+    .unwrap();
+
+    let registry = ModelRegistry::create(
+        auth_without_env(&serde_json::json!({})),
+        agent_dir.join("models.json"),
+    );
+    let model = registry
+        .get_all()
+        .iter()
+        .find(|model| model.provider == "opencode-go" && model.id == "catalog-only")
+        .expect("the cache model is present");
+    assert_eq!(
+        model.name, "Operator Name",
+        "models.json overrides the cache"
+    );
+    assert_eq!(model.max_tokens, 4096);
+}

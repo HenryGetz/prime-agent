@@ -235,7 +235,7 @@ impl ModelRegistry {
                 *status_by_provider
                     .entry(model.provider.as_str())
                     .or_insert_with(|| {
-                        let status = self.auth.get_auth_status(&model.provider);
+                        let status = self.get_provider_auth_status(&model.provider);
                         status.source != Some(crate::auth::types::AuthSource::Stale)
                             && status.label.as_deref() != Some("expired")
                     })
@@ -244,6 +244,9 @@ impl ModelRegistry {
     }
 
     pub fn has_configured_auth(&self, model: &Model) -> bool {
+        if self.opencode_go_slot(&model.provider).is_some() {
+            return true;
+        }
         self.auth.has_auth(&model.provider)
             || self.has_configured_provider_request_auth(&model.provider)
     }
@@ -252,7 +255,21 @@ impl ModelRegistry {
     /// classifying unauthenticated vs stale providers read this instead of
     /// probing for keys.
     pub fn get_provider_auth_status(&self, provider: &str) -> crate::auth::types::AuthStatus {
+        if let Some(slot) = self.opencode_go_slot(provider) {
+            return self.auth.get_auth_status(&slot);
+        }
         self.auth.get_auth_status(provider)
+    }
+
+    /// The first stored `OpenCode` Go slot: stacked logins may leave the base
+    /// key absent (`opencode-go#2`, `#3`, …). `None` for other providers.
+    fn opencode_go_slot(&self, provider: &str) -> Option<String> {
+        if provider != pa_ai::opencode_go_models::OPENCODE_GO_PROVIDER_ID {
+            return None;
+        }
+        crate::auth::opencode_accounts::slots(&self.auth)
+            .into_iter()
+            .next()
     }
 
     /// `set_model`'s model resolution: an available model resolves directly; a
@@ -405,6 +422,18 @@ impl ModelRegistry {
 
         let credentials = self.prime_credentials();
         let mut built_in = self.load_built_in_models(&result, credentials.as_ref());
+        // The OpenCode Go subscription's live catalog (cache first, embedded
+        // roster fallback) is authoritative for the provider: a base-catalog
+        // entry the roster no longer lists is retired. Learned-dead ids are
+        // already filtered out of both sources.
+        built_in
+            .retain(|model| model.provider != pa_ai::opencode_go_models::OPENCODE_GO_PROVIDER_ID);
+        let go_models = self
+            .agent_dir()
+            .map_or_else(pa_ai::opencode_go_models::models, |agent_dir| {
+                pa_ai::opencode_go_catalog::models(&agent_dir)
+            });
+        built_in = Self::merge_custom_models(built_in, go_models);
         built_in.extend(private_models.into_values());
         self.models = Self::merge_custom_models(built_in, result.models);
         self.apply_subscription_model_adaptations();
@@ -811,6 +840,207 @@ impl ModelRegistry {
 
     /// Resolve request auth: API key + merged headers for a model.
     pub fn get_api_key_and_headers(
+        &mut self,
+        model: &Model,
+        request_headers: Option<&BTreeMap<String, String>>,
+    ) -> ResolvedRequestAuth {
+        self.get_api_key_and_headers_for_session(model, request_headers, None)
+    }
+
+    /// Resolve request auth for one session: the `OpenCode` Go subscriptions pick
+    /// their stacked serving account from the routing state, every other
+    /// provider takes the plain lookup.
+    pub fn get_api_key_and_headers_for_session(
+        &mut self,
+        model: &Model,
+        request_headers: Option<&BTreeMap<String, String>>,
+        session_id: Option<&str>,
+    ) -> ResolvedRequestAuth {
+        if model.provider == pa_ai::opencode_go_models::OPENCODE_GO_PROVIDER_ID {
+            if let Some(resolved) =
+                self.opencode_go_request_auth(model, request_headers, session_id)
+            {
+                return resolved;
+            }
+        }
+        self.default_request_auth(model, request_headers)
+    }
+
+    /// The `OpenCode` Go serving account: the session pin (drain in place) or the
+    /// routing choice, with the workspace header the gateway attributes requests
+    /// by. `None` falls back to the plain lookup (no routing state, no slots).
+    fn opencode_go_request_auth(
+        &mut self,
+        model: &Model,
+        request_headers: Option<&BTreeMap<String, String>>,
+        session_id: Option<&str>,
+    ) -> Option<ResolvedRequestAuth> {
+        let agent_dir = self.agent_dir()?;
+        let slots = crate::auth::opencode_accounts::slots(&self.auth);
+        if slots.is_empty() {
+            return None;
+        }
+        // The first routed request needs the real usage so exhausted accounts
+        // are skipped before the gateway 429s. The prime is background-only: an
+        // unknown percentage proceeds and the 429/verdict path rotates.
+        crate::auth::opencode_accounts::seed_org_ids(&agent_dir, &self.auth, &slots);
+        crate::auth::opencode_accounts::refresh_usage_before_routing(
+            &agent_dir, &self.auth, &slots,
+        );
+        let Some(slot) = crate::auth::opencode_accounts::resolve(&agent_dir, &slots, session_id)
+        else {
+            // The base key would answer a guaranteed 429: every slot is
+            // exhausted or carries a fresh 401/402/403 verdict.
+            return Some(ResolvedRequestAuth {
+                ok: false,
+                api_key: None,
+                headers: None,
+                error: Some(
+                    "All OpenCode Go accounts are rate-limited or rejected; wait for a usage window to reset or add another account with /login."
+                        .to_string(),
+                ),
+            });
+        };
+        // The serving account's workspace id comes from the stored credential
+        // first (a never-served slot has no routing state yet), then the state.
+        let org_id = crate::auth::opencode_accounts::slot_org_id(&self.auth, &slot).or_else(|| {
+            crate::auth::opencode_accounts::load(&agent_dir)
+                .accounts
+                .get(&slot)
+                .and_then(|account| account.org_id.clone())
+        });
+        // A dead grant (a failed OAuth refresh) or a failed API-key command
+        // resolves to no token. Never serve the base key and let the gateway
+        // answer a bare 401: fail the turn with an actionable message, and skip
+        // the pin/serve bookkeeping for a slot that cannot answer.
+        let Some(token) = self.auth.get_api_key(&slot) else {
+            // Demote the slot so the pin `resolve` just wrote is dropped and the
+            // next turn rotates to a healthy sibling instead of retrying it.
+            crate::auth::opencode_accounts::record_verdict(
+                &agent_dir,
+                &slot,
+                401,
+                "no usable token; run /login",
+            );
+            return Some(ResolvedRequestAuth {
+                ok: false,
+                api_key: None,
+                headers: None,
+                error: Some(format!(
+                    "OpenCode Go account {slot} has no usable token; run /login to sign in again."
+                )),
+            });
+        };
+        crate::auth::opencode_accounts::note_served(&agent_dir, &slot, org_id.as_deref());
+        crate::auth::opencode_accounts::maybe_poll_usage(
+            &agent_dir,
+            &slot,
+            &token,
+            org_id.as_deref(),
+            session_id,
+        );
+        let mut headers: BTreeMap<String, String> = BTreeMap::new();
+        if let Some(model_headers) = &model.headers {
+            headers.extend(model_headers.clone());
+        }
+        if let Some(provider_headers) = self
+            .provider_request_configs
+            .get(&model.provider)
+            .and_then(|config| config.headers.clone())
+        {
+            headers.extend(provider_headers);
+        }
+        if let Some(model_headers) = self
+            .model_request_headers
+            .get(&format!("{}:{}", model.provider, model.id))
+            .cloned()
+        {
+            headers.extend(model_headers);
+        }
+        if let Some(org_id) = org_id {
+            headers.insert("x-opencode-org-id".to_string(), org_id);
+        }
+        if let Some(request_headers) = request_headers {
+            headers.extend(request_headers.clone());
+        }
+        Some(ResolvedRequestAuth {
+            ok: true,
+            api_key: Some(token),
+            headers: (!headers.is_empty()).then_some(headers),
+            error: None,
+        })
+    }
+
+    /// Record a 401/402/403 verdict on the session's serving `OpenCode` Go
+    /// account (dropping its pins) so the next turn rotates to a healthy
+    /// sibling. Non-verdict statuses are ignored.
+    pub fn record_inference_verdict(&self, session_id: Option<&str>, status: u16, message: &str) {
+        if !crate::auth::opencode_accounts::is_verdict_status(status) {
+            return;
+        }
+        let Some(agent_dir) = self.agent_dir() else {
+            return;
+        };
+        let slots = crate::auth::opencode_accounts::slots(&self.auth);
+        if slots.is_empty() {
+            return;
+        }
+        let state = crate::auth::opencode_accounts::load(&agent_dir);
+        let now = crate::auth::opencode_accounts::epoch_ms();
+        let slot =
+            crate::auth::opencode_accounts::session_pin(&state, session_id, now).or_else(|| {
+                crate::auth::opencode_accounts::choose_slot(
+                    &state,
+                    &slots,
+                    None,
+                    crate::auth::opencode_accounts::spill_fraction(),
+                    now,
+                )
+            });
+        let Some(slot) = slot else {
+            return;
+        };
+        crate::auth::opencode_accounts::record_verdict(&agent_dir, &slot, status, message);
+    }
+
+    /// Record a settled 429 on the session's serving `OpenCode` Go account
+    /// (dropping its pins) so the next turn rotates immediately instead of
+    /// waiting for the usage poll.
+    pub fn record_rate_limit(&self, session_id: Option<&str>, retry_after_ms: Option<u64>) {
+        let Some(agent_dir) = self.agent_dir() else {
+            return;
+        };
+        let slots = crate::auth::opencode_accounts::slots(&self.auth);
+        if slots.is_empty() {
+            return;
+        }
+        let state = crate::auth::opencode_accounts::load(&agent_dir);
+        let now = crate::auth::opencode_accounts::epoch_ms();
+        let slot =
+            crate::auth::opencode_accounts::session_pin(&state, session_id, now).or_else(|| {
+                crate::auth::opencode_accounts::choose_slot(
+                    &state,
+                    &slots,
+                    None,
+                    crate::auth::opencode_accounts::spill_fraction(),
+                    now,
+                )
+            });
+        let Some(slot) = slot else {
+            return;
+        };
+        crate::auth::opencode_accounts::record_rate_limit(&agent_dir, &slot, retry_after_ms);
+    }
+
+    /// The agent directory (`models.json`'s parent) the routing state lives in.
+    fn agent_dir(&self) -> Option<PathBuf> {
+        self.models_json_path
+            .as_deref()
+            .and_then(Path::parent)
+            .map(Path::to_path_buf)
+    }
+
+    fn default_request_auth(
         &mut self,
         model: &Model,
         request_headers: Option<&BTreeMap<String, String>>,

@@ -113,7 +113,7 @@ impl Client {
     }
 
     fn read_response(&mut self, id: &str) -> Value {
-        let deadline = Instant::now() + Duration::from_secs(60);
+        let deadline = Instant::now() + Duration::from_mins(1);
         loop {
             let line = self.read_line();
             if line.get("id").and_then(Value::as_str) == Some(id) {
@@ -345,7 +345,7 @@ async fn a_settled_child_passivates_stays_listable_and_revives_by_agent_message(
 
     // The child worker's PROCESS is GONE (TS's whole-worker eviction semantics:
     // worker AND its kernel leave; the session file stays).
-    let deadline = Instant::now() + Duration::from_secs(60);
+    let deadline = Instant::now() + Duration::from_mins(1);
     loop {
         if !child_alive() {
             break;
@@ -720,7 +720,7 @@ async fn a_parent_rename_after_a_revival_and_second_passivation_reaches_the_chil
         passivated["success"], true,
         "the second idle passivation must succeed: {passivated}"
     );
-    let deadline = Instant::now() + Duration::from_secs(60);
+    let deadline = Instant::now() + Duration::from_mins(1);
     while std::path::Path::new(&format!("/proc/{revived_pid}")).exists() {
         assert!(
             Instant::now() < deadline,
@@ -861,7 +861,7 @@ async fn an_idle_root_passivates_and_resumes_by_its_durable_id_with_its_transcri
     );
 
     // The root worker's process is gone (the whole-worker stop).
-    let deadline = Instant::now() + Duration::from_secs(60);
+    let deadline = Instant::now() + Duration::from_mins(1);
     while std::path::Path::new(&format!("/proc/{root_pid}")).exists() {
         assert!(
             Instant::now() < deadline,

@@ -16,10 +16,11 @@ use pa_tui::provider_auth::{
 };
 
 /// The subscription login providers (every flow ported).
-const SUBSCRIPTION_PROVIDERS: [(&str, &str); 4] = [
+const SUBSCRIPTION_PROVIDERS: [(&str, &str); 5] = [
     ("anthropic", "Anthropic (Claude Pro/Max)"),
     ("github-copilot", "GitHub Copilot"),
     ("openai-codex", "ChatGPT Plus/Pro (Codex Subscription)"),
+    ("opencode-go", "OpenCode Go"),
     ("xai", "xAI (Grok)"),
 ];
 
@@ -68,10 +69,34 @@ const PRIME_INFERENCE_PROVIDER_ID: &str = "prime-inference";
 
 /// The display name of a provider id (else the id itself).
 fn display_name(provider_id: &str) -> String {
+    if let Some(number) = provider_id.strip_prefix("opencode-go#") {
+        if let Ok(number) = number.parse::<u32>() {
+            return format!("OpenCode Go (account {number})");
+        }
+    }
     BUILT_IN_PROVIDER_DISPLAY_NAMES
         .iter()
         .find(|(id, _)| *id == provider_id)
         .map_or_else(|| provider_id.to_string(), |(_, name)| name.to_string())
+}
+
+/// The `OpenCode` Go slot's account label: the stored Console email when the
+/// credential carries one, else the slot's account number (`opencode-go#N` is
+/// account N; the base slot is account 1).
+fn opencode_go_account_name(provider_id: &str, credential: &AuthCredential) -> String {
+    if let AuthCredential::Oauth {
+        email: Some(email), ..
+    } = credential
+    {
+        if !email.trim().is_empty() {
+            return format!("OpenCode Go — {email}");
+        }
+    }
+    let number = provider_id
+        .strip_prefix("opencode-go#")
+        .and_then(|number| number.parse::<u32>().ok())
+        .unwrap_or(1);
+    format!("OpenCode Go (account {number})")
 }
 
 /// The display-name map, or a provider the built-in model provider set does not know (custom
@@ -206,8 +231,19 @@ impl ProviderAuth {
     /// The stored credential + auth status of one provider id.
     fn credential_status(&self, provider_id: &str) -> (Option<AuthCredential>, AuthStatus) {
         let auth = self.auth_storage();
-        let credential = auth.get_all().credential(provider_id);
-        let status = auth.get_auth_status(provider_id);
+        // The subscription row covers every stacked slot; the base key may be
+        // absent (`opencode-go#2` logged in first), so resolve the first
+        // stored slot instead of the literal id.
+        let stored_id = if pa_core::auth::is_opencode_go_provider(provider_id) {
+            pa_core::auth::opencode_accounts::slots(&auth)
+                .into_iter()
+                .next()
+                .unwrap_or_else(|| provider_id.to_string())
+        } else {
+            provider_id.to_string()
+        };
+        let credential = auth.get_all().credential(&stored_id);
+        let status = auth.get_auth_status(&stored_id);
         (credential, status)
     }
 
@@ -331,11 +367,25 @@ impl ProviderAuth {
             // panel.
             for (id, name) in SUBSCRIPTION_PROVIDERS {
                 let (credential, status) = provider.credential_status(id);
+                let mut indicator = status_indicator(credential.as_ref(), &status, AuthType::Oauth);
+                // Stacked OpenCode Go accounts share one row: the status names the
+                // count instead of implying a single configured login.
+                let accounts = (id == pa_core::auth::OPENCODE_GO_PROVIDER_ID)
+                    .then(|| {
+                        pa_core::auth::opencode_accounts::slots(&provider.auth_storage()).len()
+                    })
+                    .filter(|accounts| *accounts > 1);
+                let configured = indicator
+                    .as_mut()
+                    .filter(|indicator| indicator.style == AuthStatusStyle::Success);
+                if let (Some(accounts), Some(indicator)) = (accounts, configured) {
+                    indicator.label = format!("configured ({accounts} accounts)");
+                }
                 rows.push(ProviderRow {
                     id: id.to_string(),
                     name: name.to_string(),
                     auth_type: AuthType::Oauth,
-                    status: status_indicator(credential.as_ref(), &status, AuthType::Oauth),
+                    status: indicator,
                     flow: AuthFlow::TerminalFlow,
                     configured: status.configured,
                     available: true,
@@ -360,6 +410,10 @@ impl ProviderAuth {
             providers.sort();
             providers.dedup();
             for provider_id in providers {
+                // The subscription row covers every OpenCode Go slot.
+                if pa_core::auth::is_opencode_go_provider(&provider_id) {
+                    continue;
+                }
                 if !is_api_key_login_provider(&provider_id, &built_in_provider_ids) {
                     continue;
                 }
@@ -413,7 +467,7 @@ impl ProviderAuth {
             let Some(credential) = auth.get_all().credential(&provider_id) else {
                 continue;
             };
-            let auth_type = match credential {
+            let auth_type = match &credential {
                 AuthCredential::ApiKey { .. } | AuthCredential::McpStaticToken { .. } => {
                     AuthType::ApiKey
                 }
@@ -430,6 +484,8 @@ impl ProviderAuth {
                     .strip_prefix("mcp:")
                     .unwrap_or(&provider_id)
                     .to_string()
+            } else if pa_core::auth::is_opencode_go_provider(&provider_id) {
+                opencode_go_account_name(&provider_id, &credential)
             } else {
                 display_name(&provider_id)
             };
@@ -645,6 +701,31 @@ fn login_blocking_on_panel(
                 },
             );
     }
+    // The OpenCode Go (Console) login.
+    if pa_core::auth::is_opencode_go_provider(&provider_row.id) {
+        return tokio::runtime::Builder::new_current_thread()
+            .enable_all()
+            .build()
+            .map_or_else(
+                |error: std::io::Error| {
+                    ProviderAuthOutcome::Error(format!(
+                        "Failed to login to {}: {error}",
+                        provider_row.name
+                    ))
+                },
+                |runtime| {
+                    runtime.block_on(crate::subscription_login::run_opencode_login(
+                        &agent_dir,
+                        &provider_row.name,
+                        &pa_ai::oauth::ReqwestProviderHttp::new(),
+                        &crate::subscription_login::PanelSubscriptionLoginUi::new(
+                            panel,
+                            &provider_row.id,
+                        ),
+                    ))
+                },
+            );
+    }
     // Any other row answers the silent cancel.
     ProviderAuthOutcome::Cancelled
 }
@@ -657,6 +738,10 @@ fn logout_blocking(provider_row: &ProviderRow, agent_dir: &Path) -> ProviderAuth
     auth.logout(&provider_row.id);
     if let Some(error) = auth.drain_errors().pop() {
         return ProviderAuthOutcome::Error(format!("Logout failed: {error}"));
+    }
+    // The credential is gone: its routing state and pins must not outlive it.
+    if pa_core::auth::is_opencode_go_provider(&provider_row.id) {
+        pa_core::auth::opencode_accounts::forget_slot(agent_dir, &provider_row.id);
     }
     match provider_row.auth_type {
         AuthType::Oauth => ProviderAuthOutcome::Status(format!(

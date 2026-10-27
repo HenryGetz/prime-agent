@@ -210,6 +210,189 @@ pub fn logs_rows(logs_dir: &Path) -> Vec<ClientLine> {
     rows
 }
 
+/// `/usage`: the `OpenCode` Go subscription windows from the persisted routing
+/// state plus the stacked accounts' labels from `auth.json`. Offline and
+/// pure: the background poll owns every network call.
+#[must_use]
+pub fn opencode_go_usage_rows(agent_dir: &Path) -> Vec<ClientLine> {
+    let now = epoch_ms();
+    let routing = read_json(&agent_dir.join("opencode-go-routing.json"));
+    let auth = read_json(&agent_dir.join("auth.json"));
+    let accounts = routing
+        .as_ref()
+        .and_then(|state| state.get("accounts"))
+        .and_then(Value::as_object);
+    let auth_slots = auth.as_ref().and_then(Value::as_object);
+
+    let mut slots: Vec<String> = Vec::new();
+    for keys in [
+        auth_slots.map(|slots| slots.keys()),
+        accounts.map(|slots| slots.keys()),
+    ]
+    .into_iter()
+    .flatten()
+    {
+        slots.extend(keys.filter(|slot| is_opencode_go_slot(slot)).cloned());
+    }
+    slots.sort();
+    slots.dedup();
+    slots.sort_by_key(|slot| opencode_go_slot_key(slot));
+
+    let mut rows = vec![
+        vec![raw_span("OpenCode Go usage (local accounting)")],
+        vec![],
+    ];
+    let fetched = routing
+        .as_ref()
+        .and_then(|state| state.get("usageFetchedAtMs"))
+        .and_then(Value::as_i64)
+        .filter(|fetched| *fetched > 0)
+        .or_else(|| {
+            accounts
+                .into_iter()
+                .flat_map(|accounts| accounts.values())
+                .filter_map(|account| account.get("usedPctAtMs").and_then(Value::as_i64))
+                .max()
+                .filter(|last| *last > 0)
+        });
+    rows.push(vec![
+        dim("last poll:"),
+        raw_span(format!(" {}", age_label(now, fetched.unwrap_or(0)))),
+    ]);
+    rows.push(vec![]);
+
+    if slots.is_empty() {
+        rows.push(vec![raw_span(
+            "No OpenCode Go usage yet — send a request or /login",
+        )]);
+        rows.push(vec![]);
+        rows.push(vec![dim(
+            "Windows are per account; the poll runs in the background.",
+        )]);
+        return rows;
+    }
+
+    for slot in slots {
+        let label = auth_slots
+            .and_then(|auth| auth.get(&slot))
+            .and_then(|credential| {
+                credential
+                    .get("email")
+                    .and_then(Value::as_str)
+                    .or_else(|| credential.get("orgName").and_then(Value::as_str))
+            })
+            .filter(|label| !label.is_empty());
+        let account = accounts.and_then(|accounts| accounts.get(&slot));
+        let mut header = vec![raw_span(slot.clone())];
+        if let Some(label) = label {
+            header.push(dim(format!(" — {label}")));
+        }
+        rows.push(header);
+
+        let windows = account
+            .and_then(|account| account.get("windows"))
+            .and_then(Value::as_object);
+        let mut worst: Option<f64> = None;
+        for window in ["rolling", "weekly", "monthly"] {
+            let Some(detail) = windows
+                .and_then(|windows| windows.get(window))
+                .and_then(Value::as_object)
+            else {
+                continue;
+            };
+            let Some(percent) = detail.get("percent").and_then(Value::as_f64) else {
+                continue;
+            };
+            let status = detail
+                .get("status")
+                .and_then(Value::as_str)
+                .unwrap_or_default();
+            let resets_at = detail
+                .get("resetsAt")
+                .and_then(Value::as_str)
+                .unwrap_or_default();
+            worst = Some(worst.map_or(percent, |current| current.max(percent)));
+            rows.push(vec![
+                dim(format!("  {window}:")),
+                raw_span(format!(" {}%", js_to_fixed(percent, 1))),
+                dim(format!("  {status}  resets {resets_at}")),
+            ]);
+        }
+        match worst {
+            Some(worst) => rows.push(vec![
+                dim("  state:"),
+                raw_span(format!(
+                    " {} ({}%)",
+                    window_state(worst),
+                    js_to_fixed(worst, 1)
+                )),
+            ]),
+            None => rows.push(vec![dim("  no data — waiting for the first poll")]),
+        }
+        rows.push(vec![]);
+    }
+    rows.push(vec![dim(
+        "Windows are per account; the poll runs in the background.",
+    )]);
+    rows
+}
+
+/// `opencode-go` or `opencode-go#N` (a stacked Go slot, not another provider).
+fn is_opencode_go_slot(slot: &str) -> bool {
+    slot == "opencode-go"
+        || slot
+            .strip_prefix("opencode-go#")
+            .is_some_and(|number| number.parse::<u64>().is_ok())
+}
+
+/// The base slot first, then `#N` ascending.
+fn opencode_go_slot_key(slot: &str) -> (u8, u64) {
+    slot.strip_prefix("opencode-go#")
+        .and_then(|number| number.parse::<u64>().ok())
+        .map_or((0, 0), |number| (1, number))
+}
+
+/// The worst-window state: `limited` at 100%, `warning` from 80%, else ready.
+fn window_state(worst_percent: f64) -> &'static str {
+    if worst_percent >= 100.0 {
+        "limited"
+    } else if worst_percent >= 80.0 {
+        "warning"
+    } else {
+        "ready"
+    }
+}
+
+/// `12s ago` / `3m ago` / `2h 5m ago` / `3d ago`; `never` for no poll.
+fn age_label(now_ms: i64, then_ms: i64) -> String {
+    if then_ms <= 0 {
+        return "never".to_string();
+    }
+    let seconds = now_ms.saturating_sub(then_ms).max(0) / 1_000;
+    if seconds < 60 {
+        format!("{seconds}s ago")
+    } else if seconds < 3_600 {
+        format!("{}m ago", seconds / 60)
+    } else if seconds < 86_400 {
+        format!("{}h {}m ago", seconds / 3_600, (seconds % 3_600) / 60)
+    } else {
+        format!("{}d ago", seconds / 86_400)
+    }
+}
+
+fn epoch_ms() -> i64 {
+    std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .map_or(0, |duration| {
+            i64::try_from(duration.as_millis()).unwrap_or(i64::MAX)
+        })
+}
+
+fn read_json(path: &Path) -> Option<Value> {
+    let content = std::fs::read_to_string(path).ok()?;
+    serde_json::from_str(&content).ok()
+}
+
 /// The `/system-prompt` header rows; the char count is the JS string
 /// length (UTF-16 code units).
 #[must_use]

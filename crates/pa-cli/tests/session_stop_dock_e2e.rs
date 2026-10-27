@@ -103,7 +103,7 @@ fn ask(socket: &Path, command: &Value) -> Option<Value> {
     writer.write_all(line.as_bytes()).ok()?;
     reader
         .get_ref()
-        .set_read_timeout(Some(Duration::from_secs(60)))
+        .set_read_timeout(Some(Duration::from_mins(1)))
         .ok()?;
     loop {
         let mut response = String::new();
@@ -230,7 +230,7 @@ async fn stopping_the_attached_session_clears_its_shells_from_the_dock() {
         let active = active.clone();
         std::thread::spawn(move || {
             rendered_rx
-                .recv_timeout(Duration::from_secs(60))
+                .recv_timeout(Duration::from_mins(1))
                 .expect("the chat rendered the shell");
             ask_ok(
                 &socket,

@@ -776,6 +776,9 @@ mod connection_view_tests {
             resource: None,
             issuer: None,
             audience_mode: None,
+            org_id: None,
+            api_endpoint: None,
+            email: None,
             account_id: None,
             enterprise_url: None,
         }

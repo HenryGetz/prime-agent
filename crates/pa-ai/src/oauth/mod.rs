@@ -8,6 +8,7 @@ mod anthropic_callback;
 mod callback;
 mod github_copilot;
 mod openai_codex;
+mod opencode;
 mod pkce;
 mod provider_http;
 mod types;
@@ -25,6 +26,13 @@ pub use github_copilot::{
 pub use openai_codex::{
     login_openai_codex, refresh_openai_codex_token, CodexLoginUi, OAuthCredentials,
     DEFAULT_ORIGINATOR, LOGIN_CANCELLED,
+};
+pub use opencode::{
+    device_code_body, device_token_body, harness_session_id, is_harness_session_id, login_opencode,
+    login_opencode_at, refresh_opencode_token, refresh_token_body, trace_headers,
+    OpencodeCredentials, LOGIN_CANCELLED as OPENCODE_LOGIN_CANCELLED, OPENCODE_CLIENT_ID,
+    OPENCODE_CONSOLE_BASE, OPENCODE_GO_ANTHROPIC_BASE_URL, OPENCODE_GO_BASE_URL,
+    OPENCODE_USER_AGENT,
 };
 pub use provider_http::{
     ProviderHttp, ProviderHttpMethod, ProviderHttpRequest, ProviderHttpResponse,

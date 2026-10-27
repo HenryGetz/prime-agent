@@ -520,6 +520,9 @@ impl CountingOAuth {
             resource: None,
             issuer: None,
             audience_mode: None,
+            org_id: None,
+            api_endpoint: None,
+            email: None,
         }
     }
 }
@@ -554,6 +557,9 @@ fn oauth_credential(access: &str, expires: i64) -> AuthCredential {
         resource: None,
         issuer: None,
         audience_mode: None,
+        org_id: None,
+        api_endpoint: None,
+        email: None,
     }
 }
 

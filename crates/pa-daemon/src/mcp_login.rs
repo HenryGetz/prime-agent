@@ -445,6 +445,9 @@ mod tests {
             resource: None,
             issuer: None,
             audience_mode: None,
+            org_id: None,
+            api_endpoint: None,
+            email: None,
             enterprise_url: None,
         };
         let value = serde_json::to_value(&credential).unwrap();

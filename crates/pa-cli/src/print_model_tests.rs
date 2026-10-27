@@ -228,3 +228,69 @@ async fn print_model_provider_only_settings_default_does_not_scope() {
         ("my-gateway", "my-group/my-model")
     );
 }
+
+#[test]
+fn a_settled_print_turn_records_the_provider_failure() {
+    let dir = tempfile::tempdir().unwrap();
+    let agent_dir = dir.path().join("agent");
+    std::fs::create_dir_all(&agent_dir).unwrap();
+    std::fs::write(
+        agent_dir.join("auth.json"),
+        json!({
+            "opencode-go": {
+                "type": "oauth",
+                "access": "access-a",
+                "refresh": "refresh-a",
+                "expires": i64::MAX / 2,
+                "accountId": "usr_a",
+                "orgId": "org_a",
+                "apiEndpoint": "https://opencode.ai",
+            },
+        })
+        .to_string(),
+    )
+    .unwrap();
+    let assistant: pa_types::ai::AssistantMessage = serde_json::from_value(json!({
+        "content": [],
+        "api": "opencode-go",
+        "provider": "opencode-go",
+        "model": "deepseek-v4.1-flash",
+        "usage": {
+            "input": 0,
+            "output": 0,
+            "cacheRead": 0,
+            "cacheWrite": 0,
+            "totalTokens": 0,
+            "cost": {
+                "input": 0,
+                "output": 0,
+                "cacheRead": 0,
+                "cacheWrite": 0,
+                "total": 0,
+            },
+        },
+        "stopReason": "error",
+        "diagnostics": [{
+            "type": "provider_stream_failure",
+            "timestamp": 0,
+            "details": {"kind": "rate_limit", "status": 429, "retryAfterMs": 30_000},
+        }],
+        "errorMessage": "Too Many Requests",
+        "timestamp": 0,
+    }))
+    .unwrap();
+    let settled = AgentMessage::Assistant(assistant);
+
+    super::record_settled_provider_failure_message(&agent_dir, Some(&settled));
+
+    let state = pa_core::auth::opencode_accounts::load(&agent_dir);
+    let account = state
+        .accounts
+        .values()
+        .next()
+        .expect("the settled print 429 records the serving slot");
+    assert!(
+        account.rate_limited_until_ms > pa_core::auth::opencode_accounts::epoch_ms(),
+        "the print-path 429 sets rateLimitedUntilMs"
+    );
+}

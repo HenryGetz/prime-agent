@@ -83,6 +83,13 @@ impl AgentSessionEngine {
         // assistant message records its token delta, from the engine mirror.
         let goal_runtime = self.goal_runtime.lock().expect("goal runtime lock").clone();
         let goal_budget_crossed = std::sync::Arc::clone(&self.goal_budget_crossed);
+        // The settled-turn verdict seam: an account verdict (401/402/403) on
+        // the settled assistant message drops the session's `OpenCode` Go pin.
+        let engine_weak = self
+            .self_weak
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
+            .clone();
         // The run-opening boundary frames are the worker's own for the
         // item's first run; this subscription forwards them only once a
         // boundary frame already passed.
@@ -107,6 +114,7 @@ impl AgentSessionEngine {
                     let autonomous_driver = std::sync::Arc::clone(&autonomous_driver);
                     let goal_runtime = goal_runtime.clone();
                     let goal_budget_crossed = goal_budget_crossed.clone();
+                    let engine_weak = engine_weak.clone();
                     Box::pin(async move {
                         use pa_agent::types::AgentEvent;
                         if let AgentEvent::MessageEnd {
@@ -119,6 +127,11 @@ impl AgentSessionEngine {
                             if let Some(message) =
                                 json_round_trip::<_, pa_types::ai::AssistantMessage>(assistant)
                             {
+                                if let Some(engine) =
+                                    engine_weak.as_ref().and_then(std::sync::Weak::upgrade)
+                                {
+                                    engine.record_provider_failure_verdict(assistant);
+                                }
                                 let mut state = autonomous_state.lock().await;
                                 autonomous_driver.account_message(&mut state, &message);
                                 // Goal accounting: only turns neither errors

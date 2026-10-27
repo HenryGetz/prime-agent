@@ -101,6 +101,9 @@ fn to_credentials(
         resource: binding.resource.clone(),
         issuer: binding.issuer.clone(),
         audience_mode: binding.audience_mode.clone(),
+        org_id: None,
+        api_endpoint: None,
+        email: None,
         enterprise_url: None,
     }
 }
@@ -1199,6 +1202,9 @@ mod tests {
             resource: None,
             issuer: None,
             audience_mode: None,
+            org_id: None,
+            api_endpoint: None,
+            email: None,
             enterprise_url: None,
         };
         let origin_prm = "https://srv.test/.well-known/oauth-protected-resource/mcp";
@@ -1230,6 +1236,9 @@ mod tests {
             resource: Some(RESOURCE.to_string()),
             issuer: Some(PLANE_ISSUER.to_string()),
             audience_mode: None,
+            org_id: None,
+            api_endpoint: None,
+            email: None,
             enterprise_url: None,
         };
         let http = ScriptedHttp::new(vec![
@@ -1304,6 +1313,9 @@ mod tests {
             resource: None,
             issuer: None,
             audience_mode: None,
+            org_id: None,
+            api_endpoint: None,
+            email: None,
             enterprise_url: None,
         };
         let error = mcp_refresh_token(&http, &config("plane", RESOURCE), &retargeted)
@@ -1325,6 +1337,9 @@ mod tests {
             resource: Some(RESOURCE.to_string()),
             issuer: Some(PLANE_ISSUER.to_string()),
             audience_mode: None,
+            org_id: None,
+            api_endpoint: None,
+            email: None,
             enterprise_url: None,
         };
         let error = mcp_refresh_token(&http, &config("plane", RESOURCE), &drifted)
@@ -1357,6 +1372,9 @@ mod tests {
             resource: None,
             issuer: None,
             audience_mode: None,
+            org_id: None,
+            api_endpoint: None,
+            email: None,
             enterprise_url: None,
         };
         let http = ScriptedHttp::new(vec![
@@ -1730,6 +1748,9 @@ mod tests {
                 resource: resource.map(str::to_string),
                 issuer: Some("https://srv.test/tenant".to_string()),
                 audience_mode: audience_mode.map(str::to_string),
+                org_id: None,
+                api_endpoint: None,
+                email: None,
                 enterprise_url: None,
             };
         let credentials = reissued_oauth(Some(DECLARED), Some("origin"));

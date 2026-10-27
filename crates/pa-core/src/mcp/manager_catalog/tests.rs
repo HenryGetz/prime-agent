@@ -245,6 +245,9 @@ fn installed_connections_are_endpoint_pinned_across_catalog_url_changes() {
                 resource: None,
                 issuer: None,
                 audience_mode: None,
+                org_id: None,
+                api_endpoint: None,
+                email: None,
                 enterprise_url: None,
             },
         );
@@ -706,6 +709,9 @@ fn api_key_credential_views_read_the_shared_store() {
                 resource: None,
                 issuer: None,
                 audience_mode: None,
+                org_id: None,
+                api_endpoint: None,
+                email: None,
                 enterprise_url: None,
             },
         );

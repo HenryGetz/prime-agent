@@ -273,6 +273,7 @@ async fn run_stream(
         &mut headers,
         &model.provider,
         options.base.session_id.as_deref(),
+        &model.base_url,
     );
     headers.push(("x-goog-api-key".into(), api_key));
 

@@ -38,6 +38,9 @@ fn the_status_indicator_maps_the_ts_labels() {
                 resource: None,
                 issuer: None,
                 audience_mode: None,
+                org_id: None,
+                api_endpoint: None,
+                email: None,
                 enterprise_url: None,
             }),
             &AuthStatus::default(),
@@ -212,6 +215,9 @@ async fn the_anthropic_subscription_warning_matches_the_active_credential() {
             resource: None,
             issuer: None,
             audience_mode: None,
+            org_id: None,
+            api_endpoint: None,
+            email: None,
             account_id: None,
             enterprise_url: None,
         },
@@ -312,4 +318,122 @@ async fn a_stored_web_search_key_pairs_with_the_logout_row() {
             )
         );
     assert!(auth.logout_options().await.is_empty());
+}
+
+/// A stored `OpenCode` Go Console credential.
+fn opencode_oauth(email: Option<&str>, org_id: Option<&str>) -> AuthCredential {
+    AuthCredential::Oauth {
+        access: "access".to_string(),
+        refresh: Some("refresh".to_string()),
+        expires: i64::MAX,
+        account_id: Some("usr_1".to_string()),
+        endpoint: None,
+        token_endpoint: None,
+        client_id: None,
+        resource: None,
+        issuer: None,
+        audience_mode: None,
+        org_id: org_id.map(str::to_string),
+        api_endpoint: Some("https://opencode.ai/console".to_string()),
+        email: email.map(str::to_string),
+        enterprise_url: None,
+    }
+}
+
+#[tokio::test]
+async fn stacked_opencode_accounts_name_their_identity() {
+    let dir = tempfile::tempdir().expect("temp dir");
+    let agent = dir.path().join("agent");
+    std::fs::create_dir_all(&agent).expect("agent dir");
+    let auth = ProviderAuth::new(dir.path(), agent.clone());
+    let mut storage = pa_core::auth::AuthStorage::create(&agent);
+    storage.set(
+        "opencode-go",
+        opencode_oauth(Some("dev@example.com"), Some("org_a")),
+    );
+    storage.set("opencode-go#2", opencode_oauth(None, Some("org_b")));
+
+    // `/logout` names each stacked account from its stored credential.
+    let names: Vec<(String, String)> = auth
+        .logout_options()
+        .await
+        .iter()
+        .map(|row| (row.id.clone(), row.name.clone()))
+        .collect();
+    assert!(
+        names.contains(&(
+            "opencode-go".to_string(),
+            "OpenCode Go — dev@example.com".to_string()
+        )),
+        "{names:?}"
+    );
+    assert!(
+        names.contains(&(
+            "opencode-go#2".to_string(),
+            "OpenCode Go (account 2)".to_string()
+        )),
+        "{names:?}"
+    );
+
+    // `/login` keeps one subscription row (the onboarding picker derives from the
+    // same rows) and names the account count instead of a single login.
+    let rows = auth.login_options().await;
+    let opencode: Vec<&ProviderRow> = rows
+        .iter()
+        .filter(|row| pa_core::auth::is_opencode_go_provider(&row.id))
+        .collect();
+    assert_eq!(
+        opencode.len(),
+        1,
+        "one stacked OpenCode Go row, never an API-key duplicate"
+    );
+    assert!(opencode[0].available, "the OpenCode Go flow is ported");
+    assert_eq!(
+        opencode[0].auth_type,
+        AuthType::Oauth,
+        "the single row is the OAuth subscription row, never an API-key duplicate"
+    );
+    assert_eq!(
+        opencode[0]
+            .status
+            .as_ref()
+            .map(|status| status.label.as_str()),
+        Some("configured (2 accounts)")
+    );
+}
+
+#[tokio::test]
+async fn logging_out_an_opencode_slot_forgets_its_routing_state() {
+    let dir = tempfile::tempdir().expect("temp dir");
+    let agent = dir.path().join("agent");
+    std::fs::create_dir_all(&agent).expect("agent dir");
+    let auth = ProviderAuth::new(dir.path(), agent.clone());
+    let mut storage = pa_core::auth::AuthStorage::create(&agent);
+    storage.set(
+        "opencode-go",
+        opencode_oauth(Some("dev@example.com"), Some("org_a")),
+    );
+    pa_core::auth::opencode_accounts::note_usage(&agent, "opencode-go", 0.9);
+    pa_core::auth::opencode_accounts::pin_session(&agent, "session-a", "opencode-go");
+
+    let row = ProviderRow {
+        id: "opencode-go".to_string(),
+        name: "OpenCode Go".to_string(),
+        auth_type: AuthType::Oauth,
+        status: None,
+        flow: AuthFlow::TerminalFlow,
+        configured: true,
+        available: true,
+    };
+    assert!(matches!(
+        auth.logout(&row).await,
+        ProviderAuthOutcome::Status(_)
+    ));
+
+    let state = pa_core::auth::opencode_accounts::load(&agent);
+    assert!(
+        !state.accounts.contains_key("opencode-go"),
+        "the logged-out slot's usage and verdict are gone"
+    );
+    assert!(state.pins.is_empty(), "the logged-out slot's pins are gone");
 }

@@ -27,6 +27,7 @@ pub mod late_sent_messages;
 pub mod messages;
 pub mod provider_adapter;
 pub mod provider_failover;
+pub mod provider_failure;
 pub mod provider_park;
 pub mod provider_retry;
 pub mod refine;

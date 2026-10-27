@@ -1091,7 +1091,7 @@ async fn aborted_tool_call_result_carries_elapsed_duration() {
                 entered.store(true, std::sync::atomic::Ordering::SeqCst);
                 // The recursive-scan shape: unbounded runtime, only the
                 // abort ends it.
-                tokio::time::sleep(std::time::Duration::from_secs(600)).await;
+                tokio::time::sleep(std::time::Duration::from_mins(10)).await;
                 Ok(pa_agent::types::AgentToolResult::text("done"))
             })
         }

@@ -36,7 +36,7 @@ impl Default for RetryPolicy {
     fn default() -> Self {
         Self {
             max_attempts: 5,
-            max_backoff: Duration::from_secs(60),
+            max_backoff: Duration::from_mins(1),
         }
     }
 }

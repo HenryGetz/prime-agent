@@ -894,3 +894,100 @@ fn truncate_plain_matches_truncate_to_width() {
     assert_eq!(truncate_plain("abcdef", 2), "..");
     assert_eq!(truncate_plain("abcdef", 1), ".");
 }
+
+#[test]
+fn opencode_go_usage_renders_each_window_and_the_worst_state() {
+    let dir = tempfile::tempdir().expect("tempdir");
+    let agent = dir.path();
+    let now = epoch_ms();
+    std::fs::write(
+        agent.join("opencode-go-routing.json"),
+        serde_json::json!({
+            "accounts": {
+                "opencode-go": {
+                    "orgId": "org_a",
+                    "lastServedAtMs": now - 1_000,
+                    "usedPct": 0.95,
+                    "usedPctAtMs": now - 90_000,
+                    "windows": {
+                        "rolling": {"percent": 50.0, "status": "ok", "resetsAt": "2026-10-25T20:00:00Z"},
+                        "weekly": {"percent": 95.0, "status": "rate-limited", "resetsAt": "2026-11-01T00:00:00Z"},
+                        "monthly": {"percent": 10.0, "status": "ok", "resetsAt": "2026-11-20T00:00:00Z"}
+                    }
+                },
+                "opencode-go#2": {
+                    "usedPct": 0.0,
+                    "usedPctAtMs": 0
+                }
+            },
+            "pins": {},
+            "usageFetchedAtMs": now - 90_000
+        })
+        .to_string(),
+    )
+    .expect("write routing");
+    std::fs::write(
+        agent.join("auth.json"),
+        serde_json::json!({
+            "opencode-go": {"type": "oauth", "access": "a", "refresh": "r", "expires": 1, "email": "dev@example.com"},
+            "opencode-go#2": {"type": "oauth", "access": "b", "refresh": "r", "expires": 1, "orgName": "Beta Org"},
+            "anthropic": {"type": "api_key", "key": "sk-ant"}
+        })
+        .to_string(),
+    )
+    .expect("write auth");
+
+    let rows = plain(&opencode_go_usage_rows(agent));
+    assert_eq!(rows[0], "OpenCode Go usage (local accounting)");
+    assert_eq!(rows[1], "");
+    assert_eq!(rows[2], "last poll: 1m ago");
+    assert_eq!(rows[3], "");
+    assert_eq!(rows[4], "opencode-go — dev@example.com");
+    assert_eq!(rows[5], "  rolling: 50.0%  ok  resets 2026-10-25T20:00:00Z");
+    assert_eq!(
+        rows[6],
+        "  weekly: 95.0%  rate-limited  resets 2026-11-01T00:00:00Z"
+    );
+    assert_eq!(rows[7], "  monthly: 10.0%  ok  resets 2026-11-20T00:00:00Z");
+    assert_eq!(rows[8], "  state: warning (95.0%)");
+    assert_eq!(rows[9], "");
+    assert_eq!(rows[10], "opencode-go#2 — Beta Org");
+    assert_eq!(rows[11], "  no data — waiting for the first poll");
+    assert_eq!(rows[12], "");
+    assert_eq!(
+        rows[13],
+        "Windows are per account; the poll runs in the background."
+    );
+    assert_eq!(rows.len(), 14);
+}
+
+#[test]
+fn opencode_go_usage_empty_state_is_actionable() {
+    let dir = tempfile::tempdir().expect("tempdir");
+    let rows = plain(&opencode_go_usage_rows(dir.path()));
+    assert_eq!(rows[0], "OpenCode Go usage (local accounting)");
+    assert_eq!(rows[2], "last poll: never");
+    assert_eq!(
+        rows[4],
+        "No OpenCode Go usage yet — send a request or /login"
+    );
+    assert_eq!(
+        rows.last().expect("note"),
+        "Windows are per account; the poll runs in the background."
+    );
+}
+
+#[test]
+fn opencode_go_usage_state_thresholds() {
+    assert_eq!(window_state(0.0), "ready");
+    assert_eq!(window_state(79.9), "ready");
+    assert_eq!(window_state(80.0), "warning");
+    assert_eq!(window_state(99.9), "warning");
+    assert_eq!(window_state(100.0), "limited");
+    assert_eq!(age_label(10_000, 0), "never");
+    assert_eq!(age_label(10_000, 9_000), "1s ago");
+    assert_eq!(age_label(120_000, 1), "1m ago");
+    assert_eq!(age_label(3_600_000, 1), "59m ago");
+    assert_eq!(age_label(7_200_000, 1), "1h 59m ago");
+    assert_eq!(age_label(86_400_000 * 2, 1), "1d ago");
+}

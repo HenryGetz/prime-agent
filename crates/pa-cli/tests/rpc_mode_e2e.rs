@@ -266,7 +266,7 @@ impl Drop for RpcChild {
     }
 }
 
-const TIMEOUT: Duration = Duration::from_secs(60);
+const TIMEOUT: Duration = Duration::from_mins(1);
 
 fn turn_script(steps: &Value) -> Value {
     json!({ "responses": steps })
@@ -401,7 +401,7 @@ fn rpc_steer_and_follow_up_queue_then_abort() {
     let response = client.request(&json!({ "type": "prompt", "message": "go" }));
     assert_eq!(response["success"], true);
     // The response fires at admission (TS `preflightResult`): the turn is mid-LLM-call here.
-    std::thread::sleep(Duration::from_millis(1000));
+    std::thread::sleep(Duration::from_secs(1));
     let steer = client.request(&json!({ "type": "steer", "message": "steer this" }));
     assert_eq!(steer["success"], true, "steer queues: {steer}");
     let follow_up = client.request(&json!({ "type": "follow_up", "message": "fu this" }));

@@ -212,10 +212,8 @@ pub fn assistant_message_parts(
     let mut blocks = Vec::new();
     let mut tool_calls = Vec::new();
     match message.get("content") {
-        Some(Value::String(text)) => {
-            if !text.is_empty() {
-                blocks.push(MessageBlock::Text(text.clone()));
-            }
+        Some(Value::String(text)) if !text.is_empty() => {
+            blocks.push(MessageBlock::Text(text.clone()));
         }
         Some(Value::Array(array)) => {
             for block in array {

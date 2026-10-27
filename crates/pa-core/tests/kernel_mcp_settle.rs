@@ -117,7 +117,7 @@ fn scripted_model() -> pa_agent::types::Model {
 async fn wait_for_kernel_boot(
     provisioner: &Arc<pa_core::kernel::provisioner::IpythonKernelProvisioner>,
 ) {
-    let deadline = Instant::now() + Duration::from_secs(120);
+    let deadline = Instant::now() + Duration::from_mins(2);
     loop {
         if provisioner.has_running_kernel() {
             return;

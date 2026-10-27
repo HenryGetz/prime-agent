@@ -1390,3 +1390,274 @@ fn an_explicit_scope_with_no_matches_does_not_warn_about_an_excluded_default() {
         "explicitly excluded defaults do not imply an unavailable-model fallback"
     );
 }
+
+/// An `opencode-go` auth.json with two stacked slots: `opencode-go` (A) and
+/// `opencode-go#2` (B).
+fn write_opencode_slots(agent_dir: &std::path::Path) {
+    std::fs::create_dir_all(agent_dir).unwrap();
+    std::fs::write(
+        agent_dir.join("auth.json"),
+        json!({
+            "opencode-go": {
+                "type": "oauth",
+                "access": "access-a",
+                "refresh": "refresh-a",
+                "expires": i64::MAX / 2,
+                "accountId": "usr_a",
+                "orgId": "org_a",
+                "apiEndpoint": "https://opencode.ai",
+            },
+            "opencode-go#2": {
+                "type": "oauth",
+                "access": "access-b",
+                "refresh": "refresh-b",
+                "expires": i64::MAX / 2,
+                "accountId": "usr_b",
+                "orgId": "org_b",
+                "apiEndpoint": "https://opencode.ai",
+            },
+        })
+        .to_string(),
+    )
+    .unwrap();
+}
+
+/// The routing state: A is the warm leader, B a slightly older sibling. A fresh
+/// usage sample on both keeps the background prime out of the test.
+fn write_routing_state(agent_dir: &std::path::Path, used_a: f64, used_b: f64) {
+    let now = pa_core::auth::opencode_accounts::epoch_ms();
+    std::fs::create_dir_all(agent_dir).unwrap();
+    let mut state = pa_core::auth::opencode_accounts::load(agent_dir);
+    let accounts = serde_json::json!({
+        "opencode-go": {
+            "orgId": "org_a",
+            "lastServedAtMs": now,
+            "usedPct": used_a,
+            "usedPctAtMs": now,
+            "primeAttemptAtMs": now,
+        },
+        "opencode-go#2": {
+            "orgId": "org_b",
+            "lastServedAtMs": now - 60_000,
+            "usedPct": used_b,
+            "usedPctAtMs": now,
+            "primeAttemptAtMs": now,
+        },
+    });
+    state.accounts = serde_json::from_value(accounts).expect("account states");
+    std::fs::write(
+        agent_dir.join(pa_core::auth::opencode_accounts::ROUTING_FILE),
+        serde_json::to_string(&state).unwrap(),
+    )
+    .unwrap();
+}
+
+fn opencode_model() -> Model {
+    pa_ai::opencode_go_models::models()
+        .into_iter()
+        .find(|model| model.id == "deepseek-v4.1-flash")
+        .expect("deepseek-v4.1-flash is in the opencode-go roster")
+}
+
+fn opencode_engine(dir: &std::path::Path, session_file: &str) -> AgentSessionEngine {
+    let agent_dir = dir.join("agent");
+    AgentSessionEngine::new(AgentEngineConfig {
+        cwd: dir.to_path_buf(),
+        agent_dir: agent_dir.clone(),
+        provider: None,
+        model: None,
+        api_key: None,
+        thinking: None,
+        session_dir: None,
+        session_file: Some(agent_dir.join(session_file)),
+        faux_script: None,
+        supervisor_link: None,
+        telemetry_disabled: None,
+        cron_store: None,
+        queued_steering_probe: None,
+    })
+    .unwrap()
+}
+
+/// A settled provider failure carrying the gateway's HTTP status.
+fn failure_message(status: u16) -> pa_agent::types::AssistantMessage {
+    serde_json::from_value(json!({
+        "content": [],
+        "api": "opencode-go",
+        "provider": "opencode-go",
+        "model": "deepseek-v4.1-flash",
+        "usage": {
+            "input": 0,
+            "output": 0,
+            "cacheRead": 0,
+            "cacheWrite": 0,
+            "totalTokens": 0,
+            "cost": {
+                "input": 0,
+                "output": 0,
+                "cacheRead": 0,
+                "cacheWrite": 0,
+                "total": 0,
+            },
+        },
+        "stopReason": "error",
+        "diagnostics": [{
+            "type": "provider_stream_failure",
+            "timestamp": 0,
+            "details": {"kind": "auth", "status": status},
+        }],
+        "errorMessage": "Workspace access denied",
+        "timestamp": 0,
+    }))
+    .unwrap()
+}
+
+#[test]
+fn two_session_keys_pin_different_slots_and_the_same_key_stays_pinned() {
+    let dir = tempfile::TempDir::new().unwrap();
+    let agent_dir = dir.path().join("agent");
+    write_opencode_slots(&agent_dir);
+    write_routing_state(&agent_dir, 0.5, 0.1);
+    let model = opencode_model();
+
+    let first = opencode_engine(dir.path(), "session-a.jsonl");
+    let second = opencode_engine(dir.path(), "session-b.jsonl");
+    assert_eq!(
+        first.resolve_request_api_key(&model).as_deref(),
+        Some("access-a"),
+        "a fresh session joins the warm leader"
+    );
+    assert_eq!(
+        first.resolve_request_api_key(&model).as_deref(),
+        Some("access-a"),
+        "the same key stays pinned"
+    );
+
+    write_routing_state(&agent_dir, 0.95, 0.1);
+    assert_eq!(
+        second.resolve_request_api_key(&model).as_deref(),
+        Some("access-b"),
+        "a different session key starts on the sibling"
+    );
+    assert_eq!(
+        first.resolve_request_api_key(&model).as_deref(),
+        Some("access-a"),
+        "the existing pin drains in place"
+    );
+
+    let state = pa_core::auth::opencode_accounts::load(&agent_dir);
+    assert_eq!(
+        state.pins.get("session-a").map(|pin| pin.slot.as_str()),
+        Some("opencode-go")
+    );
+    assert_eq!(
+        state.pins.get("session-b").map(|pin| pin.slot.as_str()),
+        Some("opencode-go#2")
+    );
+}
+
+#[test]
+fn a_workspace_verdict_rotates_the_next_request_to_a_sibling() {
+    let dir = tempfile::TempDir::new().unwrap();
+    let agent_dir = dir.path().join("agent");
+    write_opencode_slots(&agent_dir);
+    write_routing_state(&agent_dir, 0.5, 0.1);
+    let model = opencode_model();
+
+    let engine = opencode_engine(dir.path(), "session-a.jsonl");
+    assert_eq!(
+        engine.resolve_request_api_key(&model).as_deref(),
+        Some("access-a")
+    );
+
+    engine.record_provider_failure_verdict(&failure_message(403));
+
+    assert_eq!(
+        engine.resolve_request_api_key(&model).as_deref(),
+        Some("access-b"),
+        "the verdict drops the pin and the next request rotates"
+    );
+}
+
+#[test]
+fn a_verdict_from_another_provider_leaves_the_routing_state_untouched() {
+    let dir = tempfile::TempDir::new().unwrap();
+    let agent_dir = dir.path().join("agent");
+    write_opencode_slots(&agent_dir);
+    write_routing_state(&agent_dir, 0.5, 0.1);
+    let before = pa_core::auth::opencode_accounts::load(&agent_dir);
+
+    let engine = opencode_engine(dir.path(), "session-a.jsonl");
+    let mut message = failure_message(403);
+    message.provider = "anthropic".to_string();
+    engine.record_provider_failure_verdict(&message);
+
+    assert_eq!(
+        pa_core::auth::opencode_accounts::load(&agent_dir),
+        before,
+        "a 403 from another provider records no OpenCode Go verdict"
+    );
+}
+
+#[test]
+fn a_settled_429_demotes_the_serving_slot_immediately() {
+    let dir = tempfile::TempDir::new().unwrap();
+    let agent_dir = dir.path().join("agent");
+    write_opencode_slots(&agent_dir);
+    write_routing_state(&agent_dir, 0.5, 0.1);
+    let model = opencode_model();
+
+    let engine = opencode_engine(dir.path(), "session-a.jsonl");
+    assert_eq!(
+        engine.resolve_request_api_key(&model).as_deref(),
+        Some("access-a"),
+        "the warm leader serves first"
+    );
+
+    engine.record_provider_failure_verdict(&failure_message(429));
+
+    let state = pa_core::auth::opencode_accounts::load(&agent_dir);
+    assert!(
+        state.rate_limited("opencode-go", pa_core::auth::opencode_accounts::epoch_ms()),
+        "the 429 demotes the serving slot immediately"
+    );
+    assert!(state.pins.is_empty(), "the 429 drops the slot's pins");
+    assert_eq!(
+        engine.resolve_request_api_key(&model).as_deref(),
+        Some("access-b"),
+        "the next request rotates to the healthy sibling"
+    );
+}
+
+#[test]
+fn a_settled_410_learns_the_model_as_dead() {
+    let dir = tempfile::TempDir::new().unwrap();
+    let agent_dir = dir.path().join("agent");
+    write_opencode_slots(&agent_dir);
+    let engine = opencode_engine(dir.path(), "session-a.jsonl");
+
+    engine.record_provider_failure_verdict(&failure_message(410));
+
+    assert_eq!(
+        pa_ai::opencode_go_dead_models::load(&agent_dir),
+        std::collections::BTreeSet::from(["deepseek-v4.1-flash".to_string()]),
+        "the settled 410 retires the model from the roster and cache"
+    );
+}
+
+#[test]
+fn a_retirement_message_from_another_provider_marks_nothing() {
+    let dir = tempfile::TempDir::new().unwrap();
+    let agent_dir = dir.path().join("agent");
+    write_opencode_slots(&agent_dir);
+    let engine = opencode_engine(dir.path(), "session-a.jsonl");
+    let mut message = failure_message(410);
+    message.provider = "anthropic".to_string();
+    message.error_message = Some("ModelDeprecated: claude".to_string());
+    engine.record_provider_failure_verdict(&message);
+
+    assert!(
+        pa_ai::opencode_go_dead_models::load(&agent_dir).is_empty(),
+        "another provider's retirement says nothing about the Go catalog"
+    );
+}

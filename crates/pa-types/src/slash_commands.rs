@@ -55,7 +55,8 @@ const CANONICAL_BUILTIN_SLASH_COMMANDS: &[BuiltinSlashCommand] = &[
     BuiltinSlashCommand { name: "logs", description: "Show where daemon and client logs are saved", execution: SlashCommandExecution::Client, argument_hint: None, aliases: &[], takes_argument: false },
     BuiltinSlashCommand { name: "traces", description: "Preview, upload, or configure Prime Agent traces", execution: SlashCommandExecution::Client, argument_hint: Some("[status|on|off|preview|upload|upload-current|upload-all|login]"), aliases: &[], takes_argument: false },
     BuiltinSlashCommand { name: "telemetry", description: "Show or change usage telemetry (pseudonymous metrics, never prompts or code)", execution: SlashCommandExecution::Client, argument_hint: Some("[status|on|off]"), aliases: &[], takes_argument: true },
-    BuiltinSlashCommand { name: "context", description: "Show token, cost, and context usage for agent and sub-agents", execution: SlashCommandExecution::Client, argument_hint: None, aliases: &["usage"], takes_argument: false },
+    BuiltinSlashCommand { name: "context", description: "Show token, cost, and context usage for agent and sub-agents", execution: SlashCommandExecution::Client, argument_hint: None, aliases: &[], takes_argument: false },
+    BuiltinSlashCommand { name: "usage", description: "Show OpenCode Go subscription usage: 5h, weekly, monthly windows per account", execution: SlashCommandExecution::Client, argument_hint: None, aliases: &["opencode-usage", "go-usage"], takes_argument: false },
     BuiltinSlashCommand { name: "changelog", description: "Show changelog entries", execution: SlashCommandExecution::Client, argument_hint: None, aliases: &[], takes_argument: false },
     BuiltinSlashCommand { name: "update", description: "Update to the latest Rust build (uninstalls the TypeScript version; sessions preserved)", execution: SlashCommandExecution::Client, argument_hint: None, aliases: &[], takes_argument: false },
     BuiltinSlashCommand { name: "nightly", description: "Switch Prime Agent updates to the nightly channel (unreleased builds, may be broken)", execution: SlashCommandExecution::Client, argument_hint: Some("[on|off|status]"), aliases: &[], takes_argument: true },
@@ -253,7 +254,10 @@ mod tests {
         let registry = SlashCommandRegistry::builtin();
         assert_eq!(registry.resolve_name("clear"), Some("new"));
         assert_eq!(registry.resolve_name("thinking"), Some("effort"));
-        assert_eq!(registry.resolve_name("usage"), Some("context"));
+        assert_eq!(registry.resolve_name("opencode-usage"), Some("usage"));
+        assert_eq!(registry.resolve_name("go-usage"), Some("usage"));
+        assert_eq!(registry.resolve_name("usage"), Some("usage"));
+        assert_eq!(registry.resolve_name("context"), Some("context"));
         assert_eq!(registry.resolve_name("rename"), Some("name"));
         assert_eq!(registry.resolve_name("side"), Some("btw"));
         assert!(registry.is_builtin("model"));

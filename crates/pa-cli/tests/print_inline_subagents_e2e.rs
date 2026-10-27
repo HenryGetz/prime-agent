@@ -113,7 +113,7 @@ impl PrintLane {
                 .expect("binary present");
             let pid = child.id().expect("running child") as i32;
             if let Ok(status) =
-                tokio::time::timeout(std::time::Duration::from_secs(120), child.wait()).await
+                tokio::time::timeout(std::time::Duration::from_mins(2), child.wait()).await
             {
                 Some(status.expect("print run exits"))
             } else {

@@ -29,6 +29,15 @@ pub(super) struct PendingModelSignIn {
 impl SessionUi {
     // Provider auth (/login, /logout)
 
+    /// The `feature_<name>_<outcome>_count` vocabulary value for one login result.
+    fn feature_outcome_kind(outcome: &crate::provider_auth::ProviderAuthOutcome) -> &'static str {
+        match outcome {
+            crate::provider_auth::ProviderAuthOutcome::Status(_) => "completed",
+            crate::provider_auth::ProviderAuthOutcome::Error(_) => "failed",
+            crate::provider_auth::ProviderAuthOutcome::Cancelled => "canceled",
+        }
+    }
+
     /// Fetch the hook's rows and mount the selector; an empty logout store
     /// answers the TS status directly.
     pub(crate) async fn open_provider_auth(
@@ -307,11 +316,14 @@ impl SessionUi {
                 view.auth_panel = None;
                 // The warning fires on a COMPLETED login only: a cancelled or errored flow
                 // never consumes the once-per-session gate.
+                let outcome_kind = Self::feature_outcome_kind(&outcome);
                 let completed = matches!(
                     outcome,
                     crate::provider_auth::ProviderAuthOutcome::Status(_)
                 );
                 self.apply_auth_outcome(outcome, &provider, view).await;
+                // The `feature_login_<outcome>_count` counter (the catalog's login family).
+                self.track_feature_outcome("login", outcome_kind, None);
                 if completed {
                     self.maybe_warn_anthropic_subscription_auth(&provider, view);
                 }

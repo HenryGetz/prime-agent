@@ -1484,6 +1484,35 @@ fn builtin_tools(_cwd: &std::path::Path) -> Vec<Arc<dyn pa_agent::types::AgentTo
     Vec::new()
 }
 
+/// Record a settled print turn's provider failure on the shared routing state:
+/// `--print` keeps the same `OpenCode` Go 429/verdict/dead-model learning as
+/// the daemon worker, using the last settled assistant message.
+async fn record_settled_provider_failure(
+    engine: &pa_core::session_engine::engine::SessionEngine,
+    agent_dir: &std::path::Path,
+) {
+    let settled = engine.session.last_assistant_message().await;
+    record_settled_provider_failure_message(agent_dir, settled.as_ref());
+}
+
+/// The print path's message conversion: the settled session row is the wire
+/// shape; the shared helper consumes the loop shape.
+fn record_settled_provider_failure_message(
+    agent_dir: &std::path::Path,
+    settled: Option<&pa_types::session::AgentMessage>,
+) {
+    let Some(pa_types::session::AgentMessage::Assistant(assistant)) = settled else {
+        return;
+    };
+    let Some(assistant) = pa_core::session_engine::provider_adapter::json_round_trip::<
+        pa_types::ai::AssistantMessage,
+        pa_agent::types::AssistantMessage,
+    >(assistant) else {
+        return;
+    };
+    pa_core::session_engine::provider_failure::record_provider_failure(agent_dir, None, &assistant);
+}
+
 /// Admit prompts, stream json events when requested, and decide the exit code
 /// from the headless terminal result plus the autonomous gate contract.
 async fn run_prompts_and_emit(
@@ -1610,6 +1639,7 @@ async fn run_prompts_and_emit(
             .await
             .map_err(|error| format!("{error:#}"))?;
         engine.session.agent().wait_for_idle().await;
+        record_settled_provider_failure(engine, &options.config.agent_dir).await;
         boundary
             .run_at_settled_turn(engine, model, api_key.clone(), global_harness_dir.clone())
             .await?;

@@ -728,6 +728,9 @@ mod tests {
                 resource: None,
                 issuer: None,
                 audience_mode: None,
+                org_id: None,
+                api_endpoint: None,
+                email: None,
                 enterprise_url: None,
             },
         );
@@ -778,6 +781,9 @@ mod tests {
                 resource: None,
                 issuer: None,
                 audience_mode: None,
+                org_id: None,
+                api_endpoint: None,
+                email: None,
                 enterprise_url: None,
             },
         );

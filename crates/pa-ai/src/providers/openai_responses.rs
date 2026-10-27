@@ -190,6 +190,7 @@ fn build_headers(
         &mut headers,
         &model.provider,
         options.base.session_id.as_deref(),
+        &model.base_url,
     );
     headers
 }
@@ -310,7 +311,13 @@ async fn run_stream(
         }
     }
 
-    let url = format!("{}/responses", model.base_url.trim_end_matches('/'));
+    let base = model.base_url.trim_end_matches('/');
+    let path = if model.provider == "opencode-go" {
+        crate::opencode_go_spec_generated::RESPONSES_PATH
+    } else {
+        "/responses"
+    };
+    let url = format!("{base}{path}");
     let headers = build_headers(model, &api_key, &options, cache_session_id.as_deref());
     let mut response: HttpResponse = send(RequestOptions {
         method: reqwest::Method::POST,

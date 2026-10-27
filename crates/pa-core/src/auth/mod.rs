@@ -1,6 +1,7 @@
 //! Auth subsystem: credential storage, resolution priority, stale-marking.
 
 pub(crate) mod manager;
+pub mod opencode_accounts;
 pub(crate) mod prime_inference;
 pub(crate) mod prime_inference_login;
 pub(crate) mod prime_traces;
@@ -27,8 +28,8 @@ pub use prime_traces::{
     PrimeAuthInfo, PRIME_AGENT_TRACES_PROVIDER_ID, PRIME_AGENT_TRACES_PROVIDER_NAME,
 };
 pub use provider_oauth::{
-    ProviderOAuth, ANTHROPIC_PROVIDER_ID, GITHUB_COPILOT_PROVIDER_ID, OPENAI_CODEX_PROVIDER_ID,
-    XAI_PROVIDER_ID,
+    is_opencode_go_provider, ProviderOAuth, ANTHROPIC_PROVIDER_ID, GITHUB_COPILOT_PROVIDER_ID,
+    OPENAI_CODEX_PROVIDER_ID, OPENCODE_GO_PROVIDER_ID, XAI_PROVIDER_ID,
 };
 pub use storage::{
     parse_storage_data, AuthStorageBackend, FileAuthStorageBackend, InMemoryAuthStorageBackend,

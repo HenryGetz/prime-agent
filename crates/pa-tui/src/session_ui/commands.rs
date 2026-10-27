@@ -625,10 +625,12 @@ impl SessionUi {
                     }
                 }
             }
-            // `/context` (and its `/usage` alias): the agent tree with token/cost columns and
-            // context utilization. The optional `all` argument is a deliberate TS delta (TS takes
-            // none): past the row budget the default view collapses to the highest-usage agents;
-            // `all` renders the whole tree.
+            // `/context`: the agent tree with token/cost columns and context
+            // utilization. The optional `all` argument is a deliberate TS delta
+            // (TS takes none): past the row budget the default view collapses to
+            // the highest-usage agents; `all` renders the whole tree.
+            // `/usage` is its own command (the OpenCode Go subscription
+            // windows), not an alias of this one.
             "context" => {
                 let scope = match resolved.args.as_str() {
                     "" => info_commands::ContextTreeScope::Collapsed,
@@ -666,6 +668,29 @@ impl SessionUi {
                         self.error_row(&format!("{error:#}"), view);
                     }
                 }
+            }
+            // `/usage`: the OpenCode Go subscription windows from the locally
+            // persisted routing state. A pure client read: the background poll
+            // owns every network call, so this never blocks on the paint path.
+            "usage" => {
+                if !resolved.args.is_empty() {
+                    view.editor.set_text(text);
+                    self.error_row("Usage: /usage", view);
+                    return Ok(());
+                }
+                let Some(agent_dir) = pa_types::platform::agent_dir() else {
+                    self.error_row(
+                        "home directory not found: set HOME (or USERPROFILE on Windows)",
+                        view,
+                    );
+                    return Ok(());
+                };
+                self.open_info_panel(
+                    view,
+                    Some("Usage".to_string()),
+                    InfoContent::Rows(info_commands::opencode_go_usage_rows(&agent_dir)),
+                );
+                self.track_menu_opened("usage", "command");
             }
             // The exact assembled prompt is unbounded, so it renders in the
             // scrollable info panel instead of flooding the transcript.

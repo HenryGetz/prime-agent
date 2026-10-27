@@ -36,7 +36,12 @@ fn norm_string(s: &str, tmp: &str) -> String {
     let re = regex_lite(r"pi-(?:bash|output)-[0-9a-f]+\.log");
     let out = re.replace_all(&out, "pi-<ID>.log").into_owned();
     let re = regex_lite(r"tmp-stdout-[0-9A-Za-z_]+");
-    re.replace_all(&out, "tmp-stdout-<ID>").into_owned()
+    let out = re.replace_all(&out, "tmp-stdout-<ID>").into_owned();
+    // A `git reset --hard`-style line echoes the fixture commit's hash, which
+    // depends on the host git's object format/version rather than on the tool
+    // under test.
+    let re = regex_lite(r"HEAD is now at [0-9a-f]{7,40}");
+    re.replace_all(&out, "HEAD is now at <HASH>").into_owned()
 }
 
 /// Deep-normalize all strings in a JSON value.
@@ -245,7 +250,8 @@ async fn golden_bash_group_matches_ts() {
                 );
                 let text =
                     norm_string(result.content[0].as_text().expect("text block"), tmp_root());
-                let expected_text = recorded["text"].as_str().expect("text");
+                let expected_text =
+                    norm_string(recorded["text"].as_str().expect("text"), tmp_root());
                 if text != expected_text {
                     // Stdout/stderr interleaving is OS-timing dependent in both implementations;
                     // the same multiset of lines is accepted, anything else is a mismatch.

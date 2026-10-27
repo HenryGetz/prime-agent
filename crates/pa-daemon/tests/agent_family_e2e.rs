@@ -434,7 +434,7 @@ async fn parent_child_agent_message_round_trip_end_to_end() {
     children.notify_turn_done();
     // Wait for the spawn turn to settle before delivering: the first delivered message
     // would otherwise consume the spawn response and lose its reply cell.
-    let settle_deadline = Instant::now() + Duration::from_secs(60);
+    let settle_deadline = Instant::now() + Duration::from_mins(1);
     let spawn_row = loop {
         let roster = children.list_subagents().await.expect("child roster");
         let row = roster.first().expect("one child row");
@@ -758,7 +758,7 @@ async fn family_edges_never_cross_families_end_to_end() {
         assert_eq!(handle.name, kid_name);
         children.notify_turn_done();
         // The spawn turn settles once the child goes idle with an answer (bounded).
-        let settle_deadline = Instant::now() + Duration::from_secs(60);
+        let settle_deadline = Instant::now() + Duration::from_mins(1);
         loop {
             let roster = children.list_subagents().await.expect("child roster");
             let row = roster.first().expect("one child row");
@@ -897,7 +897,7 @@ async fn family_edges_never_cross_families_end_to_end() {
         .expect("spawn the grandchild");
     assert_eq!(grandkid_handle.name, "grandkid");
     kid_children.notify_turn_done();
-    let grandkid_settle_deadline = Instant::now() + Duration::from_secs(60);
+    let grandkid_settle_deadline = Instant::now() + Duration::from_mins(1);
     let grandkid_active = loop {
         let roster = kid_children.list_subagents().await.expect("roster");
         let row = roster.first().expect("one grandchild row");
@@ -1217,7 +1217,7 @@ async fn parent_renames_a_child_end_to_end() {
     children.notify_turn_done();
     // Wait for the spawn turn to settle (bounded), then read the roster's
     // live/persisted child ids.
-    let settle_deadline = Instant::now() + Duration::from_secs(60);
+    let settle_deadline = Instant::now() + Duration::from_mins(1);
     loop {
         let roster = children.list_subagents().await.expect("child roster");
         let row = roster.first().expect("one child row");

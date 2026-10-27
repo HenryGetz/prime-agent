@@ -72,11 +72,9 @@ fn tool_result_entries_persisted_and_streamed() {
                 assert_eq!(event["toolCallId"], "call-1");
             }
             Some("tool_execution_end") => tool_execution_end = event.clone(),
-            Some("message_start" | "message_end") => {
-                if event["message"]["role"] == "toolResult" {
-                    message_pair += 1;
-                    tool_result_message = event["message"].clone();
-                }
+            Some("message_start" | "message_end") if event["message"]["role"] == "toolResult" => {
+                message_pair += 1;
+                tool_result_message = event["message"].clone();
             }
             // The first turn ends after the tool result; the scripted final
             // assistant response is persisted only before agent_end.

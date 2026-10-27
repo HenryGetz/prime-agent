@@ -458,7 +458,12 @@ impl AgentSessionEngine {
         let store_healthy = auth.load_error().is_none();
         let mut registry =
             pa_core::models::ModelRegistry::create(auth, self.config.agent_dir.join("models.json"));
-        let resolved = registry.get_api_key_and_headers(model, model.headers.as_ref());
+        let session_key = self.routing_session_key();
+        let resolved = registry.get_api_key_and_headers_for_session(
+            model,
+            model.headers.as_ref(),
+            session_key.as_deref(),
+        );
         // The credential check runs AFTER the resolution: the registry's
         // lookup may OAuth-refresh and store a fresh token, so a check
         // before it would read the stale one and discard the fresh pair.
@@ -487,8 +492,50 @@ impl AgentSessionEngine {
         let mut registry =
             pa_core::models::ModelRegistry::create(auth, self.config.agent_dir.join("models.json"));
         registry
-            .get_api_key_and_headers(model, model.headers.as_ref())
+            .get_api_key_and_headers_for_session(
+                model,
+                model.headers.as_ref(),
+                self.routing_session_key().as_deref(),
+            )
             .api_key
+    }
+
+    /// The stable per-session routing key for the `OpenCode` Go account pin:
+    /// the session file's stem (the identity a daemon worker keeps across
+    /// restores), else the configured active session id.
+    pub(crate) fn routing_session_key(&self) -> Option<String> {
+        let stem = self
+            .session_file
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
+            .as_deref()
+            .and_then(std::path::Path::file_stem)
+            .and_then(std::ffi::OsStr::to_str)
+            .filter(|stem| !stem.is_empty())
+            .map(str::to_string);
+        stem.or_else(|| {
+            self.config
+                .supervisor_link
+                .as_ref()
+                .map(|link| link.active_session_id.clone())
+        })
+    }
+
+    /// Record a turn's provider HTTP failure on the session's serving
+    /// `OpenCode` Go account: a 401/402/403 drops the pin, a 429 demotes the
+    /// slot immediately, and a 410/deprecation message retires the model.
+    ///
+    /// The policy lives in [`pa_core::session_engine::provider_failure`] so the
+    /// CLI print path learns the same failure.
+    pub(crate) fn record_provider_failure_verdict(
+        &self,
+        message: &pa_agent::types::AssistantMessage,
+    ) {
+        pa_core::session_engine::provider_failure::record_provider_failure(
+            &self.config.agent_dir,
+            self.routing_session_key().as_deref(),
+            message,
+        );
     }
 
     /// The primary target a failover episode restores: the captured model

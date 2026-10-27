@@ -586,7 +586,13 @@ async fn run_stream(
         }
     }
 
-    let url = format!("{}/chat/completions", model.base_url.trim_end_matches('/'));
+    let base = model.base_url.trim_end_matches('/');
+    let path = if model.provider == "opencode-go" {
+        crate::opencode_go_spec_generated::CHAT_PATH
+    } else {
+        "/chat/completions"
+    };
+    let url = format!("{base}{path}");
     let headers = build_headers(
         model,
         &api_key,

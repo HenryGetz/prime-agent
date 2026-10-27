@@ -13,7 +13,7 @@ use super::venv::{
 // A PID-only lock cannot distinguish its original owner from an unrelated
 // process that later receives the same PID. Never evict a possibly live
 // bootstrap: bound the caller's wait instead, including for legacy locks.
-const BOOTSTRAP_LOCK_WAIT: Duration = Duration::from_secs(120);
+const BOOTSTRAP_LOCK_WAIT: Duration = Duration::from_mins(2);
 
 fn is_process_alive(pid: u32) -> bool {
     crate::platform::process::pid_exists(pid)

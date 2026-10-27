@@ -181,28 +181,27 @@ impl AuthStorage {
             self.reload();
             return Some(credential);
         }
-        // FETCH: outside every lock, one flight per provider.
-        let fetched = {
-            let _flight = refresh_flight(provider_id);
-            // The gate may have just released a flight that wrote a fresh
-            // credential; re-check before spending a refresh token.
-            let content = self.storage.read().unwrap_or_default();
-            if let Some(credential) = parse_storage_data(content.as_deref())
-                .ok()
-                .and_then(|data| data.credential(provider_id))
-                .filter(|credential| {
-                    matches!(
-                        credential,
-                        AuthCredential::Oauth { expires, .. } if now_epoch_ms() < *expires
-                    )
-                })
-            {
-                self.reload();
-                return Some(credential);
-            }
-            self.oauth.refresh(provider_id, &data)
-        };
-        let Some(new_credential) = fetched else {
+        // FETCH + WRITE under one flight per provider: the gate covers the write
+        // too, so a second caller cannot enter between this fetch and the
+        // credential landing and spend a second single-use refresh token.
+        let _flight = refresh_flight(provider_id);
+        // The gate may have just released a flight that wrote a fresh
+        // credential; re-check before spending a refresh token.
+        let content = self.storage.read().unwrap_or_default();
+        if let Some(credential) = parse_storage_data(content.as_deref())
+            .ok()
+            .and_then(|data| data.credential(provider_id))
+            .filter(|credential| {
+                matches!(
+                    credential,
+                    AuthCredential::Oauth { expires, .. } if now_epoch_ms() < *expires
+                )
+            })
+        {
+            self.reload();
+            return Some(credential);
+        }
+        let Some(new_credential) = self.oauth.refresh(provider_id, &data) else {
             // Refresh failed: keep credentials for a later retry; a peer
             // may have refreshed meanwhile, so reload before failing.
             self.reload();

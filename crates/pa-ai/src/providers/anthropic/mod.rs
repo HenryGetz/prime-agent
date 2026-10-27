@@ -346,11 +346,7 @@ pub(crate) fn build_request_headers(
     if needs_interleaved_beta {
         beta_features.push(INTERLEAVED_THINKING_BETA);
     }
-    let beta_header = if beta_features.is_empty() {
-        None
-    } else {
-        Some(beta_features.join(","))
-    };
+    let beta_header = (!beta_features.is_empty()).then(|| beta_features.join(","));
 
     let model_headers: Option<Map<String, Value>> = model.headers.as_ref().map(|headers| {
         headers
@@ -426,10 +422,20 @@ pub(crate) fn build_request_headers(
     };
 
     let mut pairs = headers_to_pairs(&default_headers);
-    crate::providers::opencode_headers::apply(&mut pairs, &model.provider, session_id);
+    crate::providers::opencode_headers::apply(
+        &mut pairs,
+        &model.provider,
+        session_id,
+        &model.base_url,
+    );
     // The Anthropic SDK always sends the API version; mirror it.
     pairs.insert(0, ("anthropic-version".into(), "2023-06-01".into()));
     if model.provider == "cloudflare-ai-gateway" || model.provider == "github-copilot" || is_oauth {
+        pairs.push(("Authorization".into(), format!("Bearer {api_key}")));
+    } else if model.provider == "opencode-go" {
+        // The Go gateway advertises both auth headers for its Anthropic lane;
+        // send the API key alongside the Bearer form.
+        pairs.push(("x-api-key".into(), api_key.to_string()));
         pairs.push(("Authorization".into(), format!("Bearer {api_key}")));
     } else {
         pairs.push(("x-api-key".into(), api_key.to_string()));
@@ -616,6 +622,24 @@ mod subscription_identity_tests {
             headers: None,
             compat: None,
         }
+    }
+
+    #[test]
+    fn opencode_go_sends_the_key_and_a_bearer_authorization() {
+        let mut model = test_model();
+        model.provider = "opencode-go".into();
+        model.base_url = "https://opencode.ai/zen/go".into();
+        let (headers, is_oauth) =
+            build_request_headers(&model, "sk-go-test", false, false, None, None);
+        assert!(!is_oauth, "the gateway key is a plain API key");
+        let header = |name: &str| {
+            headers
+                .iter()
+                .find(|(key, _)| key.eq_ignore_ascii_case(name))
+                .map(|(_, value)| value.as_str())
+        };
+        assert_eq!(header("x-api-key"), Some("sk-go-test"));
+        assert_eq!(header("authorization"), Some("Bearer sk-go-test"));
     }
 
     #[test]

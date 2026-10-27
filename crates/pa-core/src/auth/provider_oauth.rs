@@ -6,7 +6,8 @@ use std::sync::Arc;
 
 use pa_ai::oauth::{
     refresh_anthropic_token, refresh_github_copilot_token, refresh_openai_codex_token,
-    refresh_xai_token, CodexHttp, ProviderHttp, ReqwestCodexHttp, ReqwestProviderHttp,
+    refresh_opencode_token, refresh_xai_token, CodexHttp, ProviderHttp, ReqwestCodexHttp,
+    ReqwestProviderHttp,
 };
 
 use crate::auth::types::{AuthCredential, AuthStorageData};
@@ -19,6 +20,19 @@ pub const ANTHROPIC_PROVIDER_ID: &str = "anthropic";
 pub const GITHUB_COPILOT_PROVIDER_ID: &str = "github-copilot";
 /// The xAI (Grok) subscription provider id.
 pub const XAI_PROVIDER_ID: &str = "xai";
+/// The `OpenCode` Go (Console) subscription provider id; stacked accounts
+/// store under `opencode-go`, `opencode-go#2`, `opencode-go#3`, ...
+pub const OPENCODE_GO_PROVIDER_ID: &str = "opencode-go";
+
+/// Whether `provider_id` names an `OpenCode` Go slot (the base id or a
+/// `#N` stacked account).
+#[must_use]
+pub fn is_opencode_go_provider(provider_id: &str) -> bool {
+    provider_id == OPENCODE_GO_PROVIDER_ID
+        || provider_id
+            .strip_prefix("opencode-go#")
+            .is_some_and(|slot| !slot.is_empty() && slot.chars().all(|c| c.is_ascii_digit()))
+}
 
 /// The AI library's oauth registry as the auth storage's default
 /// integration.
@@ -68,6 +82,10 @@ impl ProviderOAuth {
         let AuthCredential::Oauth {
             refresh: Some(refresh_token),
             enterprise_url,
+            account_id,
+            org_id,
+            api_endpoint,
+            email,
             ..
         } = credential
         else {
@@ -77,6 +95,10 @@ impl ProviderOAuth {
         let provider_http = Arc::clone(&self.provider_http);
         let refresh_token = refresh_token.clone();
         let enterprise_url = enterprise_url.clone();
+        let account_id = account_id.clone();
+        let org_id = org_id.clone();
+        let api_endpoint = api_endpoint.clone();
+        let email = email.clone();
         let provider_id = provider_id.to_string();
         std::thread::Builder::new()
             .name("provider-oauth-refresh".to_string())
@@ -102,6 +124,9 @@ impl ProviderOAuth {
                             resource: None,
                             issuer: None,
                             audience_mode: None,
+                            org_id: None,
+                            api_endpoint: None,
+                            email: None,
                         })
                     }
                     ANTHROPIC_PROVIDER_ID => {
@@ -123,6 +148,9 @@ impl ProviderOAuth {
                             resource: None,
                             issuer: None,
                             audience_mode: None,
+                            org_id: None,
+                            api_endpoint: None,
+                            email: None,
                         })
                     }
                     GITHUB_COPILOT_PROVIDER_ID => {
@@ -147,6 +175,9 @@ impl ProviderOAuth {
                             resource: None,
                             issuer: None,
                             audience_mode: None,
+                            org_id: None,
+                            api_endpoint: None,
+                            email: None,
                         })
                     }
                     XAI_PROVIDER_ID => {
@@ -165,6 +196,37 @@ impl ProviderOAuth {
                             resource: None,
                             issuer: None,
                             audience_mode: None,
+                            org_id: None,
+                            api_endpoint: None,
+                            email: None,
+                        })
+                    }
+                    slot if slot.starts_with("opencode-go") => {
+                        // The Console rotates the pair; the workspace binding,
+                        // the account id, and the account email stay on the
+                        // credential.
+                        let credentials = runtime
+                            .block_on(refresh_opencode_token(
+                                provider_http.as_ref(),
+                                &refresh_token,
+                                api_endpoint.as_deref(),
+                            ))
+                            .ok()?;
+                        Some(AuthCredential::Oauth {
+                            access: credentials.access,
+                            refresh: Some(credentials.refresh),
+                            expires: credentials.expires,
+                            account_id: account_id.clone(),
+                            enterprise_url: None,
+                            endpoint: None,
+                            token_endpoint: None,
+                            client_id: None,
+                            resource: None,
+                            issuer: None,
+                            audience_mode: None,
+                            org_id: credentials.org_id.or(org_id),
+                            api_endpoint: Some(credentials.api_endpoint),
+                            email,
                         })
                     }
                     // The match arms cover the four subscription ids;
@@ -194,7 +256,8 @@ impl crate::auth::OAuthIntegration for ProviderOAuth {
                 | ANTHROPIC_PROVIDER_ID
                 | GITHUB_COPILOT_PROVIDER_ID
                 | XAI_PROVIDER_ID
-        ) {
+        ) && !is_opencode_go_provider(provider_id)
+        {
             return None;
         }
         let credential = credentials.credential(provider_id)?;
@@ -277,6 +340,9 @@ mod tests {
             resource: None,
             issuer: None,
             audience_mode: None,
+            org_id: None,
+            api_endpoint: None,
+            email: None,
         }
     }
 
@@ -295,6 +361,9 @@ mod tests {
                 resource: None,
                 issuer: None,
                 audience_mode: None,
+                org_id: None,
+                api_endpoint: None,
+                email: None,
             },
             _ => AuthCredential::Oauth {
                 access: "stale-access".to_string(),
@@ -308,6 +377,9 @@ mod tests {
                 resource: None,
                 issuer: None,
                 audience_mode: None,
+                org_id: None,
+                api_endpoint: None,
+                email: None,
             },
         }
     }
@@ -517,6 +589,9 @@ mod tests {
             resource: None,
             issuer: None,
             audience_mode: None,
+            org_id: None,
+            api_endpoint: None,
+            email: None,
         };
         let mut auth = storage_with_credential(OPENAI_CODEX_PROVIDER_ID, &unexpired);
         assert_eq!(

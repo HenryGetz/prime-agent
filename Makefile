@@ -199,7 +199,13 @@ shard-gates:
 	python3 scripts/test_ci_test_shard.py
 	python3 scripts/test_ci_pr_crates.py
 
-.PHONY: check deny windows-cross actionlint glibc-gate release-dry-run continuous-dry-run audit-build package catalog-assets catalog-assets-fixture catalog-assets-gates fold-gates restamp-gates shard-gates perf
+OPENCODE_GO_SPEC_DIR ?= ../opencode-go-spec
+OMP_GO_DIR ?= ../../omp-go
+
+spec-check:
+	python3 $(OPENCODE_GO_SPEC_DIR)/tools/sync.py --omp-go $(OMP_GO_DIR) --prime-agent . --check
+
+.PHONY: check spec-check deny windows-cross actionlint glibc-gate release-dry-run continuous-dry-run audit-build package catalog-assets catalog-assets-fixture catalog-assets-gates fold-gates restamp-gates shard-gates perf
 
 # Offline packaging contract tests for updaters shipped since Prime Agent 0.6.
 legacy-upgrade-gates:

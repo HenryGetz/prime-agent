@@ -8,9 +8,9 @@ use std::path::Path;
 use std::pin::Pin;
 
 use pa_ai::oauth::{
-    login_anthropic, login_github_copilot, login_xai, AnthropicCredentials, OAuthLoginUi,
-    OAuthPrompt, ProviderHttp, ANTHROPIC_LOGIN_CANCELLED, COPILOT_LOGIN_CANCELLED,
-    XAI_LOGIN_CANCELLED,
+    login_anthropic, login_github_copilot, login_opencode, login_xai, AnthropicCredentials,
+    OAuthLoginUi, OAuthPrompt, OpencodeCredentials, ProviderHttp, ANTHROPIC_LOGIN_CANCELLED,
+    COPILOT_LOGIN_CANCELLED, OPENCODE_LOGIN_CANCELLED, XAI_LOGIN_CANCELLED,
 };
 use pa_core::auth::{
     AuthCredential, AuthStorage, ANTHROPIC_PROVIDER_ID, GITHUB_COPILOT_PROVIDER_ID, XAI_PROVIDER_ID,
@@ -152,6 +152,9 @@ fn store_anthropic_login(
             resource: None,
             issuer: None,
             audience_mode: None,
+            org_id: None,
+            api_endpoint: None,
+            email: None,
         },
     );
     if let Some(error) = auth.drain_errors().pop() {
@@ -199,6 +202,9 @@ pub(crate) async fn run_github_copilot_login(
             resource: None,
             issuer: None,
             audience_mode: None,
+            org_id: None,
+            api_endpoint: None,
+            email: None,
         },
     );
     if let Some(error) = auth.drain_errors().pop() {
@@ -207,6 +213,79 @@ pub(crate) async fn run_github_copilot_login(
         ));
     }
     login_status(agent_dir, provider_name)
+}
+
+/// The `OpenCode` Go (Console) login: the device-code flow, then the credential
+/// under the account's slot (`opencode-go`, `opencode-go#2`, …). A login for an
+/// account already stored replaces that slot.
+pub(crate) async fn run_opencode_login(
+    agent_dir: &Path,
+    provider_name: &str,
+    http: &dyn ProviderHttp,
+    ui: &dyn OAuthLoginUi,
+) -> ProviderAuthOutcome {
+    let credentials = match login_opencode(http, ui).await {
+        Ok(credentials) => credentials,
+        Err(message) if message == OPENCODE_LOGIN_CANCELLED => {
+            return ProviderAuthOutcome::Cancelled;
+        }
+        Err(message) => {
+            return ProviderAuthOutcome::Error(format!(
+                "Failed to login to {provider_name}: {message}"
+            ));
+        }
+    };
+    if ui.is_cancelled() {
+        return ProviderAuthOutcome::Cancelled;
+    }
+    let account = opencode_login_account(&credentials);
+    let mut auth = AuthStorage::create(agent_dir);
+    let slot = pa_core::auth::opencode_accounts::choose_login_slot(
+        &auth,
+        credentials.account_id.as_deref(),
+        credentials.org_id.as_deref(),
+    );
+    auth.set(
+        &slot,
+        AuthCredential::Oauth {
+            access: credentials.access.clone(),
+            refresh: Some(credentials.refresh),
+            expires: credentials.expires,
+            account_id: credentials.account_id,
+            endpoint: None,
+            token_endpoint: None,
+            client_id: None,
+            resource: None,
+            issuer: None,
+            audience_mode: None,
+            org_id: credentials.org_id.clone(),
+            api_endpoint: Some(credentials.api_endpoint),
+            email: credentials.email,
+            enterprise_url: None,
+        },
+    );
+    if let Some(error) = auth.drain_errors().pop() {
+        return ProviderAuthOutcome::Error(format!(
+            "Failed to login to {provider_name}: could not save the login: {error}"
+        ));
+    }
+    // A fresh login replaces the credential: the slot starts clean, so the
+    // previous owner's usage, verdict, org, rate limit, and pins cannot demote
+    // or misroute the account that now holds it.
+    pa_core::auth::opencode_accounts::reset_slot_state(agent_dir, &slot);
+    pa_core::auth::opencode_accounts::note_served(agent_dir, &slot, credentials.org_id.as_deref());
+    // The login waits for the usage prime (bounded by the per-account timeout)
+    // so the first chat starts from real percentages; the routed request path
+    // itself never waits.
+    let slots = pa_core::auth::opencode_accounts::slots(&auth);
+    pa_core::auth::opencode_accounts::prime_usage_after_login(agent_dir, &auth, &slots);
+    match account {
+        Some(account) => ProviderAuthOutcome::Status(format!(
+            "Logged in to {provider_name} as {account}. Credentials saved to {}",
+            agent_dir.join("auth.json").display()
+        )),
+        None => login_status(agent_dir, provider_name),
+    }
 }
 
 pub(crate) async fn run_xai_login(
@@ -244,6 +323,9 @@ pub(crate) async fn run_xai_login(
             resource: None,
             issuer: None,
             audience_mode: None,
+            org_id: None,
+            api_endpoint: None,
+            email: None,
         },
     );
     if let Some(error) = auth.drain_errors().pop() {
@@ -252,6 +334,25 @@ pub(crate) async fn run_xai_login(
         ));
     }
     login_status(agent_dir, provider_name)
+}
+
+/// The `OpenCode` Go account label for the post-login status row: the Console
+/// email, with the workspace name in parentheses when the login resolved one.
+fn opencode_login_account(credentials: &OpencodeCredentials) -> Option<String> {
+    let email = credentials
+        .email
+        .as_deref()
+        .filter(|email| !email.trim().is_empty())?;
+    Some(
+        match credentials
+            .org_name
+            .as_deref()
+            .filter(|org| !org.trim().is_empty())
+        {
+            Some(org) => format!("{email} ({org})"),
+            None => email.to_string(),
+        },
+    )
 }
 
 /// The oauth status row.
@@ -598,5 +699,104 @@ mod tests {
             )),
         );
         assert_eq!(expired.get_api_key("xai"), Some("grok-access".to_string()));
+    }
+
+    /// The `OpenCode` Go happy flow's scripted endpoints.
+    fn opencode_http() -> ScriptedHttp {
+        ScriptedHttp::new()
+            .queue(
+                "https://opencode.ai/console/auth/device/code",
+                vec![ScriptedHttp::entry(
+                    200,
+                    r#"{"device_code":"dev-1","user_code":"OC-1234","verification_uri_complete":"/auth/device?code=OC-1234","interval":0,"expires_in":900}"#,
+                )],
+            )
+            .queue(
+                "https://opencode.ai/console/auth/device/token",
+                vec![ScriptedHttp::entry(
+                    200,
+                    r#"{"access_token":"oc-access","refresh_token":"oc-refresh","expires_in":3600}"#,
+                )],
+            )
+            .queue(
+                "https://opencode.ai/console/api/user",
+                vec![ScriptedHttp::entry(
+                    200,
+                    r#"{"id":"usr_1","email":"dev@example.com"}"#,
+                )],
+            )
+            .queue(
+                "https://opencode.ai/console/api/orgs",
+                vec![ScriptedHttp::entry(
+                    200,
+                    r#"[{"id":"org_a","name":"Alpha"}]"#,
+                )],
+            )
+    }
+
+    #[tokio::test]
+    async fn a_fresh_login_starts_the_replaced_slot_clean() {
+        let dir = tempfile::tempdir().expect("temp dir");
+        let agent = agent_dir(&dir);
+        // A previous owner left an exhausted usage record, a verdict, and a
+        // pin on the slot the next login will replace.
+        pa_core::auth::opencode_accounts::note_usage(&agent, "opencode-go", 1.0);
+        pa_core::auth::opencode_accounts::record_verdict(&agent, "opencode-go", 402, "funds");
+        pa_core::auth::opencode_accounts::pin_session(&agent, "session-a", "opencode-go");
+
+        let http = opencode_http();
+        let ui = ScriptedUi::new();
+        assert!(matches!(
+            run_opencode_login(&agent, "OpenCode Go", &http, &ui).await,
+            ProviderAuthOutcome::Status(_)
+        ));
+
+        // The login itself records the fresh owner (`note_served`), so the
+        // entry exists; the PREVIOUS owner's demotion must not survive it.
+        let state = pa_core::auth::opencode_accounts::load(&agent);
+        let now = pa_core::auth::opencode_accounts::epoch_ms();
+        assert_eq!(
+            state
+                .accounts
+                .get("opencode-go")
+                .and_then(|account| account.used_pct),
+            None,
+            "the previous owner's exhausted usage is gone"
+        );
+        assert_ne!(
+            state
+                .fresh_verdict("opencode-go", now)
+                .map(|verdict| verdict.status),
+            Some(402),
+            "the previous owner's funds verdict is gone (a fresh poll may record its own)"
+        );
+        assert!(
+            !state.rate_limited("opencode-go", now),
+            "the previous owner's 429 demotion is gone"
+        );
+        assert!(state.pins.is_empty(), "the replaced slot's pins are gone");
+    }
+
+    #[tokio::test]
+    async fn the_opencode_login_names_the_account_in_the_status_row() {
+        let dir = tempfile::tempdir().expect("temp dir");
+        let agent = agent_dir(&dir);
+        let http = opencode_http();
+        let ui = ScriptedUi::new();
+        match run_opencode_login(&agent, "OpenCode Go", &http, &ui).await {
+            ProviderAuthOutcome::Status(message) => assert_eq!(
+                message,
+                format!(
+                    "Logged in to OpenCode Go as dev@example.com (Alpha). Credentials saved to {}",
+                    agent.join("auth.json").display()
+                )
+            ),
+            other => panic!("expected the logged-in status, got {other:?}"),
+        }
+        let mut auth = AuthStorage::create(&agent);
+        assert_eq!(
+            auth.get_api_key("opencode-go"),
+            Some("oc-access".to_string())
+        );
     }
 }

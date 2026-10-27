@@ -68,6 +68,8 @@ async fn capture(
 
 #[tokio::test]
 async fn opencode_session_identity_reaches_every_transport_without_cache_retention() {
+    let expected = pa_ai::oauth::harness_session_id(Some("conversation"));
+    let mut first: Option<String> = None;
     for api in [
         "openai-completions",
         "openai-responses",
@@ -75,17 +77,55 @@ async fn opencode_session_identity_reaches_every_transport_without_cache_retenti
         "google-generative-ai",
     ] {
         let headers = capture(api, "opencode-go", "conversation", None).await;
+        // The gateway validates the harness-shaped session id: every transport
+        // sends the same deterministic `ses_…` mapping of the conversation id.
+        let sessions: Vec<String> = headers
+            .iter()
+            .filter(|(name, _)| name == "x-opencode-session")
+            .map(|(_, value)| value.clone())
+            .collect();
+        assert_eq!(sessions.len(), 1, "{api}");
+        assert!(sessions[0].starts_with("ses_"), "{api}: {sessions:?}");
+        assert_eq!(sessions[0], expected, "{api}");
+        // The gateway's identity is not just the primary session header: every
+        // alias must carry the same harness-shaped id, plus the client marker.
+        for name in [
+            "x-opencode-session",
+            "x-opencode-session-id",
+            "x-session-affinity",
+            "x-session-id",
+        ] {
+            assert_eq!(
+                headers
+                    .iter()
+                    .filter(|(key, _)| key == name)
+                    .map(|(_, value)| value.as_str())
+                    .collect::<Vec<_>>(),
+                vec![expected.as_str()],
+                "{api}: {headers:?}"
+            );
+        }
         assert_eq!(
             headers
                 .iter()
-                .filter(|(name, _)| name == "x-opencode-session")
+                .filter(|(name, _)| name == "x-opencode-client")
                 .map(|(_, value)| value.as_str())
                 .collect::<Vec<_>>(),
-            vec!["conversation"],
-            "{api}"
+            vec!["cli"],
+            "{api}: {headers:?}"
         );
+        match &first {
+            Some(value) => assert_eq!(
+                &sessions[0], value,
+                "the session identity is transport-independent"
+            ),
+            None => first = Some(sessions[0].clone()),
+        }
         assert!(
-            headers.contains(&("user-agent".into(), "prime-agent".into())),
+            headers.contains(&(
+                "user-agent".into(),
+                pa_ai::opencode_go_spec_generated::USER_AGENT.into()
+            )),
             "{api}: {headers:?}"
         );
     }
