@@ -184,6 +184,7 @@ async fn second_compaction_request_carries_the_anchor_and_strips_file_blocks() {
                     id: "tc1".to_string(),
                     name: "edit".to_string(),
                     arguments: edit_arguments,
+                    raw_arguments: None,
                     thought_signature: None,
                     rest: serde_json::Map::default(),
                 },

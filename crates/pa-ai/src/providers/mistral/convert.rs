@@ -231,9 +231,7 @@ fn to_chat_messages(messages: &[Message], supports_images: bool) -> Vec<Value> {
                                 "type": "function",
                                 "function": {
                                     "name": call.name,
-                                    "arguments": serde_json::to_string(
-                                        &call.arguments,
-                                    ).unwrap_or_else(|_| "{}".to_string()),
+                                    "arguments": call.arguments_text(),
                                 },
                                 "index": 0,
                             }));

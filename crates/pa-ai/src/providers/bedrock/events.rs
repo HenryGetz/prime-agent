@@ -187,6 +187,7 @@ fn handle_content_block_start(
                 .unwrap_or_default()
                 .to_string(),
             arguments: Map::default(),
+            raw_arguments: None,
             thought_signature: None,
             rest: Map::default(),
         }));

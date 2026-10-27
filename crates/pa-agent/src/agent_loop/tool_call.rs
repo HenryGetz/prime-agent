@@ -62,6 +62,7 @@ async fn prepare_tool_call_inner(
     let prepared_tool_call = match tool.prepare_arguments(&tool_call.arguments) {
         Some(prepared) => ToolCall {
             arguments: prepared,
+            raw_arguments: None,
             ..tool_call.clone()
         },
         None => tool_call.clone(),
@@ -478,6 +479,7 @@ mod tests {
                 id: "call-1".to_string(),
                 name: "never".to_string(),
                 arguments: serde_json::json!({}),
+                raw_arguments: None,
                 thought_signature: None,
             },
             tool: Arc::new(NeverTool),

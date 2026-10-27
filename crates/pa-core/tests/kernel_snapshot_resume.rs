@@ -96,6 +96,7 @@ fn ipython_tool_call_step(call_id: &str, code: &str) -> FauxResponseStep {
                     .as_object()
                     .cloned()
                     .expect("object"),
+                raw_arguments: None,
                 thought_signature: None,
                 rest: serde_json::Map::default(),
             },

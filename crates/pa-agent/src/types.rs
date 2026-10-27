@@ -121,6 +121,14 @@ pub struct ToolCall {
     pub name: String,
     /// Must be a JSON object; kept as `Value` like the TS `Record<string, any>`.
     pub arguments: serde_json::Value,
+    /// The model's argument text when it differs from `arguments` serialized (see
+    /// `pa_types::ai::ToolCall::raw_arguments`).
+    #[serde(
+        rename = "rawArguments",
+        default,
+        skip_serializing_if = "Option::is_none"
+    )]
+    pub raw_arguments: Option<String>,
     /// Google-specific: opaque signature for reusing thought context.
     #[serde(
         rename = "thoughtSignature",

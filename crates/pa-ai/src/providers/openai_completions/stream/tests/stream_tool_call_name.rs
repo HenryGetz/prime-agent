@@ -26,6 +26,7 @@ fn tool_call(id: &str, name: &str, arguments: &Value) -> AssistantContent {
         id: id.to_string(),
         name: name.to_string(),
         arguments: arguments.as_object().cloned().unwrap_or_default(),
+        raw_arguments: None,
         thought_signature: None,
         rest: Map::default(),
     })

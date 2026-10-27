@@ -264,12 +264,35 @@ pub struct ToolCall {
     pub id: String,
     pub name: String,
     pub arguments: JsonMap,
+    /// The argument text exactly as the model streamed it, kept only when it differs from
+    /// `arguments` serialized (invalid or repaired JSON, other spacing or key order). Providers
+    /// whose wire carries arguments as text replay it, so the history matches what was sampled.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub raw_arguments: Option<String>,
     /// Google-specific opaque signature for reusing thought context (TS
     /// wire key `thoughtSignature`; see [`ThinkingContent`] for the rename).
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub thought_signature: Option<String>,
     #[serde(flatten)]
     pub rest: JsonMap,
+}
+
+impl ToolCall {
+    /// Sets `arguments` parsed from the model's argument `text`, keeping `text` as
+    /// `raw_arguments` when the parse doesn't serialize back to it.
+    pub fn set_arguments(&mut self, arguments: JsonMap, text: &str) {
+        let canonical = Value::Object(arguments.clone()).to_string();
+        self.raw_arguments = (canonical != text).then(|| text.to_string());
+        self.arguments = arguments;
+    }
+
+    /// The argument text to replay: the model's own text when kept, else `arguments` serialized.
+    #[must_use]
+    pub fn arguments_text(&self) -> String {
+        self.raw_arguments
+            .clone()
+            .unwrap_or_else(|| Value::Object(self.arguments.clone()).to_string())
+    }
 }
 
 /// Content blocks allowed in user and tool-result messages. Live session files also carry untagged
@@ -589,6 +612,8 @@ pub struct Context {
 
 /// Event protocol for assistant message streams: `start` before partial
 /// updates, then `done` (success) or `error` (`stopReason` `"error"`/`"aborted"`).
+// The wire shape mirrors the TS tagged union 1:1 rather than boxing payloads.
+#[allow(clippy::large_enum_variant)]
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 #[serde(
     tag = "type",

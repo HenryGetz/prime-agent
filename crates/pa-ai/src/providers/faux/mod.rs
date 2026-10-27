@@ -72,6 +72,7 @@ pub fn faux_tool_call(
         id: id.map_or_else(|| random_id("tool"), std::string::ToString::to_string),
         name: name.to_string(),
         arguments: arguments.as_object().cloned().unwrap_or_default(),
+        raw_arguments: None,
         thought_signature: None,
         rest: Map::default(),
     })
@@ -632,6 +633,7 @@ async fn stream_with_deltas(
                     id: tool_call_block.id.clone(),
                     name: tool_call_block.name.clone(),
                     arguments: Map::default(),
+                    raw_arguments: None,
                     thought_signature: None,
                     rest: Map::default(),
                 }));

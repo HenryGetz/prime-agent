@@ -104,9 +104,7 @@ pub fn estimate_tokens(message: &AgentMessage) -> u64 {
                         total += chars(&thinking.thinking);
                     }
                     pa_types::ai::AssistantContentBlock::ToolCall(call) => {
-                        total += chars(&call.name)
-                            + serde_json::to_string(&call.arguments)
-                                .map_or(0, |json| json.chars().count() as u64);
+                        total += chars(&call.name) + chars(&call.arguments_text());
                     }
                 }
             }

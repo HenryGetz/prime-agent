@@ -10,7 +10,7 @@
 
 use super::*;
 use crate::event_stream::AssistantMessageEventExt;
-use serde_json::Value;
+use serde_json::{json, Value};
 use std::net::SocketAddr;
 use tokio::io::{AsyncReadExt, AsyncWriteExt};
 

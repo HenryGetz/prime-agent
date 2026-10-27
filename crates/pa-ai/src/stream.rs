@@ -50,8 +50,7 @@ fn estimated_input_tokens(context: &Context) -> u64 {
                     }
                     crate::types::AssistantContent::ToolCall(call) => {
                         call.name.chars().count() as u64
-                            + serde_json::to_string(&call.arguments)
-                                .map_or(0, |json| json.chars().count() as u64)
+                            + call.arguments_text().chars().count() as u64
                     }
                 })
                 .sum(),
@@ -385,6 +384,7 @@ mod tests {
                             name: "bash".to_string(), // 5 chars
                             arguments: json!({"code": "ls"}).as_object().cloned().unwrap(),
                             // 12 chars
+                            raw_arguments: None,
                             thought_signature: None,
                             rest: Map::default(),
                         }),
