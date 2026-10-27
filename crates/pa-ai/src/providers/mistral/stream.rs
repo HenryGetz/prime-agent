@@ -402,9 +402,10 @@ impl MistralStreamState {
             else {
                 continue;
             };
-            if let Some(parsed) = accumulator.flush() {
-                block.arguments = json_object(parsed);
-            }
+            let arguments = accumulator
+                .flush()
+                .map_or_else(|| block.arguments.clone(), json_object);
+            block.set_arguments(arguments, accumulator.text());
         }
     }
 
@@ -656,6 +657,7 @@ impl MistralStreamState {
                         ),
                         name: name.unwrap_or_default().to_string(),
                         arguments: Map::default(),
+                        raw_arguments: None,
                         thought_signature: None,
                         rest: Map::default(),
                     }));
@@ -711,12 +713,14 @@ impl MistralStreamState {
             let Some(AssistantContent::ToolCall(_)) = output.content.get(index) else {
                 continue;
             };
-            let parsed = match self.tool_partial_args.get(&index) {
-                Some(accumulator) => parse_streaming_json(Some(accumulator.text())),
-                None => parse_streaming_json(None),
-            };
             if let AssistantContent::ToolCall(block) = &mut output.content[index] {
-                block.arguments = json_object(parsed);
+                match self.tool_partial_args.get(&index) {
+                    Some(accumulator) => block.set_arguments(
+                        json_object(parse_streaming_json(Some(accumulator.text()))),
+                        accumulator.text(),
+                    ),
+                    None => block.arguments = json_object(parse_streaming_json(None)),
+                }
             }
             let block = output.content[index].clone();
             writer.push(AssistantMessageEvent::ToolcallEnd {

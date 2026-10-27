@@ -3,7 +3,7 @@
 
 use std::collections::HashMap;
 
-use serde_json::{json, Map, Value};
+use serde_json::{Map, Value};
 
 use crate::cache_pricing::{get_anthropic_cache_write_cost, has_standard_anthropic_cache_pricing};
 use crate::env_api_keys::get_env_api_key;
@@ -142,6 +142,7 @@ impl StreamingState {
                 id: id.unwrap_or("").to_string(),
                 name: String::new(),
                 arguments: Map::default(),
+                raw_arguments: None,
                 thought_signature: None,
                 rest: Map::default(),
             }));
@@ -178,13 +179,18 @@ fn finish_blocks(state: &mut StreamingState, writer: &AssistantMessageEventWrite
             }
             AssistantContent::ToolCall(_) => {
                 let partial_args = state.tool_call_partial_args.remove(&index);
-                let arguments = partial_args.as_ref().map_or_else(
-                    || json!({}),
-                    |accumulator| parse_streaming_json(Some(accumulator.text())),
-                );
-                let arguments = arguments.as_object().cloned().unwrap_or_default();
                 if let AssistantContent::ToolCall(tool_call) = &mut state.output.content[index] {
-                    tool_call.arguments = arguments;
+                    match partial_args {
+                        Some(accumulator) => {
+                            let text = accumulator.text();
+                            let arguments = parse_streaming_json(Some(text));
+                            tool_call.set_arguments(
+                                arguments.as_object().cloned().unwrap_or_default(),
+                                text,
+                            );
+                        }
+                        None => tool_call.arguments = Map::default(),
+                    }
                 }
                 let tool_call = match &state.output.content[index] {
                     AssistantContent::ToolCall(tool_call) => tool_call.clone(),
@@ -453,9 +459,11 @@ fn settle_partial_tool_calls(state: &mut StreamingState) {
         let Some(AssistantContent::ToolCall(block)) = state.output.content.get_mut(*index) else {
             continue;
         };
-        if let Some(parsed) = accumulator.flush() {
-            block.arguments = parsed.as_object().cloned().unwrap_or_default();
-        }
+        let arguments = accumulator.flush().map_or_else(
+            || block.arguments.clone(),
+            |parsed| parsed.as_object().cloned().unwrap_or_default(),
+        );
+        block.set_arguments(arguments, accumulator.text());
     }
 }
 
@@ -770,6 +778,7 @@ fn parse_sse_event_data(event: &ServerSentEvent) -> Option<Value> {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use serde_json::json;
     use std::net::SocketAddr;
     use tokio::io::{AsyncReadExt, AsyncWriteExt};
 
@@ -789,6 +798,10 @@ mod tests {
     // without a function name.
     #[path = "stream_tool_call_name.rs"]
     mod stream_tool_call_name;
+
+    // Tool-call argument text replays exactly as streamed.
+    #[path = "stream_tool_call_arguments.rs"]
+    mod stream_tool_call_arguments;
 
     /// Serve one SSE response body for the provider's POST and return the
     /// bound address.

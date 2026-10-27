@@ -428,6 +428,7 @@ pub(crate) fn write_session_file(
                     map.insert("query".to_string(), serde_json::json!(sentence(rng, 3)));
                     map
                 },
+                raw_arguments: None,
                 thought_signature: None,
                 rest: serde_json::Map::new(),
             }));

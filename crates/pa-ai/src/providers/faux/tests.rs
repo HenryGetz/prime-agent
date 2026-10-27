@@ -1099,6 +1099,7 @@ async fn supports_aborting_mid_toolcall_stream_when_paced() {
             .as_object()
             .cloned()
             .unwrap(),
+        raw_arguments: None,
         thought_signature: None,
         rest: Map::default(),
     })];

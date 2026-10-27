@@ -280,10 +280,7 @@ pub fn convert_responses_messages(
                             }
                             entry.insert("call_id".into(), json!(call_id));
                             entry.insert("name".into(), json!(tool_call.name));
-                            entry.insert(
-                                "arguments".into(),
-                                json!(Value::Object(tool_call.arguments.clone()).to_string()),
-                            );
+                            entry.insert("arguments".into(), json!(tool_call.arguments_text()));
                             output.push(Value::Object(entry));
                         }
                     }
@@ -438,6 +435,7 @@ mod tests {
             id: id.into(),
             name: "bash".into(),
             arguments: [("cmd".to_string(), json!("ls"))].into_iter().collect(),
+            raw_arguments: None,
             thought_signature: None,
             rest: Map::default(),
         })

@@ -181,6 +181,7 @@ impl<'a> ResponsesStreamProcessor<'a> {
                                 id: format!("{call_id}|{item_id}"),
                                 name: name.to_string(),
                                 arguments: Map::default(),
+                                raw_arguments: None,
                                 thought_signature: None,
                                 rest: Map::default(),
                             }));
@@ -480,7 +481,10 @@ impl<'a> ResponsesStreamProcessor<'a> {
                         if let Some(AssistantContent::ToolCall(tool_call)) =
                             self.output.content.get_mut(content_index)
                         {
-                            tool_call.arguments = parsed.as_object().cloned().unwrap_or_default();
+                            tool_call.set_arguments(
+                                parsed.as_object().cloned().unwrap_or_default(),
+                                arguments,
+                            );
                         }
                         if let Some(delta) = arguments.strip_prefix(&previous_partial) {
                             if !delta.is_empty() {
@@ -646,17 +650,22 @@ impl<'a> ResponsesStreamProcessor<'a> {
                                     .get("id")
                                     .and_then(|value| value.as_str())
                                     .unwrap_or("");
-                                let tool_call = ToolCall {
+                                let mut tool_call = ToolCall {
                                     id: format!("{call_id}|{item_id}"),
                                     name: item
                                         .get("name")
                                         .and_then(|value| value.as_str())
                                         .unwrap_or("")
                                         .to_string(),
-                                    arguments: arguments.as_object().cloned().unwrap_or_default(),
+                                    arguments: Map::default(),
+                                    raw_arguments: None,
                                     thought_signature: None,
                                     rest: Map::default(),
                                 };
+                                tool_call.set_arguments(
+                                    arguments.as_object().cloned().unwrap_or_default(),
+                                    arguments_text,
+                                );
                                 if let Some(AssistantContent::ToolCall(block)) =
                                     self.output.content.get_mut(content_index)
                                 {
@@ -673,10 +682,6 @@ impl<'a> ResponsesStreamProcessor<'a> {
                                     .get("arguments")
                                     .and_then(|value| value.as_str())
                                     .unwrap_or("{}");
-                                let arguments = parse_streaming_json(Some(arguments_text))
-                                    .as_object()
-                                    .cloned()
-                                    .unwrap_or_default();
                                 let call_id = item
                                     .get("call_id")
                                     .and_then(|value| value.as_str())
@@ -685,19 +690,28 @@ impl<'a> ResponsesStreamProcessor<'a> {
                                     .get("id")
                                     .and_then(|value| value.as_str())
                                     .unwrap_or("");
+                                let mut tool_call = ToolCall {
+                                    id: format!("{call_id}|{item_id}"),
+                                    name: item
+                                        .get("name")
+                                        .and_then(|value| value.as_str())
+                                        .unwrap_or("")
+                                        .to_string(),
+                                    arguments: Map::default(),
+                                    raw_arguments: None,
+                                    thought_signature: None,
+                                    rest: Map::default(),
+                                };
+                                tool_call.set_arguments(
+                                    parse_streaming_json(Some(arguments_text))
+                                        .as_object()
+                                        .cloned()
+                                        .unwrap_or_default(),
+                                    arguments_text,
+                                );
                                 self.output
                                     .content
-                                    .push(AssistantContent::ToolCall(ToolCall {
-                                        id: format!("{call_id}|{item_id}"),
-                                        name: item
-                                            .get("name")
-                                            .and_then(|value| value.as_str())
-                                            .unwrap_or("")
-                                            .to_string(),
-                                        arguments,
-                                        thought_signature: None,
-                                        rest: Map::default(),
-                                    }));
+                                    .push(AssistantContent::ToolCall(tool_call));
                                 let content_index = self.output.content.len() - 1;
                                 let tool_call = match self.output.content.last() {
                                     Some(AssistantContent::ToolCall(tool_call)) => {
@@ -907,14 +921,16 @@ impl<'a> ResponsesStreamProcessor<'a> {
     /// the error event carries the message.
     pub fn settle_partial_tool_calls(&mut self) {
         for slot in self.slots.values_mut() {
-            let Some(parsed) = slot.partial_json.flush() else {
+            let Some(AssistantContent::ToolCall(tool_call)) =
+                self.output.content.get_mut(slot.content_index)
+            else {
                 continue;
             };
-            if let Some(AssistantContent::ToolCall(tool_call)) =
-                self.output.content.get_mut(slot.content_index)
-            {
-                tool_call.arguments = parsed.as_object().cloned().unwrap_or_default();
-            }
+            let arguments = slot.partial_json.flush().map_or_else(
+                || tool_call.arguments.clone(),
+                |parsed| parsed.as_object().cloned().unwrap_or_default(),
+            );
+            tool_call.set_arguments(arguments, slot.partial_json.text());
         }
     }
 

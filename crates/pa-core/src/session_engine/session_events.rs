@@ -382,6 +382,7 @@ mod tests {
                         id: "call-1".to_string(),
                         name: "ipython".to_string(),
                         arguments: serde_json::json!({"code": "1 + 1"}),
+                        raw_arguments: None,
                         thought_signature: None,
                     },
                     partial: message.clone(),

@@ -187,6 +187,9 @@ pub fn transform_messages_with_normalizer(
                                 normalized.thought_signature = None;
                             }
                             if !is_same_model {
+                                // Another model gets the parsed arguments; the raw text replays
+                                // only to the model that sampled it.
+                                normalized.raw_arguments = None;
                                 if let Some(normalizer) =
                                     normalize_tool_call_id(&tool_call.id, model, assistant)
                                 {
@@ -339,6 +342,7 @@ mod tests {
                 id: id.to_string(),
                 name: "echo".to_string(),
                 arguments: Map::default(),
+                raw_arguments: None,
                 thought_signature: None,
                 rest: Map::default(),
             })],
@@ -445,6 +449,7 @@ mod tests {
             id: id.to_string(),
             name: name.to_string(),
             arguments: Map::default(),
+            raw_arguments: None,
             thought_signature: None,
             rest: Map::default(),
         })

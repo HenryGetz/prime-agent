@@ -221,7 +221,7 @@ pub fn convert_messages(model: &Model, context: &Context, compat: &ResolvedCompa
                                 "type": "function",
                                 "function": {
                                     "name": tool_call.name,
-                                    "arguments": serde_json::Value::Object(tool_call.arguments.clone()).to_string(),
+                                    "arguments": tool_call.arguments_text(),
                                 },
                             }))
                             .collect::<Vec<_>>()),

@@ -425,6 +425,7 @@ async fn run_stream(
                                         .and_then(|value| value.as_object())
                                         .cloned()
                                         .unwrap_or_default(),
+                                    raw_arguments: None,
                                     thought_signature: None,
                                     rest: Map::default(),
                                 }));

@@ -330,6 +330,7 @@ mod tests {
                     id: "tc1".to_string(),
                     name: "edit".to_string(),
                     arguments,
+                    raw_arguments: None,
                     thought_signature: None,
                     rest: serde_json::Map::default(),
                 }),
@@ -425,6 +426,7 @@ mod tests {
                         id: id.to_string(),
                         name: name.to_string(),
                         arguments,
+                        raw_arguments: None,
                         thought_signature: None,
                         rest: serde_json::Map::default(),
                     })

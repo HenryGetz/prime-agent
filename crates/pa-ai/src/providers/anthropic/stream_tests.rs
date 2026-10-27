@@ -99,6 +99,7 @@ data: {"type":"message_stop"}"#,
         id: "t1".into(),
         name: "lookup".into(),
         arguments: Map::default(),
+        raw_arguments: None,
         thought_signature: None,
         rest: Map::default(),
     };

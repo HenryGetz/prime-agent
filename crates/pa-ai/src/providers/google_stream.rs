@@ -203,6 +203,7 @@ impl GoogleStreamState {
                                 .and_then(|value| value.as_object())
                                 .cloned()
                                 .unwrap_or_default(),
+                            raw_arguments: None,
                             thought_signature: part
                                 .get("thoughtSignature")
                                 .and_then(|value| value.as_str())

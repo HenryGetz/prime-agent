@@ -532,11 +532,12 @@ mod tests {
         let back: pa_types::ai::ThinkingContent =
             serde_json::from_value(serde_json::to_value(&agent_thinking).unwrap()).unwrap();
         assert_eq!(back.thinking_signature.as_deref(), Some("sig-1"));
-        // The tool-call thought signature (Google) rides the same boundary.
+        // The tool-call thought signature (Google) and raw argument text ride the same boundary.
         let tool_call = pa_types::ai::ToolCall {
             id: "toolu_1".into(),
             name: "bash".into(),
             arguments: serde_json::Map::new(),
+            raw_arguments: Some("{\"cmd\": \"ls\"".into()),
             thought_signature: Some("sig-2".into()),
             rest: serde_json::Map::default(),
         };
@@ -548,6 +549,9 @@ mod tests {
         );
         let agent_tool_call: pa_agent::types::ToolCall = serde_json::from_value(wire).unwrap();
         assert_eq!(agent_tool_call.thought_signature.as_deref(), Some("sig-2"));
+        let back: pa_types::ai::ToolCall =
+            serde_json::from_value(serde_json::to_value(&agent_tool_call).unwrap()).unwrap();
+        assert_eq!(back.raw_arguments, tool_call.raw_arguments);
     }
 
     /// A delayed faux response holds the request mid-wait; `ModelStream::close` cancels the fetch

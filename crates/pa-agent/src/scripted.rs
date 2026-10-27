@@ -383,6 +383,7 @@ pub fn tool_call_turn_steps(
             id: id.to_string(),
             name: name.to_string(),
             arguments,
+            raw_arguments: None,
             thought_signature: None,
         };
         steps.push(ScriptStep::Event(Box::new(
