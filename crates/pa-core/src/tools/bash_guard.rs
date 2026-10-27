@@ -536,20 +536,32 @@ pub(crate) fn format_dirty_tree_refusal(
 /// scans; unset or non-positive means off (the scan still runs, only warned).
 pub(crate) const SCAN_TIMEOUT_ENV: &str = "PRIME_AGENT_SCAN_TIMEOUT";
 
-/// A home-scale scan root: `~`-rooted paths and `$HOME` expansions walk the
-/// user's whole home tree, so a recursive scan there costs minutes, not
-/// milliseconds. Exact-name tests keep other env vars (`$HOMEDIR`,
-/// `${HOMEBREW_PREFIX}`) out.
+/// A home-scale scan root: the home tree itself (`~`, `~/`, `$HOME`,
+/// `${HOME}`) or one component below it (`~/Documents`, the incident dirs)
+/// walks a top-level home subtree, so a recursive scan there costs minutes,
+/// not milliseconds. Deeper `~`-rooted paths (`~/work/repo/src`) are
+/// ordinary project trees and stay quiet. Exact-name tests keep other env
+/// vars (`$HOMEDIR`, `${HOMEBREW_PREFIX}`) out.
 fn is_home_scale_root(token: &str) -> bool {
     // A grouping paren glued to the token (`(rg pattern $HOME)`) is
     // stripped first — only ')': "${HOME}"'s closing brace is part of
     // the expansion.
     let token = token.trim_end_matches(')');
-    token.starts_with('~')
-        || token == "$HOME"
-        || token.starts_with("$HOME/")
-        || token == "${HOME}"
-        || token.starts_with("${HOME}/")
+    if matches!(
+        token,
+        "~" | "~/" | "$HOME" | "$HOME/" | "${HOME}" | "${HOME}/"
+    ) {
+        return true;
+    }
+    // One component below the root, no deeper: `~/Documents` is a top-level
+    // home subtree, `~/work/repo/src` is a project tree.
+    let rest = token
+        .strip_prefix("~/")
+        .or_else(|| token.strip_prefix("$HOME/"))
+        .or_else(|| token.strip_prefix("${HOME}/"))
+        .unwrap_or("");
+    let rest = rest.trim_end_matches('/');
+    !rest.is_empty() && !rest.contains('/')
 }
 
 /// rg's depth bounds: `--max-depth[=]N`/`-d N`/`-dN` with a numeric
@@ -1954,6 +1966,45 @@ mod tests {
             "grep -rl needle \"$HOME/docs with spaces\"",
             None
         ));
+    }
+
+    /// Regression pins for the review round on unrestricted `~`/`$HOME`
+    /// prefixes: a home-scale root is the home tree itself or one component
+    /// below it (the incident dirs), and deeper `~`-rooted project paths
+    /// must not warn or get the env auto-timeout.
+    #[test]
+    fn home_scale_root_is_home_or_one_component_below() {
+        // The reviewer's ordinary project scans stay quiet, with or without
+        // expansions.
+        assert!(!is_unbounded_home_scan(
+            "grep -rn foo ~/work/repo/src",
+            None
+        ));
+        assert!(!is_unbounded_home_scan("rg pat ~/.config/app/x.toml", None));
+        assert!(!is_unbounded_home_scan(
+            "grep -rn foo $HOME/work/repo/src",
+            None
+        ));
+        assert!(!is_unbounded_home_scan(
+            "grep -rn foo ${HOME}/work/repo/src",
+            None
+        ));
+        assert!(!is_unbounded_home_scan(
+            "find ~/proj/src -name '*.py'",
+            None
+        ));
+        // The home tree itself and one component below it still warn: the
+        // incident command's roots are all `~/<one component>`.
+        assert!(is_unbounded_home_scan("grep -rl needle ~", None));
+        assert!(is_unbounded_home_scan("grep -rl needle ~/", None));
+        assert!(is_unbounded_home_scan("grep -rl needle $HOME", None));
+        assert!(is_unbounded_home_scan("grep -rl needle $HOME/", None));
+        assert!(is_unbounded_home_scan(
+            "grep -rl needle ${HOME}/Documents",
+            None
+        ));
+        assert!(is_unbounded_home_scan("grep -rn foo ~/Documents/", None));
+        assert!(is_unbounded_home_scan("find ~/proj -name '*.py'", None));
     }
 
     #[test]

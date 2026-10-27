@@ -129,16 +129,21 @@ _SCAN_TIMEOUT_ENV = "PRIME_AGENT_SCAN_TIMEOUT"
 
 
 def _is_home_scale_root(token: str) -> bool:
-    """A ~-rooted path or a $HOME expansion; exact names keep other env vars
-    ($HOMEDIR, ${HOMEBREW_PREFIX}) out. A grouping paren glued to the token
+    """The home tree itself (`~`, `~/`, `$HOME`, `${HOME}`) or one component
+    below it (`~/Documents`, the incident dirs) walks a top-level home
+    subtree; deeper `~`-rooted paths (`~/work/repo/src`) are ordinary project
+    trees and stay quiet. Exact names keep other env vars ($HOMEDIR,
+    ${HOMEBREW_PREFIX}) out. A grouping paren glued to the token
     (`(rg pattern $HOME)`) is stripped first — only `)`: `${HOME}`'s closing
     brace is part of the expansion. Mirrors the Rust bash_guard."""
     token = token.rstrip(")")
-    return (
-        token.startswith("~")
-        or token in ("$HOME", "${HOME}")
-        or token.startswith(("$HOME/", "${HOME}/"))
-    )
+    if token in ("~", "~/", "$HOME", "$HOME/", "${HOME}", "${HOME}/"):
+        return True
+    for root in ("~/", "$HOME/", "${HOME}/"):
+        if token.startswith(root):
+            rest = token.removeprefix(root).rstrip("/")
+            return bool(rest) and "/" not in rest
+    return False
 
 
 def _is_rg_depth_bound(tokens: list[str]) -> bool:

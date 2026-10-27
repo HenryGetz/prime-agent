@@ -1668,6 +1668,24 @@ class ScanCostGuardTest(unittest.IsolatedAsyncioTestCase):
         self.assertFalse(is_scan("( " * 100000 + "true"))
         self.assertTrue(is_scan("( " * 100000 + "find ~/Documents"))
 
+    def test_home_scale_root_is_home_or_one_component_below(self):
+        # Only the home tree itself or one component below it is home-scale;
+        # deeper ~-rooted project paths stay quiet (review round on the
+        # unrestricted ~/$HOME prefix rule).
+        is_scan = bash_module._is_unbounded_home_scan
+        self.assertFalse(is_scan("grep -rn foo ~/work/repo/src"))
+        self.assertFalse(is_scan("rg pat ~/.config/app/x.toml"))
+        self.assertFalse(is_scan("grep -rn foo $HOME/work/repo/src"))
+        self.assertFalse(is_scan("grep -rn foo ${HOME}/work/repo/src"))
+        self.assertFalse(is_scan("find ~/proj/src -name '*.py'"))
+        self.assertTrue(is_scan("grep -rl needle ~"))
+        self.assertTrue(is_scan("grep -rl needle ~/"))
+        self.assertTrue(is_scan("grep -rl needle $HOME"))
+        self.assertTrue(is_scan("grep -rl needle $HOME/"))
+        self.assertTrue(is_scan("grep -rl needle ${HOME}/Documents"))
+        self.assertTrue(is_scan("grep -rn foo ~/Documents/"))
+        self.assertTrue(is_scan("find ~/proj -name '*.py'"))
+
     def test_dispatch_hint_is_budgeted_and_names_the_fix(self):
         with (
             mock.patch.object(bash_module, "_scan_hints_written", 0),
