@@ -50,6 +50,7 @@ from __future__ import annotations
 
 import asyncio
 import hashlib
+import importlib
 import json
 import os
 import re
@@ -63,7 +64,6 @@ from typing import Any
 from unittest.mock import patch
 
 import rlm as rlm_module
-from rlm import factory as factory_module
 from rlm.factory import (
     ANSWER_BINDING_CAP,
     ANSWER_CAPTURE_CAP,
@@ -103,6 +103,8 @@ from rlm.factory import (
     validate_factory_spec,
 )
 from rlm.harness import HarnessState
+
+factory_module = importlib.import_module("rlm.factory")
 
 
 # ---------------------------------------------------------------------------
@@ -8953,6 +8955,7 @@ class FactoryRunFromLibraryTest(unittest.TestCase):
 
 _INSTALLED_LIBRARY_RUNNER = r"""
 import asyncio
+import importlib
 import json
 
 
@@ -9013,8 +9016,9 @@ class ScriptedHost:
 
 async def main():
     import rlm as rlm_module
-    import rlm.factory as factory_module
     from rlm.factory import FactoryExecutor
+
+    factory_module = importlib.import_module("rlm.factory")
 
     rlm_module.host_request = ScriptedHost()
 
