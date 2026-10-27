@@ -790,6 +790,10 @@ mod tests {
     #[path = "stream_tool_call_name.rs"]
     mod stream_tool_call_name;
 
+    // A reasoning-only turn replays with its reasoning.
+    #[path = "stream_reasoning_only_turn.rs"]
+    mod stream_reasoning_only_turn;
+
     /// Serve one SSE response body for the provider's POST and return the
     /// bound address.
     async fn serve_sse(body: String) -> SocketAddr {

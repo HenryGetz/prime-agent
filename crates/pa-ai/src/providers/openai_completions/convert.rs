@@ -245,13 +245,16 @@ pub fn convert_messages(model: &Model, context: &Context, compat: &ResolvedCompa
                 {
                     assistant_msg.insert("reasoning_content".into(), json!(""));
                 }
-                if !replay_reasoning_details.is_empty()
+                let has_reasoning =
+                    !replay_reasoning_details.is_empty() || !non_empty_thinking_blocks.is_empty();
+                if has_reasoning
                     && assistant_msg.get("content") == Some(&Value::Null)
                     && !assistant_msg.contains_key("tool_calls")
                 {
                     assistant_msg.insert("content".into(), json!(""));
                 }
-                // Skip assistant messages that have no content and no tool calls.
+                // Skip assistant messages with nothing to replay: no content, tool calls or
+                // reasoning. A reasoning-only turn is still part of what the model sampled.
                 let content_value = assistant_msg.get("content");
                 let has_content = match content_value {
                     Some(Value::Null) | None => false,
@@ -259,10 +262,7 @@ pub fn convert_messages(model: &Model, context: &Context, compat: &ResolvedCompa
                     Some(Value::Array(array)) => !array.is_empty(),
                     Some(_) => true,
                 };
-                if !has_content
-                    && !assistant_msg.contains_key("tool_calls")
-                    && replay_reasoning_details.is_empty()
-                {
+                if !has_content && !assistant_msg.contains_key("tool_calls") && !has_reasoning {
                     index += 1;
                     continue;
                 }
