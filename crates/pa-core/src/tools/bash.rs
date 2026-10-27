@@ -362,8 +362,16 @@ pub async fn execute_bash(
     let mut last_update_at: Option<std::time::Instant> = None;
 
     if let Some(on_update) = &on_update {
+        // Kernel parity (`_note_scan_cost` before the shell runs): the
+        // scan-cost warning rides the dispatch update, not only the result
+        // text after the command finishes — an unbounded scan holds the turn,
+        // so the warning must be visible while the scan still runs.
+        let content = scan_warning
+            .iter()
+            .map(|warning| ToolContentBlock::text(warning.clone()))
+            .collect();
         on_update(ToolUpdate {
-            content: Vec::new(),
+            content,
             details: None,
         });
     }

@@ -2105,4 +2105,80 @@ mod tests {
             "the env timeout must bound the command: {err}"
         );
     }
+
+    /// `PRRT_kwDOSXZbXs6u6JaU`: the scan-cost warning rides the dispatch
+    /// `ToolUpdate` (kernel parity: `_note_scan_cost` before the shell runs),
+    /// not only the result text after the command finishes — an unbounded
+    /// scan holds the turn, so the warning must be visible while it runs.
+    #[tokio::test]
+    async fn execute_bash_delivers_scan_warning_at_dispatch() {
+        use crate::tools::bash::{execute_bash, BashToolOptions};
+        use crate::tools::tool_definition::{OnUpdate, ToolUpdate};
+        use std::sync::{Arc, Mutex};
+
+        let cwd = tempfile::tempdir().expect("tempdir");
+        let cwd_path = cwd.path().to_string_lossy().into_owned();
+
+        let texts: Arc<Mutex<Vec<String>>> = Arc::new(Mutex::new(Vec::new()));
+        let sink = texts.clone();
+        let on_update: OnUpdate = Arc::new(move |update: ToolUpdate| {
+            for block in &update.content {
+                if let Some(text) = block.as_text() {
+                    sink.lock().unwrap().push(text.to_string());
+                }
+            }
+        });
+
+        // The detected scan shape with a quiet tail: grep fails instantly on
+        // the missing root, then the sleep holds the call open so the
+        // dispatch warning is observed mid-run, not after completion.
+        let signal = crate::tools::tool_definition::AbortSignal::new();
+        let exec = {
+            let signal = signal.clone();
+            let on_update = on_update.clone();
+            let cwd_path = cwd_path.clone();
+            let command = "grep -rl needle ~/pa-scan-guard-nonexistent-xyz 2>/dev/null || sleep 10"
+                .to_string();
+            tokio::spawn(async move {
+                execute_bash(
+                    &cwd_path,
+                    &BashToolOptions::default(),
+                    &command,
+                    None,
+                    None,
+                    Some(signal),
+                    Some(on_update),
+                )
+                .await
+            })
+        };
+
+        let mut dispatched = None;
+        for _ in 0..400 {
+            if let Some(first) = texts.lock().unwrap().first() {
+                dispatched = Some(first.clone());
+                break;
+            }
+            tokio::time::sleep(std::time::Duration::from_millis(10)).await;
+        }
+        let dispatched = dispatched.expect("no streamed scan warning mid-run");
+        assert!(
+            dispatched.contains("Warning: this recursive scan of home-scale directories"),
+            "the dispatch update must carry the scan warning: {dispatched}"
+        );
+        assert!(
+            !exec.is_finished(),
+            "the scan warning arrived only after the command finished"
+        );
+
+        signal.cancel();
+        let err = exec
+            .await
+            .expect("join the aborted scan")
+            .expect_err("the aborted scan must fail");
+        assert!(
+            err.to_string().contains("Command aborted"),
+            "unexpected abort error: {err}"
+        );
+    }
 }
