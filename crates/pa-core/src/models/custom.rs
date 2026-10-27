@@ -419,7 +419,13 @@ pub fn load_custom_models(
                 .or_else(|| provider_config.base_url.clone())
                 .or_else(|| defaults.as_ref().map(|(_, url)| url.clone()));
             let Some(base_url) = base_url else { continue };
-            let compat = merge_compat(None, compat_from_value(provider_config.compat.as_ref()));
+            // A definition's `compat` merges over its provider's (TS `modelFromJson`).
+            let provider_compat = compat_from_value(provider_config.compat.as_ref());
+            let compat = merge_compat(
+                provider_compat.as_ref(),
+                compat_from_value(model_def.compat.as_ref()),
+            )
+            .or(provider_compat);
             result.models.push(Model {
                 id: model_def.id.clone(),
                 name: model_def
@@ -502,6 +508,46 @@ mod tests {
         assert_eq!(result.models[0].id, "llama3");
         assert_eq!(result.models[0].base_url, "http://localhost:11434");
         assert_eq!(result.models[0].context_window, 128_000);
+    }
+
+    #[test]
+    fn a_custom_model_definition_compat_merges_over_its_provider() {
+        let result = load_custom_models(
+            r#"{ "providers": { "proxy": {
+                "baseUrl": "http://127.0.0.1:9/v1",
+                "apiKey": "KEY",
+                "api": "openai-completions",
+                "compat": { "maxTokensField": "max_tokens", "supportsStore": false },
+                "models": [
+                    { "id": "glm", "reasoning": true,
+                      "compat": { "supportsDeveloperRole": false, "supportsStore": true } },
+                    { "id": "plain" }
+                ]
+            } } }"#,
+            &|_| false,
+            &|_| None,
+        );
+        assert!(result.error.is_none());
+        let raw = |index: usize| {
+            result.models[index]
+                .compat
+                .as_ref()
+                .expect("a provider compat applies to every definition")
+                .raw
+                .clone()
+        };
+        assert_eq!(
+            serde_json::Value::Object(raw(0)),
+            serde_json::json!({
+                "maxTokensField": "max_tokens",
+                "supportsStore": true,
+                "supportsDeveloperRole": false
+            })
+        );
+        assert_eq!(
+            serde_json::Value::Object(raw(1)),
+            serde_json::json!({ "maxTokensField": "max_tokens", "supportsStore": false })
+        );
     }
 
     #[test]
