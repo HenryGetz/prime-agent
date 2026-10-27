@@ -1,7 +1,8 @@
 //! Live token-stream coalescing: the emit path parks `message_update` frames in a
 //! single-slot coalescer — a flusher emits at most one parked update per interval;
 //! every other frame flushes the parked update first, so wire order stays identical.
-//! The deltas are ADDITIVE, so the parked run merges delta text; block-end events flush it.
+//! The deltas are ADDITIVE, so the parked run merges delta text of one stream-event
+//! kind; a kind switch or a block-end event flushes it.
 
 use std::sync::Mutex;
 use std::time::Duration;
@@ -67,13 +68,15 @@ impl TurnStreamCoalescer {
     }
 
     /// Park one streamed update: the newest snapshot wins; the delta merges into the
-    /// parked run (same kind) or starts a fresh one. `false` when the turn already ended.
+    /// parked run (same kind) or starts a fresh one after broadcasting the parked run.
+    /// `false` when the turn already ended.
     pub(crate) fn park_update(
         &self,
         message: AssistantSnapshot,
         kind: &str,
         delta: &str,
         sequence: u64,
+        events: &crate::worker::EventPump,
     ) -> bool {
         let mut inner = self.inner.lock().unwrap();
         if inner.closed {
@@ -87,9 +90,11 @@ impl TurnStreamCoalescer {
                 pending.message = message;
                 pending.sequence = sequence;
             }
-            // Kind switch: the newer snapshot wins whole. A `*_start`
-            // event carries no delta, so nothing additive is lost.
+            // Kind switch: the parked run's delta text belongs to another block
+            // (a chunk can carry text and reasoning; a block can start while
+            // another is open), so it goes out before the new run starts.
             _ => {
+                self.flush_locked(&mut inner, events);
                 inner.pending = Some(PendingUpdate {
                     message,
                     kind: kind.to_string(),
@@ -202,7 +207,8 @@ mod tests {
             AssistantSnapshot::Wire(json!({ "text": "partial" })),
             "text_delta",
             "part",
-            1
+            1,
+            &pump
         ));
         // The parked update waits for the flusher until a direct frame
         // arrives: the direct send must broadcast the parked snapshot first.
@@ -223,19 +229,22 @@ mod tests {
             AssistantSnapshot::Wire(json!({ "text": "The" })),
             "text_delta",
             "The ",
-            1
+            1,
+            &pump
         ));
         assert!(coalescer.park_update(
             AssistantSnapshot::Wire(json!({ "text": "The Thames" })),
             "text_delta",
             "Thames ",
-            2
+            2,
+            &pump
         ));
         assert!(coalescer.park_update(
             AssistantSnapshot::Wire(json!({ "text": "The Thames flows" })),
             "text_delta",
             "flows",
-            3
+            3,
+            &pump
         ));
         assert!(coalescer.flush_pending(&pump));
         let flushed = session_event_of(&rx.try_recv().unwrap());
@@ -252,34 +261,57 @@ mod tests {
         );
     }
 
+    /// Every broadcast frame as `(event type, stream kind, delta)`.
+    fn drain(rx: &mut broadcast::Receiver<Arc<OutboundFrame>>) -> Vec<(String, String, String)> {
+        std::iter::from_fn(|| rx.try_recv().ok())
+            .map(|frame| {
+                let event = &session_event_of(&frame)["event"];
+                let field = |value: &Value| value.as_str().unwrap_or_default().to_string();
+                (
+                    field(&event["type"]),
+                    field(&event["assistantMessageEvent"]["type"]),
+                    field(&event["assistantMessageEvent"]["delta"]),
+                )
+            })
+            .collect()
+    }
+
+    fn frame(event_type: &str, kind: &str, delta: &str) -> (String, String, String) {
+        (event_type.to_string(), kind.to_string(), delta.to_string())
+    }
+
     #[test]
-    fn a_kind_switch_replaces_the_run() {
+    fn a_kind_switch_flushes_the_parked_run() {
+        // A chunk carrying both `content` and `reasoning_content` streams a text
+        // delta, then a thinking delta, then more text, all inside one interval.
         let (pump, mut rx) = subscribe();
         let coalescer = TurnStreamCoalescer::new("s1".to_string(), "g1".to_string());
-        assert!(coalescer.park_update(
-            AssistantSnapshot::Wire(json!({ "text": "think" })),
-            "thinking_delta",
-            "think",
-            1
-        ));
-        assert!(coalescer.park_update(
-            AssistantSnapshot::Wire(json!({ "text": "thinkanswer" })),
-            "text_delta",
-            "answer",
-            2
-        ));
+        for (sequence, (kind, delta)) in [
+            ("text_delta", "I"),
+            ("thinking_delta", "."),
+            ("text_delta", " don't"),
+            ("text_delta", " know"),
+        ]
+        .into_iter()
+        .enumerate()
+        {
+            assert!(coalescer.park_update(
+                AssistantSnapshot::Wire(json!({ "text": delta })),
+                kind,
+                delta,
+                sequence as u64 + 1,
+                &pump
+            ));
+        }
         coalescer.send_direct(&[event_payload(&json!({ "type": "turn_end" }))], &pump);
-        let flushed = session_event_of(&rx.try_recv().unwrap());
         assert_eq!(
-            flushed["event"]["assistantMessageEvent"]["type"],
-            "text_delta"
-        );
-        assert_eq!(flushed["event"]["assistantMessageEvent"]["delta"], "answer");
-        let direct = session_event_of(&rx.try_recv().unwrap());
-        assert_eq!(direct["event"]["type"], "turn_end");
-        assert!(
-            rx.try_recv().is_err(),
-            "no frames beyond the flushed run and the direct one"
+            drain(&mut rx),
+            vec![
+                frame("message_update", "text_delta", "I"),
+                frame("message_update", "thinking_delta", "."),
+                frame("message_update", "text_delta", " don't know"),
+                frame("turn_end", "", ""),
+            ]
         );
     }
 
@@ -291,14 +323,16 @@ mod tests {
             AssistantSnapshot::Wire(json!({ "text": "partial" })),
             "text_delta",
             "p",
-            1
+            1,
+            &pump
         ));
         coalescer.close();
         assert!(!coalescer.park_update(
             AssistantSnapshot::Wire(json!({ "text": "stale" })),
             "text_delta",
             "s",
-            2
+            2,
+            &pump
         ));
         assert!(!coalescer.flush_pending(&pump), "the flusher stops");
         assert!(rx.try_recv().is_err(), "a closed turn parks nothing");
