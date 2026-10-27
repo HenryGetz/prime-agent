@@ -67,7 +67,12 @@ impl Editor {
         &self,
         item: &crate::autocomplete::CompletionItem,
         prefix: &str,
+        kind: Option<crate::autocomplete::SuggestionKind>,
     ) -> crate::autocomplete::CompletionResult {
+        if kind == Some(crate::autocomplete::SuggestionKind::Emoji) {
+            let start = self.cursor_col - prefix.chars().count();
+            return self.replace_before_cursor(start, &item.value);
+        }
         match self.autocomplete_provider.as_ref() {
             Some(provider) => provider.apply_completion(
                 &self.lines,
@@ -120,9 +125,10 @@ impl Editor {
         }
     }
 
-    /// Request suggestions when the cursor ends an `@`/`#` token: any edit
-    /// inside it — a `/` too, and a completion that keeps it open (an
-    /// applied directory, `@src/`) — lists what the token now matches.
+    /// Request suggestions when the cursor ends an `@`/`#` token or an
+    /// emoji `:name` query: any edit inside it — a `/` too, and a
+    /// completion that keeps it open (an applied directory, `@src/`) —
+    /// lists what the token now matches.
     pub(crate) fn request_autocomplete_in_symbol_token(&mut self) {
         if self.cursor_ends_symbol_token() {
             self.request_autocomplete(false, false);
@@ -133,6 +139,7 @@ impl Editor {
         let before = char_prefix(&self.lines[self.cursor_line], self.cursor_col);
         ends_with_symbol_token(&before)
             || crate::autocomplete::extract_at_prefix(&before.chars().collect::<Vec<_>>()).is_some()
+            || self.emoji_query().is_some()
     }
 
     pub(crate) fn request_autocomplete(&mut self, force: bool, explicit_tab: bool) {
@@ -194,6 +201,10 @@ impl Editor {
     }
 
     fn run_autocomplete_request(&mut self, request: PendingAutocomplete) {
+        if let Some((_, name)) = self.emoji_query() {
+            self.apply_suggestions(Some(Self::emoji_suggestions(&name)), request);
+            return;
+        }
         let Some(provider) = self.autocomplete_provider.as_ref() else {
             return;
         };
@@ -239,8 +250,7 @@ impl Editor {
             let item = suggestions.items[0].clone();
             self.push_undo_snapshot();
             self.last_action = None;
-            let prefix = suggestions.prefix;
-            let result = self.apply_completion(&item, &prefix);
+            let result = self.apply_completion(&item, &suggestions.prefix, suggestions.kind);
             self.lines = result.lines;
             self.cursor_line = result.cursor_line;
             self.set_cursor_col(result.cursor_col);
